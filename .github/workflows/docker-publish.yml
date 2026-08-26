@@ -107,7 +107,7 @@ jobs:
           username: lazymio
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         timeout-minutes: 2400
         with:
           context: .
