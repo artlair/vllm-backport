@@ -92,7 +92,7 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.suffix }}-
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Inject ccache into build
         uses: reproducible-containers/buildkit-cache-dance@v3
