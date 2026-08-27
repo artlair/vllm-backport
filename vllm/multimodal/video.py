@@ -674,6 +674,47 @@ class GLM46VVideoBackend(VideoBackend):
 
 
 @VIDEO_LOADER_REGISTRY.register(
+    "glm5next",
+    # Both spellings: the borrowed-config type string (``Glm5Next...``) and
+    # the dedicated transformers classes landing with the new checkpoint
+    # (``Glm5nextVideoProcessor``, matching ``Glm5nextImageProcessor``).
+    video_processor=("Glm5NextVideoProcessor", "Glm5nextVideoProcessor"),
+)
+class Glm5NextVideoBackend(VideoBackend):
+    """GLM-5.3-Flash fps-interval video backend.
+
+    Selects frames with the same ``glm_sample_frame_indices`` sampler the
+    processor falls back to, so only the sampled frames are
+    materialized. ``fps_interval`` semantics (default 2.0) with a
+    temporal-patch-scaled greedy walk, frame count capped at 2048, temporal
+    pairs kept even. Request overrides: ``fps`` -> fps interval,
+    ``max_frames`` -> frame cap, ``temporal_patch_size`` (default 2).
+    """
+
+    @classmethod
+    def compute_frames_index_to_sample(
+        cls,
+        source: VideoSourceMetadata,
+        target: VideoTargetMetadata,
+        **kwargs,
+    ) -> list[int]:
+        # Lazy import: the processor module sits behind the
+        # transformers_utils package init, which multimodal must not pull in.
+        from vllm.transformers_utils.processors.glm5next import (
+            glm_sample_frame_indices,
+        )
+
+        return glm_sample_frame_indices(
+            source.total_frames_num,
+            source.original_fps,
+            source.duration or 0,
+            target_fps=target.fps if target.fps > 0 else None,
+            max_frame_count=kwargs.get("max_frames"),
+            temporal_patch_size=kwargs.get("temporal_patch_size", 2),
+        )
+
+
+@VIDEO_LOADER_REGISTRY.register(
     "glmga",
     video_processor="GlmgaVideoProcessor",
 )
