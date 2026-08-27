@@ -299,6 +299,8 @@ class Indexer(nn.Module):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             tail_cache=self.tail_cache,
+            num_heads=self.n_head,
+            index_kpool=self.index_kpool,
         )
 
     def forward(

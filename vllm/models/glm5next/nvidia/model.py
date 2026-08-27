@@ -68,6 +68,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
     make_layers,
@@ -663,6 +664,28 @@ class Glm5NextModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        # Under mHC the PP stream is the multi-stream residual state
+        # (num_tokens, n, hidden_size) — the sending rank materializes its
+        # deferred hc_post before shipping (see forward). Without mHC it is
+        # the plain 2-D stream.
+        if getattr(self.config, "mhc", False):
+            shape: tuple[int, ...] = (
+                batch_size,
+                self.config.mhc_num_residual_streams,
+                self.config.hidden_size,
+            )
+        else:
+            shape = (batch_size, self.config.hidden_size)
+        return IntermediateTensors(
+            {"hidden_states": torch.zeros(shape, dtype=dtype, device=device)}
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -682,9 +705,13 @@ class Glm5NextModel(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-            # post/comb (deferred mHC hc_post state) are not propagated across
-            # PP ranks; the receiving rank's first mHC layer uses standalone pre.
+            # The sending rank materialized its deferred hc_post, so the
+            # incoming stream is the complete residual state ([s, n, H] under
+            # mHC, [s, H] otherwise). The first layer here re-enters via the
+            # standalone hc_pre (post is None), which is the unfused form of
+            # the inter-layer hc_fused_post_pre; the non-mHC branch rebuilds
+            # residual from hidden_states itself.
+            residual = None
             post = None
             comb = None
 
@@ -698,14 +725,15 @@ class Glm5NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
-            # so this branch is not exercised. post/comb are the deferred
-            # hc_post state of this rank's last mHC layer; a future PP path
-            # would need to propagate them, but for now they are dropped (the
-            # receiving rank's first layer would fall back to standalone pre).
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            # Materialize this rank's pending deferred hc_post so the stream
+            # shipped across the PP boundary is the complete multi-stream
+            # residual state (the DSv4 mHC-under-PP pattern). The receiving
+            # rank's first layer re-enters via the standalone hc_pre.
+            if post is not None:
+                hidden_states = self._active_layers[-1].hc_post(
+                    hidden_states, residual, post, comb
+                )
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -899,6 +927,9 @@ class Glm5NextForCausalLM(
         self.logits_processor = LogitsProcessor(
             self.config.vocab_size, scale=self.config.logit_scale
         )
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -960,9 +991,19 @@ class Glm5NextForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    # Text-only load of the multimodal checkpoint (--hf-overrides
+    # architectures=[Glm5NextForCausalLM]): remap the language-model prefix
+    # and drop the vision tower. When loaded as the inner model of the MM
+    # wrapper the names arrive already stripped, so both mappings no-op.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={"model.language_model.": "model."},
+    )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loader = AutoWeightsLoader(
+            self, ignore_unexpected_prefixes=["model.visual.", "visual."]
+        )
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1046,9 +1087,9 @@ class Glm5NextForConditionalGeneration(
                 architectures=["Glm5NextForCausalLM"],
             )
 
-        # Glm5NextForCausalLM does not implement make_empty_intermediate_tensors,
-        # so pipeline parallelism is gated off (consistent with the text-only
-        # model) and we intentionally do not alias it here.
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
+            self.language_model.make_empty_intermediate_tensors
+        )
 
     def get_encoder_cudagraph_config(self):
         # This vision tower does not produce the absolute position embedding

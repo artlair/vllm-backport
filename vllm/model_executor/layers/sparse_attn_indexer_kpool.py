@@ -22,7 +22,7 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    is_deep_gemm_supported,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -34,6 +34,10 @@ from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.mqa_logits_triton import (
+    fp8_mqa_logits_triton,
+    fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_cuda_alike():
@@ -300,7 +304,17 @@ def sparse_attn_indexer_kpool(
                 sched.max_num_batched_tokens,
             )
         # float32 logits -> 4 bytes/element; uint8 sentinel so elems == bytes.
-        decode_logits_elems = worst_decode_tokens * max_model_len * 4
+        # The Triton fallback (no DeepGEMM) sizes the decode logits in the
+        # pool-granular coordinate system, index_kpool x narrower — reserving
+        # the DeepGEMM width there would waste blocks the KV pool could use.
+        logits_width = max_model_len
+        if (
+            current_platform.is_cuda()
+            and not is_deep_gemm_supported()
+            and index_kpool > 1
+        ):
+            logits_width = -(-max_model_len // index_kpool)
+        decode_logits_elems = worst_decode_tokens * logits_width * 4
         prefill_cap_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         max_logits_elems = max(decode_logits_elems, prefill_cap_elems)
         _ = torch.empty(
@@ -398,6 +412,14 @@ def sparse_attn_indexer_kpool(
             )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
+    # DeepGEMM availability is constant per process; check once for both
+    # branches. On SM8x/SM121 the logits fall back to the Triton kernels in
+    # mqa_logits_triton.py, exactly like the DSv4 indexer.
+    use_deep_gemm = not current_platform.is_cuda() or is_deep_gemm_supported()
+    if not use_deep_gemm:
+        assert not use_fp4_cache, (
+            "Triton sparse-MLA fallback does not support FP4 KV cache"
+        )
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -479,15 +501,7 @@ def sparse_attn_indexer_kpool(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            logits = fp8_fp4_mqa_logits(
-                (q_slice_cast, q_scale_slice),
-                (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                clean_logits=False,
-            )
-            num_rows = logits.shape[0]
+            num_rows = q_slice_cast.shape[0]
 
             # kpool: logits are pool-granular (compress_ratio == index_kpool),
             # so topk selects pools. We pick topk_tokens // kpool pools then
@@ -495,7 +509,9 @@ def sparse_attn_indexer_kpool(
             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
             if index_kpool > 1:
                 pool_topk = torch.empty(
-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
+                    (num_rows, select_k),
+                    dtype=torch.int32,
+                    device=q_slice_cast.device,
                 )
                 topk_dst = pool_topk
             else:
@@ -503,28 +519,70 @@ def sparse_attn_indexer_kpool(
                     chunk.token_start : chunk.token_end, :topk_tokens
                 ]
 
-            if current_platform.is_xpu():
-                xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
-                    logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
-                    topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    select_k,
+            if current_platform.is_cuda() and not use_deep_gemm:
+                # SM8x/SM121 Triton fallback (DeepGEMM unavailable). Row-chunked
+                # like the DSv4 path (#50576): the [M, N] fp32 logits transient
+                # grows with context (N is pool-granular here, so index_kpool x
+                # smaller than DSv4's) — process rows in blocks and drop each
+                # block's logits immediately.
+                row_step = (
+                    envs.VLLM_DSV4_LOGITS_ROW_CHUNK
+                    if envs.VLLM_DSV4_LOGITS_ROW_CHUNK > 0
+                    else num_rows
                 )
+                for r0 in range(0, num_rows, row_step):
+                    r1 = min(r0 + row_step, num_rows)
+                    logits = fp8_mqa_logits_triton(
+                        q_slice_cast[r0:r1],
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start + r0 : chunk.token_start + r1],
+                        chunk.cu_seqlen_ks[r0:r1],
+                        chunk.cu_seqlen_ke[r0:r1],
+                        clean_logits=False,
+                    )
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits,
+                        chunk.cu_seqlen_ks[r0:r1],
+                        chunk.cu_seqlen_ke[r0:r1],
+                        topk_dst[r0:r1],
+                        r1 - r0,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
+                    )
+                    del logits
             else:
-                torch.ops._C.top_k_per_row_prefill(
-                    logits,
+                logits = fp8_fp4_mqa_logits(
+                    (q_slice_cast, q_scale_slice),
+                    (k_quant_cast, k_scale_cast),
+                    weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                    topk_dst,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    select_k,
+                    clean_logits=False,
                 )
+
+                if current_platform.is_xpu():
+                    xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_dst,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_dst,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        select_k,
+                    )
 
             if index_kpool > 1:
                 pool_ids = pool_topk.to(torch.int64)
@@ -716,16 +774,31 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        logits = fp8_fp4_paged_mqa_logits(
-            (padded_q_quant_cast, padded_q_scale),
-            kv_cache,
-            padded_weights[:num_padded_tokens],
-            seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
-            clean_logits=False,
-        )
+        if current_platform.is_cuda() and not use_deep_gemm:
+            # SM8x/SM121 Triton fallback. Downstream topk reads only up to
+            # `seq_lens` (pool-granular), so size the logits buffer in the same
+            # compressed coordinate system as the kpool indexer cache — NOT
+            # max_model_len, which is token-granular and index_kpool x wider.
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=decode_metadata.max_seq_len,
+                clean_logits=False,
+            )
+        else:
+            logits = fp8_fp4_paged_mqa_logits(
+                (padded_q_quant_cast, padded_q_scale),
+                kv_cache,
+                padded_weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
@@ -749,7 +822,10 @@ def sparse_attn_indexer_kpool(
                 topk_dst,
                 topk_workspace,
                 select_k,
-                attn_metadata_narrowed.max_seq_len,
+                # Bound by the actual buffer width: the Triton fallback sizes
+                # logits pool-granular (decode max_seq_len), DeepGEMM sizes
+                # them at max_model_len — logits.shape[1] is right for both.
+                logits.shape[1],
             )
         else:
             if current_platform.is_xpu():
@@ -876,6 +952,8 @@ class SparseAttnIndexerKpool(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         tail_cache=None,
+        num_heads: int | None = None,
+        index_kpool: int = 1,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -889,9 +967,40 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+        # On SM8x/SM121 DeepGEMM is unavailable — fall back to the Triton
+        # sparse-MLA logits kernels, exactly like the DSv4 indexer
+        # (sparse_attn_indexer.py). Downgrade upstream's hard error to a
+        # one-time warning and prime the Triton autotune caches here: memory
+        # profiling captures cudagraphs before any warmup hook runs, and the
+        # autotuner's synchronizing benchmark is illegal under capture.
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
+            logger.warning_once(
+                "DeepGEMM not supported on this platform; using Triton "
+                "fallback for the kpool sparse attention indexer."
+            )
+            assert not use_fp4_cache, (
+                "Triton sparse-MLA fallback does not support FP4 KV cache"
+            )
+            from vllm.config import get_current_vllm_config
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                warmup_fp8_mqa_logits_triton,
+                warmup_fp8_paged_mqa_logits_triton,
+            )
+
+            device = topk_indices_buffer.device
+            # The q handed to the logits kernels is zero-padded to >= 32 heads
+            # (DeepGEMM's num_heads constraint, kept for kernel-shape parity).
+            eff_heads = max(num_heads or 32, 32)
+            warmup_fp8_mqa_logits_triton(eff_heads, head_dim, device)
+            # The paged kernel sees the kpool cache's STATE-granular block
+            # size (cache block_size // index_kpool states per block), not the
+            # token-granular cache_config.block_size — the autotune cache is
+            # keyed on it, so warming the wrong value leaves the real launch
+            # to autotune under capture.
+            cache_block = get_current_vllm_config().cache_config.block_size
+            kernel_block_size = max(cache_block // max(index_kpool, 1), 1)
+            warmup_fp8_paged_mqa_logits_triton(
+                eff_heads, head_dim, kernel_block_size, device
             )
 
     def forward_native(

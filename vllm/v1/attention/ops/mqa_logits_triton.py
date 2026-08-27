@@ -167,6 +167,8 @@ def _fp8_paged_mqa_logits_kernel(
     stride_bt_k,
     stride_l_t,
     stride_l_n,
+    stride_cl_b,
+    stride_cl_n,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -175,6 +177,7 @@ def _fp8_paged_mqa_logits_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     Q_IS_BF16: tl.constexpr,
+    CL_2D: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     block_rk = tl.program_id(1)
@@ -182,11 +185,19 @@ def _fp8_paged_mqa_logits_kernel(
     batch_id = token_id // next_n
     next_n_id = token_id % next_n
 
-    context_len = tl.load(context_lens_ptr + batch_id)
+    context_len = tl.load(
+        context_lens_ptr + batch_id * stride_cl_b + next_n_id * stride_cl_n
+    )
     if block_rk * block_size >= context_len:
         return
 
-    q_offset = context_len - next_n + next_n_id
+    if CL_2D:
+        # 2-D (B, next_n) rows already encode each sub-token's effective
+        # context length (L_b - next_n + j + 1, the indexer metadata
+        # builder's native-MTP layout), so the query position is one less.
+        q_offset = context_len - 1
+    else:
+        q_offset = context_len - next_n + next_n_id
 
     # int64: unified-KV-pool layer views carry a large block stride (~1e6
     # elements), so int32 `block_idx * stride` wraps once a batch touches
@@ -269,7 +280,9 @@ def fp8_paged_mqa_logits_triton(
         q:             [B, next_n, H, D] fp8_e4m3fn
         kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
         weights:       [B*next_n, H] float32
-        context_lens:  [B] int32
+        context_lens:  [B] int32, or [B, next_n] int32 where row [b, j] is
+            sub-token j's effective context length (L_b - next_n + j + 1) —
+            the indexer metadata builder's native-MTP layout
         block_tables:  [B, max_blocks] int32
         max_model_len: output width. Caller passes the active batch max so
             the logits buffer and grid stay tight.
@@ -282,6 +295,15 @@ def fp8_paged_mqa_logits_triton(
     _, block_size, one, d_plus_4 = kv_cache.shape
     assert one == 1
     assert d_plus_4 == head_dim + 4
+    cl_2d = context_lens.dim() == 2
+    if cl_2d:
+        assert context_lens.shape[1] == next_n, (
+            f"2-D context_lens must be (B, next_n); got "
+            f"{tuple(context_lens.shape)} with next_n={next_n}"
+        )
+        cl_stride_b, cl_stride_n = context_lens.stride(0), context_lens.stride(1)
+    else:
+        cl_stride_b, cl_stride_n = context_lens.stride(0), 0
 
     # Cache layout from `indexer_k_quant_and_cache`: per block, FP8 K bytes
     # (block_size * head_dim) followed by fp32 scales (block_size * 4). The
@@ -355,6 +377,8 @@ def fp8_paged_mqa_logits_triton(
         block_tables.stride(1),
         logits.stride(0),
         logits.stride(1),
+        cl_stride_b,
+        cl_stride_n,
         next_n=next_n,
         num_heads=num_heads,
         head_dim=head_dim,
@@ -363,6 +387,7 @@ def fp8_paged_mqa_logits_triton(
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
         Q_IS_BF16=q_is_bf16,
+        CL_2D=cl_2d,
     )
     return logits
 
@@ -668,6 +693,17 @@ def warmup_fp8_paged_mqa_logits_triton(
     weights = torch.zeros(1, num_heads, dtype=torch.float32, device=device)
     context_lens = torch.tensor([block_size], dtype=torch.int32, device=device)
     block_tables = torch.zeros(1, 1, dtype=torch.int32, device=device)
+    # Warm both context_lens specializations: the indexer metadata builder
+    # always hands the kernel 2-D (B, next_n) seq_lens, while direct callers
+    # may pass 1-D. CL_2D is a constexpr, so each is a separate compile.
     fp8_paged_mqa_logits_triton(
         q, kv_cache, weights, context_lens, block_tables, max_model_len=block_size
+    )
+    fp8_paged_mqa_logits_triton(
+        q,
+        kv_cache,
+        weights,
+        context_lens.unsqueeze(-1),
+        block_tables,
+        max_model_len=block_size,
     )

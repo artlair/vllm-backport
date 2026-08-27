@@ -69,7 +69,9 @@ class XPUMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [576]
+        # 576 = DeepSeek MLA (kv_lora_rank 512 + qk_rope 64);
+        # 512 = NoPE MLA (GLM-5.3-Flash: kv_lora_rank 512, qk_rope 0).
+        return [512, 576]
 
 
 @dataclass
@@ -185,6 +187,10 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
 class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
     is_sparse = True
+    # Everything routes through the top-k MQA kernel; there is no dense-MHA
+    # prefill impl, so let MLAAttention take the clean sparse-only early-out
+    # instead of the noisy "No MLA prefill backend" warning path.
+    supports_dense_mha_prefill = False
 
     def __init__(
         self,
@@ -277,7 +283,10 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            # The buffer may be wider than index_topk (kpool widens it to
+            # index_topk + kpool - 1, rounded up to a multiple of 128); use
+            # the actual width, like the other sparse backends do.
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)

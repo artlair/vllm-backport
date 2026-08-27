@@ -23,6 +23,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
     has_deep_gemm,
+    is_deep_gemm_supported,
     native_next_n_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
@@ -986,6 +987,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 "DCP is not supported with sparse indexer KV compression "
                 f"(compress_ratio={self.compress_ratio})."
             )
+        if self.indexer_shard_size > 1 and self.compress_ratio > 1:
+            # The kpool (compress_ratio > 1) indexer consumer ignores the
+            # shard metadata entirely — no per-rank row slicing and no top-k
+            # all-gather — so a sharded batch would silently compute garbage
+            # logits. Fall back to the replicated path.
+            logger.warning_once(
+                "VLLM_INDEXER_QUERY_SHARD is not supported with sparse "
+                "indexer KV compression (compress_ratio=%d); running the "
+                "indexer replicated.",
+                self.compress_ratio,
+            )
+            self.indexer_shard_size = 1
+            self.indexer_shard_rank = 0
+            self.decode_shard_min_reqs = 0
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
@@ -1483,7 +1498,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # Schedule the sharded rows, not the batch: this is the work
             # decomposition for the very call the shard narrows.
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if current_platform.is_cuda() and is_deep_gemm_supported():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens
                     if decode_shard_bounds is None
