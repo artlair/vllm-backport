@@ -308,6 +308,11 @@ class MambaHybridModelState(DefaultModelState):
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            # Position-dependent builders (the GLM-5.3-Flash kpool tail's
+            # circular slot mapping) need per-token positions; the default
+            # model state passes them, and omitting them here made the tail
+            # builder silently fall back to the generic (wrong) mapping.
+            positions=input_batch.positions[:num_tokens],
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,

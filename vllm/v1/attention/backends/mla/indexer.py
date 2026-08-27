@@ -750,6 +750,22 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
         )
         slot_mapping = common_attn_metadata.slot_mapping
         positions = common_attn_metadata.positions
+        if positions is None and common_attn_metadata.num_actual_tokens > 0:
+            # Some model-state paths don't thread positions through the common
+            # metadata. The generic slot mapping is NEVER correct for the tail
+            # (its circular one-block-per-request geometry), so derive
+            # positions here rather than silently falling back: token i of
+            # request r sits at seq_lens[r] - (qsl[r+1] - i).
+            qsl = common_attn_metadata.query_start_loc
+            tokens = torch.arange(
+                common_attn_metadata.num_actual_tokens, device=slot_mapping.device
+            )
+            req = (torch.searchsorted(qsl, tokens, right=True) - 1).clamp_(
+                min=0, max=common_attn_metadata.num_reqs - 1
+            )
+            positions = common_attn_metadata.seq_lens.index_select(0, req) - (
+                qsl.index_select(0, req + 1) - tokens
+            )
         if positions is not None:
             slot_mapping = compute_kpool_tail_slot_mapping(
                 slot_mapping,
