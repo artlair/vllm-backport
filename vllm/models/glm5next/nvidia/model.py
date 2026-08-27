@@ -1122,6 +1122,9 @@ def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
     if not is_weight and not is_scale:
         return False
     layer_prefix = name.rsplit(".wk.", 1)[0]
+    # PP: skip layers owned by other pipeline ranks (no fused param here).
+    if f"{layer_prefix}.wk_weights_proj.weight" not in params_dict:
+        return True
     entry = buf.setdefault(layer_prefix, {})
     entry["weight" if is_weight else "scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
@@ -1218,6 +1221,10 @@ def _try_load_fp8_attn_proj(
     # handle it (it has a weight_scale_inv param).
     if target_s in params_dict:
         return False
+    # PP: a layer owned by another pipeline rank has no param here — consume
+    # the tensor without loading (the owning rank loads its own copy).
+    if target_w not in params_dict:
+        return True
 
     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
     entry["weight" if is_weight else "scale"] = tensor
