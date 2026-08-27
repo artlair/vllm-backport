@@ -1000,9 +1000,15 @@ class Glm5NextForCausalLM(
     )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self, ignore_unexpected_prefixes=["model.visual.", "visual."]
+        # Drop the vision tower before dispatch: the inner Glm5NextModel
+        # loader indexes params_dict directly, so ignore-prefix handling at
+        # the AutoWeightsLoader level comes too late for visual.* keys.
+        weights = (
+            (name, w)
+            for name, w in weights
+            if not name.startswith(("model.visual.", "visual."))
         )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
