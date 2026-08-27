@@ -288,8 +288,12 @@ def prepare_fp8_moe_layer_for_marlin(
     # WEIGHT
     # Repack weights to marlin format
     def repack_weight(name: str, weight: torch.Tensor) -> torch.Tensor:
-        tensor_list = []
+        # Stream each expert into a preallocated output instead of
+        # accumulating a per-expert list and torch.cat-ing it: the list plus
+        # the cat holds the full repacked layer TWICE, a multi-GiB transient
+        # that OOMs large-MoE layers on 24 GB cards during load.
         size_n, size_k = weight.size(1), weight.size(2)
+        out: torch.Tensor | None = None
         for i in range(e):
             qweight = pack_fp8_to_int32(weight[i], size_k_first=False)
             qweight = qweight.T.contiguous()
@@ -297,9 +301,16 @@ def prepare_fp8_moe_layer_for_marlin(
             marlin_qweight = ops.gptq_marlin_repack(
                 b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
             )
-            tensor_list.append(marlin_qweight)
+            if out is None:
+                out = torch.empty(
+                    (e, *marlin_qweight.shape),
+                    dtype=marlin_qweight.dtype,
+                    device=marlin_qweight.device,
+                )
+            out[i].copy_(marlin_qweight)
 
-        return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        assert out is not None
+        return out
 
     w13_weight = repack_weight("w13", w13_weight)
     w2_weight = repack_weight("w2", w2_weight)
