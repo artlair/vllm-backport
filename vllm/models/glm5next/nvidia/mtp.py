@@ -322,6 +322,20 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
             # prefix to match.
             if name.startswith("model.language_model."):
                 name = name.replace("model.language_model.", "model.", 1)
+            # GLM-5.3-Flash ships no embed_tokens copy under the MTP layer
+            # (unlike DeepSeek MTP checkpoints), so load the base model's
+            # embedding here. Without this the draft's embed_tokens is only
+            # ever populated by the PP==1 target-sharing path in
+            # load_eagle_model; under PP the last-stage drafter has no target
+            # embedding to share and would silently draft from uninitialized
+            # embeddings (observed: pos-1 acceptance stuck at ~18-26% instead
+            # of ~70%).
+            if name == "model.embed_tokens.weight" and name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
