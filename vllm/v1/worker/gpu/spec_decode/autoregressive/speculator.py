@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import time
 from typing import Any
 
 import torch
@@ -9,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -43,6 +46,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
+
+        # Debug wall-clock profiling of propose() phases (VLLM_MTP_PERF=1).
+        # Syncs at every boundary, so only for perf forensics, never prod.
+        self._perf = os.environ.get("VLLM_MTP_PERF") == "1"
+        self._perf_on = False
+        self._perf_rec: list[tuple[str, float]] = []
+        self._perf_call = 0
+        # Skip the per-step full-stream fences (measurement experiment for the
+        # vllm#40756 workaround cost; may reintroduce the IMA it papers over).
+        self._no_fence = os.environ.get("VLLM_MTP_NO_FENCE") == "1"
+
+    def _perf_mark(self, label: str) -> None:
+        if self._perf_on:
+            torch.cuda.synchronize()
+            self._perf_rec.append((label, time.perf_counter()))
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -132,6 +150,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
+            cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+        elif (
+            os.environ.get("VLLM_MTP_DRAFT_DECODE_CG", "").lower() == "full"
+            and self.attn_cg_support.min_cg_support.value
+            >= AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE.value
+        ):
+            # Opt-in escalation: draft decode steps are uniform single-token
+            # batches, which the DRAFT's own attention backends may support as
+            # FULL graphs even when the target must run PIECEWISE (e.g.
+            # GLM-5.3-Flash on sm86: the draft is one sparse-MLA layer whose
+            # builders all declare uniform-decode graph support). Eager draft
+            # decode steps cost ~a full pipeline step in launch overhead, so
+            # without this MTP cannot win on multi-node PP topologies.
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
             cudagraph_mode = CUDAGraphMode.NONE
@@ -225,6 +256,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        self._perf_on = self._perf and not dummy_run and not is_profile
+        if self._perf_on:
+            self._perf_rec = []
+            self._perf_mark("t0")
+
         num_tokens = input_batch.num_tokens
         num_tokens_padded = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
@@ -290,6 +326,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         self._prepare_eplb_forward(num_tokens)
+        self._perf_mark("prep")
 
         # Debug dump: capture the draft's exact prefill inputs for offline
         # reference recomputation. Gated; eager-mode debugging only.
@@ -336,6 +373,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 mm_inputs=mm_inputs,
             )
         self.on_prefill_end(num_reqs)
+        self._perf_mark("prefill")
 
         if _dump is not None:
             _dump["draft_token_ids"] = self.draft_tokens[:num_reqs, 0].cpu().clone()
@@ -370,6 +408,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         if self.num_speculative_steps == 1:
             # Early exit.
+            self._perf_report(num_reqs)
             return self.draft_tokens[:num_reqs, :1]
 
         # Prepare the inputs for the decode steps.
@@ -394,6 +433,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             dp_rank=self.dp_rank,
             need_eager=is_profile,
         )
+        self._perf_mark("decprep")
 
         self.on_multi_step_decode_begin(num_reqs)
         # Generate the remaining num_speculative_steps - 1 draft tokens.
@@ -411,7 +451,25 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self.on_multi_step_decode_end(num_reqs)
 
+        self._perf_report(num_reqs)
         return self.draft_tokens[:num_reqs]
+
+    def _perf_report(self, num_reqs: int) -> None:
+        if not self._perf_on:
+            return
+        self._perf_mark("end")
+        self._perf_on = False
+        self._perf_call += 1
+        rec = self._perf_rec
+        parts = []
+        for (_, t_prev), (label, t) in zip(rec, rec[1:]):
+            parts.append(f"{label}={1e3 * (t - t_prev):.2f}")
+        total = 1e3 * (rec[-1][1] - rec[0][1])
+        print(
+            f"MTP_PERF call={self._perf_call} reqs={num_reqs} "
+            f"total={total:.2f}ms " + " ".join(parts),
+            flush=True,
+        )
 
     @torch.inference_mode()
     def _run_model(
@@ -495,6 +553,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
         )
+        self._perf_mark("pf_fwd")
         sample_hidden_states = last_hidden_states[last_token_indices]
 
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
@@ -523,7 +582,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # graph is being captured (cudaErrorStreamCaptureUnsupported), and
         # unnecessary there: replay order is fixed by the capture-time stream
         # dependencies, so the cross-launch race cannot occur inside a graph.
-        if not torch.cuda.is_current_stream_capturing():
+        self._perf_mark("pf_sample")
+        if not self._no_fence and not torch.cuda.is_current_stream_capturing():
             torch.accelerator.current_stream().synchronize()
 
     def _multi_step_decode(
@@ -560,6 +620,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
                     step=step,
                 )
+            self._perf_mark(f"s{step}_meta")
 
             self.current_draft_step.fill_(step)
 
@@ -686,6 +747,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        self._perf_mark("d_fwd")
         last_hidden_states = last_hidden_states[:num_reqs]
 
         sample_positions = positions
@@ -704,6 +766,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.current_draft_step,
             self.draft_logits,
         )
+        self._perf_mark("d_sample")
 
         # Update the inputs for the next step.
         update_draft_inputs(
@@ -718,8 +781,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.num_speculative_steps,
             advance_draft_positions=self.advance_draft_positions,
         )
+        self._perf_mark("d_update")
         # See the fence comment in propose(): vllm-project/vllm#40756.
-        if not torch.cuda.is_current_stream_capturing():
+        if not self._no_fence and not torch.cuda.is_current_stream_capturing():
             torch.accelerator.current_stream().synchronize()
 
 

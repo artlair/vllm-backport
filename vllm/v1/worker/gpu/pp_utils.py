@@ -10,8 +10,57 @@ import torch
 
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+
+@triton.jit
+def _scatter_draft_tokens_kernel(
+    dst_ptr,
+    dst_stride,
+    idx_ptr,
+    src_ptr,
+    src_stride,
+    width,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    idx = tl.load(idx_ptr + row)
+    if idx < 0:
+        return
+    offs = tl.arange(0, BLOCK)
+    mask = offs < width
+    vals = tl.load(src_ptr + row * src_stride + offs, mask=mask)
+    tl.store(dst_ptr + idx * dst_stride + offs, vals, mask=mask)
+
+
+def scatter_draft_tokens(
+    dst: torch.Tensor,  # [max_num_reqs, num_spec] draft-token state
+    idx_mapping: torch.Tensor,  # [num_rows], -1 marks excluded rows
+    draft_tokens: torch.Tensor,  # [num_rows, num_spec]
+) -> None:
+    """Scatter relayed draft tokens into per-request state, skipping -1 rows.
+
+    Deliberately sync-free: the obvious `dst[idx[idx >= 0]] = src[idx >= 0]`
+    boolean indexing forces a host-side stream sync (nonzero must report its
+    count), and on non-last PP ranks that sync lands while the current step's
+    relay broadcast is still in flight — the host then blocks for the rest of
+    the whole pipeline step. Profiled at ~70ms/step on the 2-node GLM-5.3
+    deploy, it single-handedly erased the MTP speedup.
+    """
+    num_rows, width = draft_tokens.shape
+    if num_rows == 0:
+        return
+    _scatter_draft_tokens_kernel[(num_rows,)](
+        dst,
+        dst.stride(0),
+        idx_mapping,
+        draft_tokens,
+        draft_tokens.stride(0),
+        width,
+        BLOCK=triton.next_power_of_2(width),
+    )
 
 
 @dataclass
