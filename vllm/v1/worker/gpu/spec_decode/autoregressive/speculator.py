@@ -291,6 +291,32 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self._prepare_eplb_forward(num_tokens)
 
+        # Debug dump: capture the draft's exact prefill inputs for offline
+        # reference recomputation. Gated; eager-mode debugging only.
+        import os as _os
+
+        _dump_dir = _os.environ.get("VLLM_MTP_DEBUG_DUMP_DIR")
+        _dump = None
+        if _dump_dir and not dummy_run and not is_profile:
+            _i = getattr(self, "_mtp_dump_i", 0)
+            if _i < int(_os.environ.get("VLLM_MTP_DEBUG_DUMP_MAX", "8")):
+                self._mtp_dump_i = _i + 1
+                print(f"MTP_DUMP capturing call {_i}", flush=True)
+                _dump = {
+                    "input_ids": self.input_buffers.input_ids[:num_tokens]
+                    .cpu()
+                    .clone(),
+                    "positions": self.input_buffers.positions[:num_tokens]
+                    .cpu()
+                    .clone(),
+                    "prev_hidden": self.hidden_states[:num_tokens].cpu().clone(),
+                    "query_start_loc": input_batch.query_start_loc[
+                        : num_reqs + 1
+                    ].cpu(),
+                    "seq_lens": input_batch.seq_lens[:num_reqs].cpu(),
+                    "last_token_indices": self.last_token_indices[:num_reqs].cpu(),
+                }
+
         self.on_prefill_begin(num_reqs)
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
@@ -310,6 +336,37 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 mm_inputs=mm_inputs,
             )
         self.on_prefill_end(num_reqs)
+
+        if _dump is not None:
+            _dump["draft_token_ids"] = self.draft_tokens[:num_reqs, 0].cpu().clone()
+            torch.save(
+                _dump,
+                f"{_dump_dir}/mtp_dump_{_os.getpid()}_{self._mtp_dump_i - 1:03d}.pt",
+            )
+
+        # Oracle draft (debug): replace the draft's token with the token a
+        # recorded greedy run produced at the same generation index. If the
+        # verify machinery is correct, acceptance must equal the run's own
+        # agreement with the recording — any gap is a verify-side bug,
+        # independent of draft quality.
+        _oracle_path = _os.environ.get("VLLM_MTP_ORACLE_FILE")
+        if _oracle_path and not dummy_run and not is_profile:
+            if not getattr(self, "_oracle_map", None):
+                import json as _json
+
+                self._oracle_map = _json.load(open(_oracle_path))
+            _seq_cpu = input_batch.seq_lens[:num_reqs].cpu().tolist()
+            _rej_cpu = num_rejected[:num_reqs].cpu().tolist()
+            for _r, _rid in enumerate(input_batch.req_ids[:num_reqs]):
+                _ent = self._oracle_map.get(str(_rid))
+                if _ent is None:
+                    if getattr(self, "_oracle_warned", 0) < 4:
+                        self._oracle_warned = getattr(self, "_oracle_warned", 0) + 1
+                        print(f"MTP_ORACLE no entry for req_id={_rid!r}", flush=True)
+                    continue
+                _idx = _seq_cpu[_r] - _ent["prompt_len"] + 1 - _rej_cpu[_r]
+                if 0 <= _idx < len(_ent["tokens"]):
+                    self.draft_tokens[_r, 0] = _ent["tokens"][_idx]
 
         if self.num_speculative_steps == 1:
             # Early exit.
@@ -697,6 +754,16 @@ def _prepare_prefill_inputs_kernel(
 
     # Get the true query length and next token after accounting for rejected tokens.
     num_rejected = tl.load(num_rejected_ptr + req_idx)
+    # The rejected-slot rows past the true query length still run through the
+    # draft forward as padding, and their POSITIONS must be their real
+    # scheduled positions: the GLM-5.3 kpool indexer derives cache write slots
+    # and pool-completion decisions from runtime positions, so a stale
+    # position on a dead row stashes tail K into the wrong slot and compresses
+    # a garbage pool into the draft's index cache — permanently (pools are
+    # never recomputed). With the true position, the dead row's write lands
+    # where the next step's live token overwrites it, the same self-healing
+    # contract every attention backend relies on for rejected tokens.
+    full_query_len = query_len
     query_len -= num_rejected
 
     num_sampled = tl.load(num_sampled_ptr + req_idx)
@@ -718,10 +785,11 @@ def _prepare_prefill_inputs_kernel(
     tl.store(last_token_indices_ptr + req_idx, last_token_index)
     tl.store(draft_input_ids_ptr + last_token_index, next_token)
 
-    # Copy positions.
-    for i in range(0, query_len, BLOCK_SIZE):
+    # Copy positions for ALL scheduled rows, including the rejected padding
+    # rows (see the stale-position note above).
+    for i in range(0, full_query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
-        mask = block < query_len
+        mask = block < full_query_len
         target_pos = tl.load(target_positions_ptr + query_start + block, mask=mask)
         tl.store(draft_positions_ptr + query_start + block, target_pos, mask=mask)
 

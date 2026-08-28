@@ -346,6 +346,27 @@ def sparse_attn_indexer_kpool(
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
 
+    # Debug trace (VLLM_KPOOL_TRACE=1): what each indexer call is doing.
+    import os as _os
+
+    _trace = _os.environ.get("VLLM_KPOOL_TRACE") == "1"
+    if _trace:
+        global _TRACE_COUNT
+        try:
+            _TRACE_COUNT += 1
+        except NameError:
+            _TRACE_COUNT = 1
+        _trace = _TRACE_COUNT <= 60
+        if _trace:
+            print(
+                f"KPOOL_TRACE#{_TRACE_COUNT} layer={k_cache_prefix.split('.layers.')[-1].split('.')[0]} "
+                f"nd={attn_metadata_narrowed.num_decodes} np={attn_metadata_narrowed.num_prefills} "
+                f"ndt={num_decode_tokens} pos={'None' if positions is None else positions[:8].tolist()} "
+                f"skip_insert={skip_k_cache_insert} "
+                f"seq_lens={attn_metadata_narrowed.seq_lens[:4].tolist()}",
+                flush=True,
+            )
+
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
     if use_fp4_cache:
@@ -445,6 +466,13 @@ def sparse_attn_indexer_kpool(
                 and positions is not None
                 and int(positions[num_decode_tokens:num_tokens].max().item()) + 1
                 <= topk_tokens
+            )
+        if _trace:
+            print(
+                f"KPOOL_TRACE#{_TRACE_COUNT} prefill short={short_prefill} "
+                f"max_pf_seq={prefill_metadata.max_prefill_seq_len} "
+                f"n_chunks={len(prefill_metadata.chunks)}",
+                flush=True,
             )
         if short_prefill:
             # short_prefill is only True when positions is not None (above),
@@ -872,9 +900,51 @@ def sparse_attn_indexer_kpool(
                     dec_seq = dec_seq[:, -1]
                 dec_seq = dec_seq.to(torch.int32)
             out = expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
+
+            # Debug verifier: at short context (seq_len <= buffer width) the
+            # correct top-k selection is exactly the full causal set, so any
+            # missing/extra/duplicate index is a selection-chain bug. Gated;
+            # eager-mode only (host sync + python loop).
+            import os as _os
+
+            if _os.environ.get("VLLM_KPOOL_CHECK_DECODE_TOPK") == "1":
+                _dec_seq_cpu = dec_seq.cpu()
+                _out_cpu = out.cpu()
+                for _r in range(_out_cpu.shape[0]):
+                    _L = int(_dec_seq_cpu[_r])
+                    if _L <= 0 or _L > _out_cpu.shape[1]:
+                        continue
+                    _raw = _out_cpu[_r][_out_cpu[_r] >= 0].to(torch.int64)
+                    _got = set(_raw.tolist())
+                    _exp = set(range(_L))
+                    if len(_raw) != _L or _got != _exp:
+                        print(
+                            f"KPOOL_TOPK_MISMATCH layer={k_cache_prefix} row={_r} "
+                            f"L={_L} nvalid={len(_raw)} nuniq={len(_got)} "
+                            f"missing={sorted(_exp - _got)[:8]} "
+                            f"extra={sorted(_got - _exp)[:8]} "
+                            f"seq_lens_row={decode_metadata.seq_lens.reshape(-1)[_r].item() if decode_metadata.seq_lens.numel() > _r else '?'} "
+                            f"next_n={next_n}",
+                            flush=True,
+                        )
         else:
             out = topk_dst
 
+        if _trace:
+            _oc = out.cpu()
+            _stats = []
+            for _r in range(min(4, _oc.shape[0])):
+                _v = _oc[_r][_oc[_r] >= 0]
+                _stats.append(
+                    f"r{_r}:n={_v.numel()}"
+                    + (f",min={int(_v.min())},max={int(_v.max())}" if _v.numel() else "")
+                )
+            print(
+                f"KPOOL_TRACE#{_TRACE_COUNT} decode_out rows={_oc.shape[0]} "
+                f"width={_oc.shape[1]} {' '.join(_stats)} "
+                f"pad={decode_metadata.requires_padding}",
+                flush=True,
+            )
         if decode_metadata.requires_padding:
             # Drop padded query rows introduced by the next_n padding above.
             out = unpack_seq_triton(

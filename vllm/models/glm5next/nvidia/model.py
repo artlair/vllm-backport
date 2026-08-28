@@ -719,9 +719,35 @@ class Glm5NextModel(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
-        for layer in self._active_layers:
+        # Debug layer trace (VLLM_GLM_LAYER_TRACE=<dir>): capture per-layer
+        # outputs on small decode batches for offline spec-vs-nonspec bisects.
+        import os as _os
+
+        _lt_dir = _os.environ.get("VLLM_GLM_LAYER_TRACE")
+        _lt = None
+        if _lt_dir and 0 < positions.numel() <= 64:
+            _n = getattr(self, "_lt_count", 0)
+            if _n < int(_os.environ.get("VLLM_GLM_LAYER_TRACE_MAX", "40")):
+                self._lt_count = _n + 1
+                _lt = {
+                    "positions": positions.cpu().clone(),
+                    "input_ids": (
+                        input_ids.cpu().clone() if input_ids is not None else None
+                    ),
+                    "layers": {},
+                }
+
+        for _li, layer in enumerate(self._active_layers):
             hidden_states, residual, post, comb = layer(
                 positions, hidden_states, residual, post, comb
+            )
+            if _lt is not None:
+                _lt["layers"][_li] = hidden_states.float().cpu().clone()
+
+        if _lt is not None:
+            torch.save(
+                _lt,
+                f"{_lt_dir}/lt_{_os.getpid()}_{self._lt_count - 1:03d}.pt",
             )
 
         if not get_pp_group().is_last_rank:
