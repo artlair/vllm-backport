@@ -1497,12 +1497,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 if seq_lens_is_buffer_view:
                     seq_lens //= self.compress_ratio
                 else:
-                    # Copy to avoid mutating shared state; keeps CG address stable.
-                    self.expanded_seq_lens_buffer[:num_decodes] = (
+                    # Copy to avoid mutating shared state; keeps CG address
+                    # stable. Slice by the SOURCE length: on the flattened
+                    # path seq_lens is per-token (num_decode_tokens), while
+                    # num_decodes can exceed it on cudagraph-padded draft
+                    # batches (padding requests carry zero-length queries), so
+                    # slicing the destination by num_decodes over- or
+                    # under-runs the copy.
+                    n_src = seq_lens.shape[0]
+                    self.expanded_seq_lens_buffer[:n_src] = (
                         seq_lens // self.compress_ratio
                     )
-                    self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
-                    seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
+                    if n_src < num_decode_tokens:
+                        self.expanded_seq_lens_buffer[n_src:num_decode_tokens] = 0
+                    seq_lens = self.expanded_seq_lens_buffer[
+                        : max(n_src, num_decode_tokens)
+                    ]
 
             # Non-MTP: deep_gemm paged MQA logits requires 2D context_lens
             # (csrc/apis/attention.hpp). Unsqueeze to (B, 1) so downstream
