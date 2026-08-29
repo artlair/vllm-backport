@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -309,6 +310,32 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        # PP decode microbatching (VLLM_PP_DECODE_MICROBATCH): cap the number
+        # of pure-decode requests admitted per schedule() call so the running
+        # set splits into disjoint batches staggered across pipeline slots.
+        # Without a cap, requests that once get scheduled together receive the
+        # same `next_decode_eligible_step` forever (phases merge, never split),
+        # so a cohort collapses into one fat batch per pp_size steps and the
+        # other pipeline slots run empty batches. The cadence gate keeps every
+        # request's decode-to-decode gap at pp_size steps, which is exactly the
+        # worker-side PPHandler ring depth, so a cap (which only ever delays a
+        # request further) is always safe. Values: unset/"0" = off (upstream
+        # behavior), "auto" = ceil(len(running)/pp_size) recomputed each step,
+        # a positive integer = fixed cap. Only meaningful where the cadence
+        # gate is active (V2 runner + PP + async scheduling); ignored elsewhere.
+        self.decode_microbatch = 0
+        if (
+            self.use_pp
+            and self.use_v2_model_runner
+            and self.scheduler_config.async_scheduling
+        ):
+            raw = os.environ.get("VLLM_PP_DECODE_MICROBATCH", "0")
+            self.decode_microbatch = -1 if raw == "auto" else int(raw)
+            if self.decode_microbatch:
+                logger.info(
+                    "PP decode microbatching enabled: %s",
+                    "auto" if self.decode_microbatch < 0 else self.decode_microbatch,
+                )
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -545,6 +572,23 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # PP decode microbatching: cap on pure-decode admissions this step
+        # (-1 = uncapped). See the knob comment in __init__.
+        decode_cap = -1
+        num_decodes_scheduled = 0
+        if self.decode_microbatch:
+            decode_cap = (
+                self.decode_microbatch
+                if self.decode_microbatch > 0
+                else max(
+                    1,
+                    -(
+                        -len(self.running)
+                        // self.parallel_config.pipeline_parallel_size
+                    ),
+                )
+            )
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -571,6 +615,19 @@ class Scheduler(SchedulerInterface):
             if self.current_step < request.next_decode_eligible_step:
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
+                req_index += 1
+                continue
+
+            if (
+                decode_cap >= 0
+                and not request.is_prefill_chunk
+                and num_decodes_scheduled >= decode_cap
+            ):
+                # PP decode microbatching: leave the remaining decodes for the
+                # following steps so multiple disjoint batches occupy pipeline
+                # slots concurrently instead of one fat batch per traversal.
+                # `continue` rather than `break` so in-progress prefill chunks
+                # behind the decode cohort still get scheduled this step.
                 req_index += 1
                 continue
 
@@ -683,6 +740,8 @@ class Scheduler(SchedulerInterface):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
+                            if not preempted_req.is_prefill_chunk:
+                                num_decodes_scheduled -= 1
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
@@ -719,6 +778,8 @@ class Scheduler(SchedulerInterface):
             # Schedule the request.
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
+            if not request.is_prefill_chunk:
+                num_decodes_scheduled += 1
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
