@@ -149,10 +149,12 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # PIECEWISE cudagraphs are not supported for draft decodes.
+        draft_cg_env = os.environ.get("VLLM_MTP_DRAFT_DECODE_CG", "").lower()
+        decode_capture_size_cap = None
         if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         elif (
-            os.environ.get("VLLM_MTP_DRAFT_DECODE_CG", "").lower() == "full"
+            draft_cg_env in ("full", "full-batched")
             and self.attn_cg_support.min_cg_support.value
             >= AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE.value
         ):
@@ -164,6 +166,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             # decode steps cost ~a full pipeline step in launch overhead, so
             # without this MTP cannot win on multi-node PP topologies.
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+            if draft_cg_env == "full":
+                # "full" captures BATCH SIZE 1 ONLY: batched (num_reqs > 1)
+                # FULL draft replays corrupt mixed-length batches — the
+                # capture-time bake (1-2 token dummy sequences) leaves some
+                # value-dependent state stale, and a ~70k-ctx request batched
+                # with a ~25k one degenerates into token loops within minutes
+                # (reproduced 2/6 soak rounds batched, 0/25 batch-1-only;
+                # cousin of vllm-project/vllm#46088). Single-stream is where
+                # the FULL-graph speedup matters (~78 vs ~63 tok/s); batched
+                # draft steps take the always-correct eager path via
+                # dispatch() falling back to NONE. "full-batched" keeps the
+                # unrestricted (corrupting) behavior for root-cause work.
+                decode_capture_size_cap = 1
         else:
             cudagraph_mode = CUDAGraphMode.NONE
 
@@ -173,6 +188,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=1,
+            capture_size_cap=decode_capture_size_cap,
         )
 
     def capture(self) -> None:

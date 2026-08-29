@@ -114,6 +114,7 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        capture_size_cap: int | None = None,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -123,6 +124,13 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        # Optional ceiling on the capture sizes this manager captures. Sizes
+        # above the cap are simply not captured, so dispatch() falls back to
+        # eager (NONE) for them. Used by the speculator's decode manager to
+        # keep opt-in FULL draft graphs at batch size 1 only: batched FULL
+        # replays corrupt mixed-length batches (stale capture-time bakes), so
+        # multi-request draft steps take the always-correct eager path.
+        self.capture_size_cap = capture_size_cap
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -185,6 +193,8 @@ class CudaGraphManager:
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
+        if self.capture_size_cap is not None:
+            capture_sizes = [s for s in capture_sizes if s <= self.capture_size_cap]
         if not (self.cudagraph_mode and capture_sizes):
             return
 
