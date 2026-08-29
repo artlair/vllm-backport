@@ -730,7 +730,19 @@ def compute_kpool_tail_slot_mapping(
     req = req.clamp_(min=0, max=num_reqs - 1)
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
-    out[:num_actual_tokens] = own_block * kpool + torch.remainder(pos, kpool)
+    # Preserve the PAD sentinel for tokens whose generic slot mapping is PAD
+    # (cudagraph padding lanes past the real batch). Those lanes' `req`
+    # clamps to the last request index, whose block-table row under a padded
+    # FULL-graph replay is a stale or zeroed row — i.e. a block owned by a
+    # LIVE request. The tail stash kernel gates only on tail_slot >= 0, so
+    # overwriting the sentinel here let padding lanes scribble raw K + gate
+    # scores into another request's in-progress kpool pool, which is then
+    # compressed permanently into its index cache (the mixed-length
+    # concurrent-decode corruption behind the batch-1 capture cap).
+    src = slot_mapping[:num_actual_tokens]
+    out[:num_actual_tokens] = torch.where(
+        src >= 0, own_block * kpool + torch.remainder(pos, kpool), src
+    )
     return out
 
 

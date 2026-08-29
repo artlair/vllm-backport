@@ -643,6 +643,14 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert self.decode_cudagraph_manager is not None
                 self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+                # Mirror the vllm#40756 per-step fence from _generate_draft
+                # (see the comment there): the eager path fences after every
+                # step, but graph replay bypasses _generate_draft entirely,
+                # leaving the next step's metadata rebuild / plan copies
+                # unordered against the replay's buffer writes. Replay is not
+                # capture, so the capturing guard is only for safety.
+                if not self._no_fence and not torch.cuda.is_current_stream_capturing():
+                    torch.accelerator.current_stream().synchronize()
             else:
                 self._generate_draft(
                     num_reqs,
@@ -795,6 +803,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_reqs,
             self.max_model_len,
             self.num_speculative_steps,
+            self.idx_mapping,
             advance_draft_positions=self.advance_draft_positions,
         )
         self._perf_mark("d_update")
@@ -1028,10 +1037,21 @@ def _update_draft_inputs_kernel(
     hidden_size,
     max_model_len,
     num_speculative_steps,
+    idx_mapping_ptr,
     BLOCK_SIZE: tl.constexpr,
     ADVANCE_DRAFT_POSITIONS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
+
+    # FULL cudagraphs bake this kernel's grid at the CAPTURED (padded)
+    # request count, so replays run programs for padding lanes past the
+    # real batch. Those lanes must stay inert: advancing their seq_lens
+    # breaks the seq_len == 0 padding invariant the sparse indexer relies
+    # on, and their positions feed stale-state derived writes. idx_mapping
+    # is -1 exactly for padding lanes (set every propose()) and >= 0 at
+    # capture (zeroed), so capture still records the full per-lane work.
+    if tl.load(idx_mapping_ptr + req_idx) < 0:
+        return
 
     # Write the sampled draft token into self.draft_tokens[req_idx, step].
     draft_token = tl.load(draft_tokens_ptr + req_idx)
@@ -1089,6 +1109,7 @@ def update_draft_inputs(
     num_reqs: int,
     max_model_len: int,
     num_speculative_steps: int,
+    idx_mapping: torch.Tensor,
     advance_draft_positions: bool = True,
 ):
     _, hidden_size = hidden_states.shape
@@ -1107,6 +1128,7 @@ def update_draft_inputs(
         hidden_size,
         max_model_len,
         num_speculative_steps,
+        idx_mapping,
         BLOCK_SIZE=1024,
         ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
     )
