@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 import time
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -53,14 +53,64 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self._perf_on = False
         self._perf_rec: list[tuple[str, float]] = []
         self._perf_call = 0
-        # Skip the per-step full-stream fences (measurement experiment for the
-        # vllm#40756 workaround cost; may reintroduce the IMA it papers over).
-        self._no_fence = os.environ.get("VLLM_MTP_NO_FENCE") == "1"
+        # vllm#40756 fence mode. "sync" (default) = the upstream workaround,
+        # a host-blocking current-stream synchronize at each fence site. On a
+        # deep-PP deploy the main stream is headed by the p2p recv wait, so
+        # each drain costs ~a full pipeline traversal of host time (measured
+        # ~6% single-stream on the GLM-5.3 cluster). "event"
+        # (VLLM_MTP_FENCE_EVENT=1) = device-side bidirectional event join
+        # between the main stream and every worker side stream: side streams'
+        # future work waits on the draft's buffer writes and the main stream's
+        # future work waits on side-stream copies — the two orderings the
+        # host drain enforced — at microsecond host cost. "off"
+        # (VLLM_MTP_NO_FENCE=1) = no fence (measurement only; reintroduces
+        # the IMA family the fence papers over).
+        if os.environ.get("VLLM_MTP_NO_FENCE") == "1":
+            self._fence_mode = "off"
+        elif os.environ.get("VLLM_MTP_FENCE_EVENT") == "1":
+            self._fence_mode = "event"
+        else:
+            self._fence_mode = "sync"
+        self._fence_side_streams: Callable[[], list[torch.cuda.Stream]] | None = None
+        self._fence_main_event = torch.cuda.Event()
+        self._fence_side_events: list[torch.cuda.Event] = []
 
     def _perf_mark(self, label: str) -> None:
         if self._perf_on:
             torch.cuda.synchronize()
             self._perf_rec.append((label, time.perf_counter()))
+
+    def set_fence_side_streams(
+        self, provider: "Callable[[], list[torch.cuda.Stream]]"
+    ) -> None:
+        """Provide the worker's side streams for event-mode fencing. Called
+        lazily at each fence so streams created after speculator init (e.g.
+        structured outputs) are picked up."""
+        self._fence_side_streams = provider
+
+    def _fence(self) -> None:
+        # vllm#40756 ordering fence — see the comment in propose(). Illegal
+        # and unnecessary while capturing (replay order is fixed by
+        # capture-time stream dependencies).
+        if self._fence_mode == "off" or torch.cuda.is_current_stream_capturing():
+            return
+        if self._fence_mode == "sync" or self._fence_side_streams is None:
+            torch.accelerator.current_stream().synchronize()
+            return
+        # Event mode: device-side bidirectional join of the main stream and
+        # every side stream. Future side-stream work waits on the draft's
+        # buffer writes; future main-stream work waits on in-flight
+        # side-stream copies. Same orderings the host drain enforced, without
+        # blocking the host.
+        main = torch.cuda.current_stream()
+        side_streams = self._fence_side_streams()
+        self._fence_main_event.record(main)
+        while len(self._fence_side_events) < len(side_streams):
+            self._fence_side_events.append(torch.cuda.Event())
+        for stream, event in zip(side_streams, self._fence_side_events):
+            stream.wait_event(self._fence_main_event)
+            event.record(stream)
+            main.wait_event(event)
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -599,8 +649,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # unnecessary there: replay order is fixed by the capture-time stream
         # dependencies, so the cross-launch race cannot occur inside a graph.
         self._perf_mark("pf_sample")
-        if not self._no_fence and not torch.cuda.is_current_stream_capturing():
-            torch.accelerator.current_stream().synchronize()
+        self._fence()
 
     def _multi_step_decode(
         self,
@@ -649,8 +698,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 # leaving the next step's metadata rebuild / plan copies
                 # unordered against the replay's buffer writes. Replay is not
                 # capture, so the capturing guard is only for safety.
-                if not self._no_fence and not torch.cuda.is_current_stream_capturing():
-                    torch.accelerator.current_stream().synchronize()
+                self._fence()
             else:
                 self._generate_draft(
                     num_reqs,
@@ -808,8 +856,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self._perf_mark("d_update")
         # See the fence comment in propose(): vllm-project/vllm#40756.
-        if not self._no_fence and not torch.cuda.is_current_stream_capturing():
-            torch.accelerator.current_stream().synchronize()
+        self._fence()
 
 
 @triton.jit

@@ -253,6 +253,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
+                if hasattr(self.speculator, "set_fence_side_streams"):
+                    self.speculator.set_fence_side_streams(
+                        self._speculator_fence_streams
+                    )
 
             if self.speculative_config.method in (
                 "eagle3",
@@ -565,6 +569,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def main_stream(self) -> torch.cuda.Stream:
         # Cache the default CUDA stream to avoid lookup overhead.
         return torch.cuda.current_stream(self.device)
+
+    def _speculator_fence_streams(self) -> list[torch.cuda.Stream]:
+        # Every side stream this worker enqueues work on. The speculator's
+        # event-mode vllm#40756 fence joins these with the main stream
+        # device-side instead of draining the main stream host-side.
+        streams = [self.output_copy_stream, self.draft_tokens_handler.copy_stream]
+        if self.pp_handler is not None:
+            streams.append(self.pp_handler.broadcast_stream)
+        if self.structured_outputs_worker is not None:
+            streams.append(self.structured_outputs_worker.copy_stream)
+        if self.adaptive_verification is not None:
+            streams.append(self.adaptive_verification._copy_stream)
+        return streams
 
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:
         encoder_runner = getattr(self.model_state, "encoder_runner", None)
