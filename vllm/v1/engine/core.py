@@ -214,6 +214,8 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        # Debug: per-slot dispatch/completion timeline for PP pipelining work.
+        self._slot_trace = os.environ.get("VLLM_SLOT_TRACE", "0") == "1"
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -697,6 +699,18 @@ class EngineCore:
                 )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
+            if self._slot_trace:
+                scheduler_output._trace = (  # type: ignore[attr-defined]
+                    self.scheduler.current_step,
+                    time.monotonic(),
+                )
+                logger.info(
+                    "SLOTTRACE dispatch step=%d ntok=%d nreq=%d qdepth=%d",
+                    self.scheduler.current_step,
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(scheduler_output.num_scheduled_tokens),
+                    len(batch_queue),
+                )
 
             if self.is_pooling_model or not model_executed:
                 # No sampling required (no requests scheduled).
@@ -739,6 +753,14 @@ class EngineCore:
             self.log_error_detail(scheduler_output),
         ):
             model_output = future.result()
+            if self._slot_trace and hasattr(scheduler_output, "_trace"):
+                _sid, _t0 = scheduler_output._trace  # type: ignore[attr-defined]
+                logger.info(
+                    "SLOTTRACE done step=%d ntok=%d lat_ms=%.1f",
+                    _sid,
+                    scheduler_output.total_num_scheduled_tokens,
+                    (time.monotonic() - _t0) * 1000,
+                )
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.

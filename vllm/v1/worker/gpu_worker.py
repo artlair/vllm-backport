@@ -1096,6 +1096,15 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        if getattr(self, "_wtrace", False):
+            _t0 = time.monotonic()
+            out = self.model_runner.sample_tokens(grammar_output)
+            logger.info(
+                "WTRACE sample pp=%d dur=%.1f",
+                self._wtrace_pp,
+                (time.monotonic() - _t0) * 1e3,
+            )
+            return out
         return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
@@ -1103,11 +1112,19 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if not hasattr(self, "_wtrace"):
+            self._wtrace = (
+                os.environ.get("VLLM_SLOT_TRACE", "0") == "1"
+                and get_tp_group().rank_in_group == 0
+            )
+            self._wtrace_pp = get_pp_group().rank_in_group
+        _t0 = time.monotonic()
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
+        _t1 = time.monotonic()
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -1145,6 +1162,7 @@ class Worker(WorkerBase):
                 )
             }
 
+        _t2 = time.monotonic()
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
@@ -1158,6 +1176,7 @@ class Worker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
+        _t3 = time.monotonic()
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
@@ -1172,6 +1191,18 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                if self._wtrace:
+                    _t4 = time.monotonic()
+                    logger.info(
+                        "WTRACE exec pp=%d ntok=%d sendwait=%.1f mdrv=%.1f "
+                        "run=%.1f tot=%.1f",
+                        self._wtrace_pp,
+                        num_scheduled_tokens,
+                        (_t1 - _t0) * 1e3,
+                        (_t3 - _t2) * 1e3,
+                        (_t4 - _t3) * 1e3,
+                        (_t4 - _t0) * 1e3,
+                    )
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1188,6 +1219,17 @@ class Worker(WorkerBase):
             all_gather_tensors=all_gather_tensors,
         )
 
+        if self._wtrace:
+            _t4 = time.monotonic()
+            logger.info(
+                "WTRACE exec pp=%d ntok=%d sendwait=%.1f mdrv=%.1f run=%.1f tot=%.1f",
+                self._wtrace_pp,
+                num_scheduled_tokens,
+                (_t1 - _t0) * 1e3,
+                (_t3 - _t2) * 1e3,
+                (_t4 - _t3) * 1e3,
+                (_t4 - _t0) * 1e3,
+            )
         return None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
