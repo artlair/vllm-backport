@@ -47,6 +47,14 @@ elif current_platform.is_xpu():
 
 logger = init_logger(__name__)
 
+# Debug gates hoisted to import time: these sit on the per-layer decode hot
+# path (2-3 indexer calls per stage per step) where a per-call environ.get
+# is measurable launch overhead.
+import os as _os  # noqa: E402
+
+_KPOOL_TRACE = _os.environ.get("VLLM_KPOOL_TRACE") == "1"
+_KPOOL_CHECK_DECODE_TOPK = _os.environ.get("VLLM_KPOOL_CHECK_DECODE_TOPK") == "1"
+
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
@@ -347,9 +355,7 @@ def sparse_attn_indexer_kpool(
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
 
     # Debug trace (VLLM_KPOOL_TRACE=1): what each indexer call is doing.
-    import os as _os
-
-    _trace = _os.environ.get("VLLM_KPOOL_TRACE") == "1"
+    _trace = _KPOOL_TRACE
     if _trace:
         global _TRACE_COUNT
         try:
@@ -905,9 +911,7 @@ def sparse_attn_indexer_kpool(
             # correct top-k selection is exactly the full causal set, so any
             # missing/extra/duplicate index is a selection-chain bug. Gated;
             # eager-mode only (host sync + python loop).
-            import os as _os
-
-            if _os.environ.get("VLLM_KPOOL_CHECK_DECODE_TOPK") == "1":
+            if _KPOOL_CHECK_DECODE_TOPK:
                 _dec_seq_cpu = dec_seq.cpu()
                 _out_cpu = out.cpu()
                 for _r in range(_out_cpu.shape[0]):
