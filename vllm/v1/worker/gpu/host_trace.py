@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ENABLED = os.environ.get("VLLM_BUILDER_TRACE", "0") == "1"
-_INTERVAL = int(os.environ.get("VLLM_BUILDER_TRACE_INTERVAL", "500"))
+_INTERVAL = int(os.environ.get("VLLM_BUILDER_TRACE_INTERVAL", "200"))
 
 _samples: dict[str, list[float]] = defaultdict(list)
 _steps = 0
