@@ -532,6 +532,13 @@ class GroupCoordinator:
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
 
+        # PP cached-metadata caches (isend_tensor_dict/irecv_tensor_dict
+        # metadata_sig fast path). Keyed by a caller-provided signature that
+        # is a deterministic function of the broadcast scheduler_output, so
+        # the sender's and receiver's caches evolve in lockstep.
+        self._send_meta_cache: dict[Any, list] = {}
+        self._recv_meta_cache: dict[Any, list] = {}
+
     def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
         """Create a new device-side ProcessGroup with the same per-rank membership
         as this coordinator's `device_group`, but backed by a distinct communicator.
@@ -1022,10 +1029,12 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        metadata_sig: Any = None,
     ) -> list[Handle]:
         if self.world_size <= 1:
             return []
 
+        use_meta_cache = metadata_sig is not None and dst is None
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
@@ -1048,7 +1057,23 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
+        # PP cached-metadata fast path (VLLM_PP_CACHED_METADATA): for steps
+        # whose metadata is a deterministic function of the broadcast
+        # scheduler_output (uniform decode), both peers cache the metadata
+        # under the same signature and elide the blocking gloo rendezvous on
+        # hits, so the receiver can post its NCCL irecv and launch its
+        # forward without waiting for the sender's launch to finish.
+        cached = self._send_meta_cache.get(metadata_sig) if use_meta_cache else None
+        if cached is not None:
+            if cached != metadata_list:
+                raise RuntimeError(
+                    "PP cached-metadata mismatch for sig "
+                    f"{metadata_sig}: cached={cached} actual={metadata_list}"
+                )
+        else:
+            self.send_object(metadata_list, dst=dst)
+            if use_meta_cache:
+                self._send_meta_cache[metadata_sig] = metadata_list
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
@@ -1116,6 +1141,7 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        metadata_sig: Any = None,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -1124,6 +1150,7 @@ class GroupCoordinator:
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None, [], []
 
+        use_meta_cache = metadata_sig is not None and src is None
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
@@ -1145,7 +1172,15 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
-        recv_metadata_list = self.recv_object(src=src)
+        # See the cached-metadata comment in isend_tensor_dict: on a hit the
+        # sender elided its metadata send, so we must not post a gloo recv.
+        cached = self._recv_meta_cache.get(metadata_sig) if use_meta_cache else None
+        if cached is not None:
+            recv_metadata_list = cached
+        else:
+            recv_metadata_list = self.recv_object(src=src)
+            if use_meta_cache:
+                self._recv_meta_cache[metadata_sig] = recv_metadata_list
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []

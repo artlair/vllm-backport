@@ -1107,6 +1107,42 @@ class Worker(WorkerBase):
             return out
         return self.model_runner.sample_tokens(grammar_output)
 
+    def _pp_metadata_sig(self, scheduler_output: "SchedulerOutput"):
+        """Signature for the PP cached-metadata fast path, or None.
+
+        Non-None only for pure uniform spec-decode steps, where the
+        intermediate-tensor metadata (a single [N, ...] hidden_states entry,
+        N = padded token count) is a deterministic function of the
+        scheduler_output that every PP rank received identically over the
+        broadcast RPC queue — so sender and receiver caches evolve in
+        lockstep with zero extra wire traffic (same trust model as the
+        empty-step hop skip and PPHandler's need_sampled gating).
+        """
+        if not self._pp_cached_meta:
+            return None
+        if getattr(self.model_runner, "adaptive_verification", None) is not None:
+            # Confidence-trimmed num_toks: padding not sig-deterministic.
+            return None
+        nst = scheduler_output.num_scheduled_tokens
+        if not nst or scheduler_output.scheduled_new_reqs:
+            return None
+        q = self.model_runner.decode_query_len
+        spec = scheduler_output.scheduled_spec_decode_tokens
+        num_reqs = len(nst)
+        # Pure uniform decode: every request is q tokens = 1 target + (q-1)
+        # proposed drafts. Prefill/mixed/first-decode steps fall through to
+        # the full gloo rendezvous.
+        if any(c != q for c in nst.values()):
+            return None
+        if q > 1:
+            if len(spec) != num_reqs:
+                return None
+            if any(len(d) != q - 1 for d in spec.values()):
+                return None
+        elif spec:
+            return None
+        return (num_reqs, scheduler_output.total_num_scheduled_tokens, q)
+
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
@@ -1118,6 +1154,11 @@ class Worker(WorkerBase):
                 and get_tp_group().rank_in_group == 0
             )
             self._wtrace_pp = get_pp_group().rank_in_group
+            self._pp_cached_meta = (
+                os.environ.get("VLLM_PP_CACHED_METADATA", "0") == "1"
+                and self.use_v2_model_runner
+                and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+            )
         _t0 = time.monotonic()
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
@@ -1162,12 +1203,14 @@ class Worker(WorkerBase):
                 )
             }
 
+        pp_meta_sig = self._pp_metadata_sig(scheduler_output)
         _t2 = time.monotonic()
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
                     all_gather_tensors=all_gather_tensors,
+                    metadata_sig=pp_meta_sig,
                 )
             )
             assert tensor_dict is not None
@@ -1217,6 +1260,7 @@ class Worker(WorkerBase):
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
+            metadata_sig=pp_meta_sig,
         )
 
         if self._wtrace:
