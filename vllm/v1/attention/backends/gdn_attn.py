@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
 import torch
+
+# Steady-state fast path for pure uniform spec-decode batches: replaces the
+# mask/argsort/item() machinery with direct persistent-buffer staging.
+_GDN_FAST_UNIFORM = os.environ.get("VLLM_GDN_FAST_UNIFORM", "0") == "1"
 
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -165,6 +170,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             device=device,
         )
 
+        # Uniform spec-decode fast path (VLLM_GDN_FAST_UNIFORM=1). The staged
+        # buffer contents for masks / token indices / query_start_loc are
+        # constant for a given batch size on pure uniform spec batches, so
+        # high-water marks let steady-state steps skip re-writing them. Any
+        # generic build or capture invalidates the marks.
+        self._fast_uniform: bool = _GDN_FAST_UNIFORM and self.use_spec_decode
+        self._fast_mask_hw: int = 0
+        self._fast_indx_hw: int = 0
+        self._fast_qsl_hw: int = 0
+        if self._fast_uniform:
+            max_tok = self.decode_cudagraph_max_bs * (self.num_spec + 1)
+            self._fast_arange_src: torch.Tensor = torch.arange(
+                max_tok, dtype=torch.int32, device=device
+            )
+            self._fast_qsl_src: torch.Tensor = torch.arange(
+                0,
+                (self.decode_cudagraph_max_bs + 1) * (self.num_spec + 1),
+                self.num_spec + 1,
+                dtype=torch.int32,
+                device=device,
+            )
+
     def _build_chunk_metadata(
         self,
         prefill_query_start_loc: torch.Tensor,
@@ -207,6 +234,69 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             ),
         )
 
+    def _build_fast_uniform_spec(
+        self,
+        m: CommonAttentionMetadata,
+        block_table_tensor: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+    ) -> "GDNAttentionMetadata":
+        """Pure uniform spec-decode batch (every request is a spec row with
+        exactly num_spec drafts, no padding): the generic mask machinery
+        reduces to constants, so stage the persistent cudagraph buffers
+        directly. Buffer contents proven identical to the generic
+        pure-uniform branch; constant-content prefixes are skipped via
+        high-water marks."""
+        num_reqs = m.num_reqs
+        num_tokens = m.num_actual_tokens
+
+        if self._fast_mask_hw < num_reqs:
+            self.spec_sequence_masks[:num_reqs].fill_(True)
+            self._fast_mask_hw = num_reqs
+        if self._fast_indx_hw < num_tokens:
+            self.spec_token_indx[:num_tokens].copy_(
+                self._fast_arange_src[:num_tokens], non_blocking=True
+            )
+            self._fast_indx_hw = num_tokens
+        if self._fast_qsl_hw < num_reqs + 1:
+            self.spec_query_start_loc[: num_reqs + 1].copy_(
+                self._fast_qsl_src[: num_reqs + 1], non_blocking=True
+            )
+            self._fast_qsl_hw = num_reqs + 1
+
+        self.spec_state_indices_tensor[:num_reqs].copy_(
+            block_table_tensor[:num_reqs, : self.num_spec + 1], non_blocking=True
+        )
+        self.num_accepted_tokens[:num_reqs].copy_(
+            num_accepted_tokens[:num_reqs], non_blocking=True
+        )
+
+        return GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=num_reqs,
+            num_spec_decode_tokens=num_tokens,
+            num_actual_tokens=num_tokens,
+            has_initial_state=None,
+            chunk_indices=None,
+            chunk_offsets=None,
+            prefill_query_start_loc=None,
+            prefill_state_indices=None,
+            prefill_has_initial_state=None,
+            spec_query_start_loc=self.spec_query_start_loc[: num_reqs + 1],
+            non_spec_query_start_loc=None,
+            spec_state_indices_tensor=self.spec_state_indices_tensor[:num_reqs],
+            non_spec_state_indices_tensor=None,
+            spec_sequence_masks=self.spec_sequence_masks[:num_reqs],
+            spec_token_indx=self.spec_token_indx[:num_tokens],
+            non_spec_token_indx=self.non_spec_token_indx[:0],
+            num_accepted_tokens=self.num_accepted_tokens[:num_reqs],
+            nums_dict=None,
+            batch_ptr=None,
+            token_chunk_offset_ptr=None,
+        )
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -226,6 +316,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
+
+        if (
+            self._fast_uniform
+            and self.use_full_cuda_graph
+            and num_decode_draft_tokens_cpu is not None
+            and m.max_query_len == self.num_spec + 1
+            and m.num_reqs * (self.num_spec + 1) == m.num_actual_tokens
+            and m.num_reqs <= self.decode_cudagraph_max_bs
+            and m.num_actual_tokens <= self.decode_cudagraph_max_bs
+            and num_accepted_tokens is not None
+            and bool((num_decode_draft_tokens_cpu == self.num_spec).all())
+        ):
+            return self._build_fast_uniform_spec(
+                m, block_table_tensor, num_accepted_tokens
+            )
+        # Generic path may overwrite the staged buffers with arbitrary
+        # orderings; the fast path must re-stage them next time.
+        self._fast_mask_hw = 0
+        self._fast_indx_hw = 0
+        self._fast_qsl_hw = 0
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:

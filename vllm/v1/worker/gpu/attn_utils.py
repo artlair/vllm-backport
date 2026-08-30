@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
+
+from vllm.v1.worker.gpu import host_trace
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
@@ -323,11 +326,17 @@ def build_attn_metadata(
                     if model_specific_attn_metadata is not None
                     else {}
                 )
+                _bt0 = time.perf_counter() if host_trace.ENABLED else 0.0
                 metadata = attn_metadata_builder.build(
                     common_prefix_len=0,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+                if host_trace.ENABLED:
+                    host_trace.record(
+                        f"b.{type(attn_metadata_builder).__name__}",
+                        time.perf_counter() - _bt0,
+                    )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

@@ -73,6 +73,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.gpu import host_trace
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
@@ -1583,6 +1584,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         context_len: int = 0,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        _ht = host_trace.ENABLED and not dummy_run
+        _t = time.perf_counter() if _ht else 0.0
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1591,6 +1594,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            if _ht:
+                _now = time.perf_counter()
+                host_trace.record("state", _now - _t)
+                _t = _now
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1605,6 +1612,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
             scheduler_output, dummy_run
         )
+        if _ht:
+            _now = time.perf_counter()
+            host_trace.record("gather", _now - _t)
+            _t = _now
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
             if self.pcp_manager is not None:
@@ -1648,10 +1659,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             assert batch_req_state is not None
+            if _ht:
+                _now = time.perf_counter()
+                host_trace.record("dispatch", _now - _t)
+                _t = _now
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc
             )
+            if _ht:
+                _now = time.perf_counter()
+                host_trace.record("prep_in", _now - _t)
+                _t = _now
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            if _ht:
+                _now = time.perf_counter()
+                host_trace.record("prep_bt", _now - _t)
+                _t = _now
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1662,6 +1685,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config,
                 self.req_states.num_computed_tokens.gpu,
             )
+            if _ht:
+                _now = time.perf_counter()
+                host_trace.record("preproc", _now - _t)
+                _t = _now
 
             if self.lora_config:
                 # Activate LoRA adapters.
@@ -1714,6 +1741,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
+            if _ht:
+                _t = time.perf_counter()
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -1726,6 +1755,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+            if _ht:
+                _now = time.perf_counter()
+                host_trace.record("build", _now - _t)
+                _t = _now
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1793,6 +1826,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        if _ht:
+            _now = time.perf_counter()
+            host_trace.record("mprep", _now - _t)
+            _t = _now
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1832,6 +1870,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if _ht:
+            host_trace.record("fwd", time.perf_counter() - _t)
+            host_trace.tick()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
