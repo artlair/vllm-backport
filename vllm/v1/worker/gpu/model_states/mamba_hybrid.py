@@ -3,9 +3,13 @@
 from dataclasses import dataclass
 from typing import Any
 
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
+
+_ALIGN_TRACE = os.environ.get("VLLM_MAMBA_ALIGN_TRACE") == "1"
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -214,6 +218,28 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_off_gpu,
             input_batch.idx_mapping,
         )
+        if _ALIGN_TRACE:
+            # Debug: print every block-boundary crossing (host sync; debug only).
+            idx = input_batch.idx_mapping[:num_reqs].cpu()
+            st = self._mamba_state_idx_gpu[idx].cpu()
+            sc = self._mamba_src_col_gpu[idx].cpu()
+            so = self._mamba_src_off_gpu[idx].cpu()
+            nc = num_computed_tokens[idx].cpu()
+            qsl = input_batch.query_start_loc[: num_reqs + 1].cpu()
+            bt = block_tables[mamba_group_ids[0]][:num_reqs].cpu()
+            try:
+                rank = torch.distributed.get_rank()
+            except Exception:  # noqa: BLE001
+                rank = -1
+            for b in range(num_reqs):
+                if int(sc[b]) >= 0 and int(sc[b]) != int(st[b]):
+                    d = int(st[b])
+                    print(
+                        f"ALIGN-XING rank={rank} slot={int(idx[b])} computed={int(nc[b])} "
+                        f"qlen={int(qsl[b + 1] - qsl[b])} src_col={int(sc[b])} "
+                        f"bias={int(so[b])} dst_col={d} row={bt[b, : d + 4].tolist()}",
+                        flush=True,
+                    )
 
     def prepare_attn(
         self,

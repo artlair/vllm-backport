@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -35,6 +36,9 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Debug: trace mamba "align" block allocation / frees (VLLM_MAMBA_ALIGN_TRACE=1).
+_ALIGN_TRACE = os.environ.get("VLLM_MAMBA_ALIGN_TRACE") == "1"
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -1588,6 +1592,15 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
+                    if _ALIGN_TRACE:
+                        logger.info(
+                            "ALIGN-FREE req=%s processed=%d idx=%d block=%d row=%s",
+                            request_id,
+                            processed_computed_tokens,
+                            last_state_block_idx,
+                            blocks[last_state_block_idx].block_id,
+                            [b.block_id for b in blocks],
+                        )
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
@@ -1812,6 +1825,17 @@ class MambaManager(SingleTypeKVCacheManager):
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)
                 returned_blocks.extend(new_blocks)
+                if _ALIGN_TRACE:
+                    logger.info(
+                        "ALIGN-ALLOC req=%s ntok=%d prev_len=%d last_state_idx=%s "
+                        "new=%s row=%s",
+                        request_id,
+                        num_tokens,
+                        prev_block_len,
+                        self.last_state_block_idx.get(request_id),
+                        [b.block_id for b in new_blocks],
+                        [b.block_id for b in req_blocks],
+                    )
                 return returned_blocks
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
