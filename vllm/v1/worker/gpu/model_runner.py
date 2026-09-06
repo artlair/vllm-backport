@@ -688,6 +688,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_interleave=self.cp_interleave,
             slot_mapping_enabled=slot_mapping_enabled,
         )
+        # Hand the per-request-slot block tables to the model state: the
+        # mamba "align" postprocess can run after its batch was replaced (PP
+        # relay consume), when batch-order tables are the wrong rows.
+        self.model_state.slot_block_tables = [
+            bt.gpu for bt in self.block_tables.block_tables
+        ]
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
             self.device,

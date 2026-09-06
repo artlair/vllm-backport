@@ -82,6 +82,9 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        # Per-request-slot block tables (set by the runner once BlockTables
+        # exist); consumed by the align postprocess, see _ensure_align_ctx.
+        self.slot_block_tables: list[torch.Tensor] | None = None
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -168,6 +171,10 @@ class MambaHybridModelState(DefaultModelState):
                 self.model.get_mamba_state_copy_func(),
                 [block_tables[gid] for gid in mamba_group_ids],
             )
+            if self.slot_block_tables is not None:
+                ctx.set_slot_block_tables(
+                    [self.slot_block_tables[gid] for gid in mamba_group_ids]
+                )
         return ctx
 
     def preprocess_state(

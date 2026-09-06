@@ -410,6 +410,10 @@ def postprocess_mamba_fused_kernel(
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
+    # Address block-table rows by request slot (req_idx) instead of batch row.
+    # Required when the kernel runs AFTER the batch it belongs to (the PP
+    # relay-consume path): the batch-order tables then hold a different batch.
+    BT_ROW_IS_REQ: tl.constexpr = False,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -474,7 +478,10 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+    if BT_ROW_IS_REQ:
+        bt_row_idx = req_idx
+    else:
+        bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     _copy_mamba_state_block(
         state_idx,
         bt_row_idx,
@@ -751,6 +758,11 @@ class MambaSpecDecodeGPUContext:
     # initialize_from_forward_context from the persistent per-group block
     # table tensors (whose data_ptr is stable across steps).
     block_table_ptrs: torch.Tensor
+    # Per-request-SLOT block tables (the persistent tables the batch-order
+    # input tables are gathered from), for kernels that run after their batch
+    # has been replaced (PP relay-consume postprocess). None until set.
+    slot_block_table_ptrs: torch.Tensor | None = None
+    slot_block_table_stride_req: int = 0
     block_table_stride_req: int = 0
 
     # persistent output for the once-per-step, all-group aligned-index launch.
@@ -1011,6 +1023,20 @@ class MambaSpecDecodeGPUContext:
 
         self.is_initialized = True
 
+    def set_slot_block_tables(self, slot_block_tables: list[torch.Tensor]) -> None:
+        """Capture the per-request-slot block tables (same order as
+        ``mamba_group_ids``) for ``run_fused_postprocess_align``."""
+        assert len(slot_block_tables) == self.num_groups
+        strides = {bt.stride(0) for bt in slot_block_tables}
+        assert len(strides) == 1, strides
+        self.slot_block_table_stride_req = int(next(iter(strides)))
+        ptrs = torch.zeros(
+            self.num_groups, dtype=torch.int64, device=self.block_table_ptrs.device
+        )
+        for i, bt in enumerate(slot_block_tables):
+            ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
+        self.slot_block_table_ptrs = ptrs
+
     def compute_aligned_state_indices(
         self,
         seq_lens: torch.Tensor,
@@ -1180,14 +1206,19 @@ class MambaSpecDecodeGPUContext:
 
         total_states = self.num_layers * self.num_state_types
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        # Under PP this runs on non-last ranks when the sampled outputs are
+        # consumed, pp_size steps after the forward: the batch-order input
+        # block tables then describe a DIFFERENT batch, so address rows by
+        # request slot through the persistent per-slot tables.
+        use_slot = self.slot_block_table_ptrs is not None
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_snapshot,
             state_idx_gpu,
             None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
             new_num_computed_tokens_gpu,
             None,  # num_draft: unused under PRECOMPUTED_NEW_COMPUTED
-            self.block_table_ptrs,
-            self.block_table_stride_req,
+            self.slot_block_table_ptrs if use_slot else self.block_table_ptrs,
+            self.slot_block_table_stride_req if use_slot else self.block_table_stride_req,
             self.state_base_addrs,
             self.state_block_strides,
             self.state_elem_sizes,
@@ -1205,6 +1236,7 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            BT_ROW_IS_REQ=use_slot,
         )
 
 
