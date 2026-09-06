@@ -231,7 +231,19 @@ class MambaHybridModelState(DefaultModelState):
                 rank = torch.distributed.get_rank()
             except Exception:  # noqa: BLE001
                 rank = -1
+            bs = mamba_spec.block_size
+            sched_nc = input_batch.num_computed_tokens_np
             for b in range(num_reqs):
+                # Scheduler-side (optimistic) view vs the migration's actual view.
+                s_after = int(sched_nc[b]) + int(qsl[b + 1] - qsl[b])
+                s_idx = (s_after + bs - 1) // bs - 1
+                if s_idx != int(st[b]) and int(sc[b]) >= 0:
+                    print(
+                        f"ALIGN-MISMATCH rank={rank} slot={int(idx[b])} actual_computed={int(nc[b])} "
+                        f"sched_computed={int(sched_nc[b])} qlen={int(qsl[b + 1] - qsl[b])} "
+                        f"migration_idx={int(st[b])} sched_gather_idx={s_idx} row={bt[b, : max(s_idx, int(st[b])) + 4].tolist()}",
+                        flush=True,
+                    )
                 if int(sc[b]) >= 0 and int(sc[b]) != int(st[b]):
                     d = int(st[b])
                     print(
