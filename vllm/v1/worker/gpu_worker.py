@@ -84,7 +84,7 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
-from vllm.v1.worker.workspace import init_workspace_manager
+from vllm.v1.worker.workspace import init_workspace_manager, lock_workspace
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.warmup import warmup_kernels
@@ -777,6 +777,16 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
 
+        if self.use_v2_model_runner:
+            # V2: run a scheduler-realistic prefill + decode (JIT-compiles the
+            # Triton kernels) BEFORE capture. Its shapes reach the shared
+            # workspace arena; growing the arena replaces the tensor, so if it
+            # ran after capture the FULL graphs would keep pointers into freed
+            # memory (upstream vllm #55341 / #55336). Then lock the arena so any
+            # later growth is a loud assert instead of silent corruption.
+            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            lock_workspace()
+
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
@@ -855,10 +865,7 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
-        if self.use_v2_model_runner:
-            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        elif get_pp_group().is_last_rank:
+        if not self.use_v2_model_runner and get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
             # fragmentation issue.
