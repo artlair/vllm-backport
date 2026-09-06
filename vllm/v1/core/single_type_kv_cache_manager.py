@@ -1840,6 +1840,12 @@ class MambaManager(SingleTypeKVCacheManager):
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
+            if _ALIGN_TRACE:
+                logger.info(
+                    "ALIGN-REQFREE req=%s row=%s",
+                    request_id,
+                    [b.block_id for b in self.req_to_blocks.get(request_id, [])],
+                )
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
             self._num_checkpoint_blocks.pop(request_id, None)
