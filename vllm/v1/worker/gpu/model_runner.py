@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -64,7 +65,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KpoolTailSpec, MambaSpec
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -162,6 +163,10 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import use_workspace_lane
 
 logger = init_logger(__name__)
+
+_KPOOL_TAIL_GENERIC_EXCLUDE = (
+    os.environ.get("VLLM_KPOOL_TAIL_GENERIC_EXCLUDE", "1") != "0"
+)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -610,9 +615,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         block_sizes = []
         max_num_blocks_per_group = []
+        slot_mapping_enabled = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            # KpoolTailSpec is a 1-block-per-request ring with its own mapping
+            # (KpoolTailMetadataBuilder). The generic position-indexed kernel
+            # reads its 32-column block-table row at pos // kpool with no
+            # bound, i.e. far past the tensor on any real conversation
+            # (position 130560 IMA'd on 4090s upstream; silent garbage here).
+            # VLLM_KPOOL_TAIL_GENERIC_EXCLUDE=0 restores the old behavior for
+            # the VLLM_KPOOL_TAIL_CHECK diagnostic only.
+            slot_mapping_enabled.append(
+                not (isinstance(spec, KpoolTailSpec) and _KPOOL_TAIL_GENERIC_EXCLUDE)
+            )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
             max_num_blocks = spec.max_num_blocks_per_req(
@@ -670,6 +686,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            slot_mapping_enabled=slot_mapping_enabled,
         )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,

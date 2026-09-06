@@ -218,6 +218,8 @@ def make_common_metadata(per_req_positions, own_blocks, with_positions=True):
 def make_tail_builder(block_size=KPOOL):
     builder = object.__new__(KpoolTailMetadataBuilder)
     builder.kv_cache_spec = SimpleNamespace(block_size=block_size)
+    # Persistent output buffer normally allocated in __init__.
+    builder.tail_slot_mapping_buffer = torch.zeros(256, dtype=torch.int64)
     return builder
 
 
@@ -241,12 +243,20 @@ def test_builder_build_uses_circular_mapping():
     )
 
 
-def test_builder_build_falls_back_without_positions():
-    """Capture / dummy builds without positions keep the generic mapping."""
+def test_builder_build_derives_positions_when_absent():
+    """Model-state paths that don't thread positions through the common
+    metadata must NOT fall back to the generic mapping (never valid for the
+    tail ring); the builder derives positions from seq_lens / query_start_loc
+    and still produces the circular mapping."""
     per_req = [list(range(10))]
     cam = make_common_metadata(per_req, [5], with_positions=False)
     meta = KpoolTailMetadataBuilder.build(make_tail_builder(), 0, cam)
-    assert meta.slot_mapping is cam.slot_mapping
+    assert meta.slot_mapping is not cam.slot_mapping
+    for pos in range(10):
+        assert int(meta.slot_mapping[pos]) == 5 * KPOOL + pos % KPOOL
+    assert torch.equal(
+        meta.slot_mapping[10:], torch.full_like(meta.slot_mapping[10:], -1)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -351,3 +361,57 @@ def test_interleaved_decode_pollution_legacy_vs_circular():
 
     # The circular mapping keeps the rings isolated under interleaving.
     torch.testing.assert_close(circular, ground_truth)
+
+
+def test_circular_mapping_ignores_generic_values_for_real_lanes():
+    """Regression: the generic tail-group slot mapping is an unbounded read
+    past a 32-column block-table row (position // kpool), so its values are
+    garbage on any real conversation. A negative garbage word must NOT turn a
+    real token into PAD (that dropped the token's raw K from the tail ring and
+    baked a stale pool into the sparse-index cache)."""
+    own_blocks = [5, 9]
+    per_req = [list(range(200, 210)), list(range(4000, 4012))]
+    positions, qsl, slot_mapping, num_actual, num_reqs = make_batch(per_req)
+    bt = make_tail_block_table(own_blocks)
+    # Garbage generic values: negatives, huge positives, and all-PAD (what the
+    # generic kernel now emits for the excluded tail group).
+    for garbage in (
+        torch.randint(-(2**31), 2**31 - 1, (num_actual,), dtype=torch.int64),
+        torch.full((num_actual,), -1, dtype=torch.int64),
+    ):
+        out = circular_tail_slots(garbage, bt, qsl, positions, num_actual, num_reqs)
+        off = 0
+        for req, prompt in enumerate(per_req):
+            for i, pos in enumerate(prompt):
+                slot = int(out[off + i])
+                assert slot == own_blocks[req] * KPOOL + pos % KPOOL
+            off += len(prompt)
+
+
+def test_circular_mapping_pads_lanes_past_query_start_loc():
+    """Cudagraph padding lanes past query_start_loc[num_reqs] (which would
+    clamp onto the last request's block-table row) stay PAD even when
+    num_actual_tokens counts them and the generic mapping says otherwise."""
+    own_blocks = [5, 9]
+    per_req = [list(range(10)), list(range(12))]
+    positions, qsl, _, num_real, num_reqs = make_batch(per_req)
+    padded = num_real + 6
+    positions = torch.cat([positions, torch.zeros(6, dtype=torch.int64)])
+    generic = torch.zeros(padded, dtype=torch.int64)  # claims every lane real
+    out = circular_tail_slots(generic, bt := make_tail_block_table(own_blocks), qsl, positions, padded, num_reqs)
+    assert torch.equal(out[num_real:], torch.full((6,), -1, dtype=torch.int64))
+    assert int(out[num_real - 1]) == own_blocks[1] * KPOOL + 11 % KPOOL
+    del bt
+
+
+def test_circular_mapping_resets_whole_persistent_buffer():
+    own_blocks = [5]
+    per_req = [list(range(6))]
+    positions, qsl, slot_mapping, num_actual, num_reqs = make_batch(per_req)
+    bt = make_tail_block_table(own_blocks)
+    buf = torch.full((64,), 12345, dtype=torch.int64)
+    out = compute_kpool_tail_slot_mapping(
+        slot_mapping, bt, qsl, positions, num_actual, num_reqs, KPOOL, out=buf
+    )
+    assert out.shape[0] == num_actual
+    assert torch.equal(buf[num_actual:], torch.full((64 - num_actual,), -1, dtype=torch.int64))

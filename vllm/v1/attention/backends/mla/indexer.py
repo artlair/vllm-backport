@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import NamedTuple
 
+import os as _os
+
 import torch
 
 import vllm.envs as envs
@@ -701,6 +703,14 @@ class DeepseekV32IndexerMetadata:
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
 
+# Only meaningful with VLLM_KPOOL_TAIL_GENERIC_EXCLUDE=0 (otherwise the
+# generic tail mapping is all PAD by construction).
+_KPOOL_TAIL_CHECK = (
+    _os.environ.get("VLLM_KPOOL_TAIL_CHECK") == "1"
+    and _os.environ.get("VLLM_KPOOL_TAIL_GENERIC_EXCLUDE", "1") == "0"
+)
+
+
 def compute_kpool_tail_slot_mapping(
     slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
@@ -717,12 +727,27 @@ def compute_kpool_tail_slot_mapping(
     metadata's tensor addresses at capture, so a freshly cloned mapping would
     leave replays reading the capture-time tensor while build() writes a new
     one nobody consumes.
+
+    The generic slot mapping (``slot_mapping``) is NEVER consulted for the
+    value of a lane. The generic kernel indexes the tail group's one-block
+    table row by ``pos // kpool`` with no bound, so past position
+    ``kpool * row_width`` it returns whatever memory follows that tiny
+    tensor; with the group excluded from the generic kernel it is all PAD.
+    A real token is one below ``query_start_loc[num_reqs]`` (the same rule
+    the generic kernel uses to PAD its tail), everything else -- cudagraph
+    padding lanes past the real batch, whose ``req`` would clamp to a live
+    request's stale block-table row -- is PAD so the tail stash kernels
+    early-out instead of scribbling raw K + gate into another request's
+    in-progress pool.
     """
+    n = slot_mapping.shape[0]
     if out is None:
-        out = slot_mapping.clone()
+        out = torch.full((n,), -1, dtype=slot_mapping.dtype, device=slot_mapping.device)
     else:
-        out = out[: slot_mapping.shape[0]]
-        out.copy_(slot_mapping)
+        # Replayed FULL graphs index up to the *captured* padded length, which
+        # can exceed this build's, so the whole buffer is reset to PAD.
+        out.fill_(-1)
+        out = out[:n]
     if num_actual_tokens == 0:
         return out
     tokens = torch.arange(num_actual_tokens, device=slot_mapping.device)
@@ -730,19 +755,23 @@ def compute_kpool_tail_slot_mapping(
     req = req.clamp_(min=0, max=num_reqs - 1)
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
-    # Preserve the PAD sentinel for tokens whose generic slot mapping is PAD
-    # (cudagraph padding lanes past the real batch). Those lanes' `req`
-    # clamps to the last request index, whose block-table row under a padded
-    # FULL-graph replay is a stale or zeroed row — i.e. a block owned by a
-    # LIVE request. The tail stash kernel gates only on tail_slot >= 0, so
-    # overwriting the sentinel here let padding lanes scribble raw K + gate
-    # scores into another request's in-progress kpool pool, which is then
-    # compressed permanently into its index cache (the mixed-length
-    # concurrent-decode corruption behind the batch-1 capture cap).
-    src = slot_mapping[:num_actual_tokens]
+    real = tokens < query_start_loc[num_reqs]
     out[:num_actual_tokens] = torch.where(
-        src >= 0, own_block * kpool + torch.remainder(pos, kpool), src
+        real, own_block * kpool + torch.remainder(pos, kpool), -1
     )
+    if _KPOOL_TAIL_CHECK:
+        # Diagnostic: how many REAL lanes the generic mapping would have
+        # marked PAD (the pre-fix sign test dropped their tail K).
+        src = slot_mapping[:num_actual_tokens]
+        neg = int((real & (src < 0)).sum().item())
+        if neg:
+            logger.warning(
+                "KPOOL-TAIL-NEGSRC %d of %d real lanes had a negative generic "
+                "tail slot (max_pos=%d)",
+                neg,
+                int(real.sum().item()),
+                int(pos.max().item()),
+            )
     return out
 
 
