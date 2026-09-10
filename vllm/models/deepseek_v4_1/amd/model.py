@@ -64,7 +64,12 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from ..common.engram import Engram, EngramLayout, NgramHashState
+from ..common.engram import (
+    Engram,
+    EngramLayout,
+    NgramHashState,
+    is_engram_table_weight,
+)
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
 if typing.TYPE_CHECKING:
@@ -963,6 +968,11 @@ class DeepseekV41LLMForCausalLM(
         self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
             expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
         )
+        # dsv41 engram-mmap: see lazy_mmap_weight_names.
+        engram_config = vllm_config.engram_config
+        self._engram_table_mmap = (
+            engram_config is not None and engram_config.resolved_table_mode == "mmap"
+        )
 
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
@@ -1034,6 +1044,11 @@ class DeepseekV41LLMForCausalLM(
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    def lazy_mmap_weight_names(self, name: str) -> bool:
+        """dsv41 engram-mmap: the n-gram tables are memory-mapped by their
+        weight loader, so the safetensors iterator must not read them."""
+        return self._engram_table_mmap and is_engram_table_weight(name)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

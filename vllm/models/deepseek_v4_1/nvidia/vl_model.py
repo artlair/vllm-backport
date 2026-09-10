@@ -43,6 +43,7 @@ from vllm.models.deepseek_v4.common.vision import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
+from ..common.engram import is_engram_table_weight
 from ..common.mm_preprocess import (
     IMAGE,
     IMAGE_END,
@@ -144,6 +145,11 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         self.config = config
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
+        # dsv41 engram-mmap: see lazy_mmap_weight_names.
+        engram_config = vllm_config.engram_config
+        self._engram_table_mmap = (
+            engram_config is not None and engram_config.resolved_table_mode == "mmap"
+        )
 
         # The tower is always built; _mark_tower_model stubs it out
         # (StageMissingLayer, weights skipped) when the image limit is 0.
@@ -339,6 +345,21 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
+
+    def engram_prefetch(self, **model_inputs) -> None:
+        """dsv41 engram-mmap: stage engram rows before a FULL graph replay
+        (see `DeepseekV4Model.engram_prefetch`)."""
+        self.language_model.model.engram_prefetch(**model_inputs)
+
+    def set_engram_full_graph_prefetch(self, enabled: bool) -> None:
+        self.language_model.model.set_engram_full_graph_prefetch(enabled)
+
+    def lazy_mmap_weight_names(self, name: str) -> bool:
+        """dsv41 engram-mmap: checkpoint tensors the safetensors iterator
+        must hand over as `SafetensorsMmapRef` instead of reading (the two
+        94 GiB n-gram tables); every rank benefits, PP ranks without the
+        layer simply drop the ref."""
+        return self._engram_table_mmap and is_engram_table_weight(name)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Map HF names into this wrapper's namespace up front and sort, so

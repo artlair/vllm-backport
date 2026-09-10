@@ -21,6 +21,7 @@ import functools
 import gc
 import os
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -216,6 +217,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.is_first_pp_rank = get_pp_group().is_first_rank
+        # dsv41 engram-mmap: bound `model.engram_prefetch` when the engram
+        # tables are memory-mapped and FULL cudagraphs are on (set in
+        # load_model); called before every FULL graph replay.
+        self.engram_prefetch: Callable[..., None] | None = None
         self.is_last_pp_rank = get_pp_group().is_last_rank
 
         # Size the UVA buffer pools to the max number of concurrent in-flight
@@ -471,6 +476,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        # dsv41 engram-mmap: with memory-mapped engram tables a FULL graph
+        # cannot contain the host gather, so the runner stages the rows
+        # itself before each FULL replay (see execute_model).
+        engram_config = self.vllm_config.engram_config
+        if (
+            engram_config is not None
+            and engram_config.resolved_table_mode == "mmap"
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            and hasattr(self.model, "engram_prefetch")
+        ):
+            self.model.set_engram_full_graph_prefetch(True)
+            self.engram_prefetch = self.model.engram_prefetch
+            logger.info_once("Engram mmap: staging rows before FULL graph replays")
 
         self.decode_query_len = (
             self.num_speculative_steps
@@ -1328,7 +1346,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             )
 
-
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
@@ -1841,6 +1858,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
+            if self.engram_prefetch is not None:
+                # dsv41 engram-mmap: the host gather cannot live inside the
+                # FULL graph; hash + gather now, from the same static inputs
+                # and metadata the graph reads, into the static staged rows.
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    slot_mapping=slot_mappings_by_layer,
+                    is_padding=input_batch.is_padding,
+                ):
+                    self.engram_prefetch(**model_inputs)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().

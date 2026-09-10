@@ -34,12 +34,18 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
   cache for the rest.
 """
 
+import mmap
+import os
+import re
+import time
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
 from torch import nn
 
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -49,17 +55,141 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.model_loader.weight_utils import SafetensorsMmapRef
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.common.ops.sequence_parallel import sp_shard
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
-from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.utils.torch_utils import (
+    get_accelerator_view_from_cpu_tensor,
+    weak_ref_tensor,
+)
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32
 
 logger = init_logger(__name__)
 
 # Cache value for tokens that take no part in an n-gram (image spans).
 DEAD_ID = -1
+
+# dsv41 engram-mmap: checkpoint names of the n-gram tables. In mmap mode the
+# safetensors iterator yields these as `SafetensorsMmapRef` instead of
+# reading 94 GiB per table into memory (`lazy_mmap_weight_names`).
+ENGRAM_TABLE_WEIGHT_RE = re.compile(
+    r"(?:^|\.)layers\.\d+\.engram\.embed\.(?:weight|scale)$"
+)
+
+# dsv41 engram-mmap: host gathers of more than two tokens' rows are split
+# over a thread pool so page faults on cold rows overlap (numpy's take
+# releases the GIL; a cold row is one ~200 us NVMe read, and x299's NVMe
+# sustains ~120k random 4K reads/s at queue depth 32). Chunks shrink to
+# _MMAP_GATHER_MIN_CHUNK rows so a decode batch spreads too. Measured on
+# x299 (shard 47): 98k cold rows 3.0 s / 1.9 s / 1.0 s with 8 / 16 / 32
+# threads; 192 rows (8 decode tokens) warm 5 us serial vs 0.3 ms pooled at
+# chunk 32, cold 27 ms serial vs 6 ms pooled (4 ms at chunk 16, but 0.5 ms
+# warm). The pool overhead is the price of bounded cold-miss latency.
+_MMAP_GATHER_THREADS = 32
+_MMAP_GATHER_MIN_CHUNK = 32
+_MMAP_GATHER_MAX_CHUNK = 1024
+_mmap_gather_pool: ThreadPoolExecutor | None = None
+
+
+def _mmap_gather_executor() -> ThreadPoolExecutor:
+    global _mmap_gather_pool
+    if _mmap_gather_pool is None:
+        _mmap_gather_pool = ThreadPoolExecutor(
+            max_workers=_MMAP_GATHER_THREADS, thread_name_prefix="engram-mmap"
+        )
+    return _mmap_gather_pool
+
+
+def is_engram_table_weight(name: str) -> bool:
+    """dsv41 engram-mmap: True for `layers.N.engram.embed.{weight,scale}`."""
+    return ENGRAM_TABLE_WEIGHT_RE.search(name) is not None
+
+
+class EngramMmapTable:
+    """dsv41 engram-mmap: one rank's row range of a checkpoint table, mapped
+    read-only from the safetensors shard (MAP_SHARED, page-cache backed,
+    MADV_RANDOM so a cold row costs one 4 KiB read and no readahead).
+
+    `rows` is a [row_count, row_bytes] uint8 view over the mapping; nothing
+    is read until a row is gathered. An anonymous zero-filled table (dummy
+    load) uses the same interface.
+    """
+
+    def __init__(
+        self,
+        rows: np.ndarray,
+        mapping: mmap.mmap | None,
+        source: str,
+    ) -> None:
+        self.rows = rows
+        self._mapping = mapping
+        self.source = source
+
+    @classmethod
+    def from_ref(
+        cls, ref: SafetensorsMmapRef, row_start: int, row_count: int
+    ) -> "EngramMmapTable":
+        row_bytes = ref.nbytes // ref.shape[0]
+        byte_start = ref.data_begin + row_start * row_bytes
+        byte_count = row_count * row_bytes
+        assert byte_start + byte_count <= ref.data_end
+        # mmap offsets must be page aligned; map from the page below and
+        # skip the slack in the numpy view.
+        aligned = byte_start - byte_start % mmap.ALLOCATIONGRANULARITY
+        slack = byte_start - aligned
+        fd = os.open(ref.path, os.O_RDONLY)
+        try:
+            mapping = mmap.mmap(
+                fd,
+                slack + byte_count,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ,
+                offset=aligned,
+            )
+        finally:
+            os.close(fd)  # the mapping keeps its own reference
+        mapping.madvise(mmap.MADV_RANDOM)
+        rows = np.frombuffer(mapping, dtype=np.uint8, count=byte_count, offset=slack)
+        return cls(
+            rows.reshape(row_count, row_bytes), mapping, f"{ref.path}:{ref.name}"
+        )
+
+    @classmethod
+    def anonymous(cls, row_count: int, row_bytes: int) -> "EngramMmapTable":
+        # calloc-backed: pages stay unmapped until a gather touches them.
+        return cls(np.zeros((row_count, row_bytes), dtype=np.uint8), None, "anonymous")
+
+    def gather(self, local_rows: np.ndarray, out: np.ndarray) -> None:
+        """out[i] = rows[local_rows[i]] (indices already validated)."""
+        n = local_rows.shape[0]
+        chunk = min(
+            _MMAP_GATHER_MAX_CHUNK,
+            max(_MMAP_GATHER_MIN_CHUNK, -(-n // _MMAP_GATHER_THREADS)),
+        )
+        if n <= 2 * _MMAP_GATHER_MIN_CHUNK:
+            np.take(self.rows, local_rows, axis=0, out=out, mode="clip")
+            return
+        futures = [
+            _mmap_gather_executor().submit(
+                np.take,
+                self.rows,
+                local_rows[c : c + chunk],
+                axis=0,
+                out=out[c : c + chunk],
+                mode="clip",
+            )
+            for c in range(0, n, chunk)
+        ]
+        for f in futures:
+            f.result()
+
+    def close(self) -> None:
+        self.rows = None  # type: ignore[assignment]
+        if self._mapping is not None:
+            self._mapping.close()
+            self._mapping = None
 
 
 def _is_prime(n: int) -> bool:
@@ -553,6 +683,18 @@ def _engram_head_shard_weight_loader(
 ) -> None:
     """Load this rank's complete head buckets. ue8m0 scales arrive as
     float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
+    attach = getattr(param, "engram_mmap_attach", None)
+    if attach is not None:
+        # dsv41 engram-mmap: the param is a 0-row placeholder; map the rank's
+        # row slice of the checkpoint tensor instead of copying it.
+        if not isinstance(loaded_weight, SafetensorsMmapRef):
+            raise RuntimeError(
+                "engram table_mode='mmap' needs the default safetensors loader "
+                "(no enable_multithread_load / prefetch / torchao strategy), "
+                f"got a {type(loaded_weight).__name__} for the table"
+            )
+        attach(loaded_weight)
+        return
     part_rows = param.shape[0]
     if loaded_weight.dtype == torch.float8_e8m0fnu:
         loaded_weight = loaded_weight.view(torch.uint8)
@@ -631,7 +773,23 @@ class ParallelEngramEmbedding(nn.Module):
 
     With `cpu_offload` the shard lives in pinned host memory and is read over
     UVA instead of HBM; the TP sharding is unchanged either way.
+
+    dsv41 engram-mmap: `table_mode="mmap"` keeps no copy of the shard at all.
+    The rank's row range is memory-mapped from the checkpoint file, the rows
+    a step needs are gathered on the host (raw fp8 bytes + ue8m0 scale bytes)
+    into pinned staging, copied to a device staging buffer and dequantised
+    there by `_engram_lookup_kernel` itself (identity indices over the
+    staging rows), so the maths is the same kernel as the other modes.
     """
+
+    # dsv41 engram-mmap: class default so instances built without __init__
+    # (tests) take the non-mmap paths.
+    table_mode: str | None = None
+    # dsv41 engram-mmap: set by the V2 runner when it stages the rows itself
+    # before every FULL cudagraph replay (`DeepseekV4Model.engram_prefetch`);
+    # a lookup met inside a plain (non-breakable) capture is then a no-op
+    # instead of an error, and the graph reads the prefilled static buffer.
+    full_graph_prefetch: bool = False
 
     def __init__(
         self,
@@ -640,12 +798,19 @@ class ParallelEngramEmbedding(nn.Module):
         head_sizes: tuple[int, ...],
         block_size: int = 32,
         cpu_offload: bool = False,
+        table_mode: str | None = None,
     ):
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
+        # dsv41 engram-mmap: `table_mode` wins over the legacy flag.
+        if table_mode is None:
+            table_mode = "pinned" if cpu_offload else "resident"
+        assert table_mode in ("pinned", "resident", "mmap"), table_mode
+        cpu_offload = table_mode == "pinned"
+        self.table_mode = table_mode
         if cpu_offload and not is_uva_available():
             raise RuntimeError("Engram CPU offload requires UVA support")
         self.num_embeddings = num_embeddings
@@ -669,15 +834,19 @@ class ParallelEngramEmbedding(nn.Module):
         # Explicit device: model init runs under a `torch.device("cuda")`
         # context, which would otherwise put the shard in HBM.
         kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+        # dsv41 engram-mmap: 0-row placeholders keep the checkpoint names in
+        # `named_parameters()` (the loader routes the lazy refs through them)
+        # without allocating any host or device storage.
+        param_rows = 0 if table_mode == "mmap" else self.part_num_embeddings
+        if table_mode == "mmap":
+            kwargs = {"device": "cpu"}
         self.weight = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
-            ),
+            torch.empty(param_rows, dim, dtype=torch.float8_e4m3fn, **kwargs),
             requires_grad=False,
         )
         self.weight_scale_inv = nn.Parameter(
             torch.empty(
-                self.part_num_embeddings,
+                param_rows,
                 dim // block_size,
                 dtype=torch.uint8,
                 **kwargs,
@@ -692,6 +861,35 @@ class ParallelEngramEmbedding(nn.Module):
                     "engram_vocab_start": self.vocab_start_idx,
                 },
             )
+        # dsv41 engram-mmap state: the two mapped tables, the host/device
+        # staging and the identity index tensor the lookup kernel reads.
+        self._mmap_tables: dict[str, EngramMmapTable] = {}
+        self._mmap_staging_rows = 0
+        self._mmap_idx_host: torch.Tensor | None = None
+        self._mmap_raw_host: torch.Tensor | None = None
+        self._mmap_scale_host: torch.Tensor | None = None
+        self._mmap_raw_dev: torch.Tensor | None = None
+        self._mmap_scale_dev: torch.Tensor | None = None
+        self._mmap_ids: torch.Tensor | None = None
+        # calls, rows, seconds waiting for the ids (GPU drain) and seconds
+        # of host gather + H2D + kernel launch; logged at DEBUG every 500.
+        self.mmap_stats = {"calls": 0, "rows": 0, "sync_s": 0.0, "gather_s": 0.0}
+        if table_mode == "mmap":
+            set_weight_attrs(
+                self.weight, {"engram_mmap_attach": self._attach_mmap_weight}
+            )
+            set_weight_attrs(
+                self.weight_scale_inv,
+                {"engram_mmap_attach": self._attach_mmap_scale},
+            )
+            logger.info(
+                "Engram table in mmap mode: rows %d..%d of %d (%.2f GiB of "
+                "checkpoint per rank, page-cache backed, nothing pinned)",
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+                num_embeddings,
+                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+            )
         if cpu_offload:
             logger.info(
                 "Engram table offloaded to pinned host memory: %d rows x %d, "
@@ -701,12 +899,225 @@ class ParallelEngramEmbedding(nn.Module):
                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
             )
 
+    # ---- dsv41 engram-mmap -------------------------------------------------
+
+    def _attach_mmap_weight(self, ref: SafetensorsMmapRef) -> None:
+        self._attach_mmap("weight", ref, self.dim)
+
+    def _attach_mmap_scale(self, ref: SafetensorsMmapRef) -> None:
+        self._attach_mmap("scale", ref, self.dim // self.block_size)
+
+    def _attach_mmap(self, kind: str, ref: SafetensorsMmapRef, row_bytes: int) -> None:
+        """Map this rank's rows of one checkpoint table (called by the weight
+        loader with the lazy ref the safetensors iterator produced)."""
+        if len(ref.shape) != 2 or ref.shape[1] != row_bytes:
+            raise ValueError(
+                f"engram {kind} table {ref.name}: shape {ref.shape}, expected "
+                f"[rows, {row_bytes}] (1 byte per element)"
+            )
+        if ref.nbytes != ref.shape[0] * row_bytes:
+            raise ValueError(f"engram {kind} table {ref.name} is not 1 byte/element")
+        if ref.shape[0] < self.vocab_end_idx:
+            raise ValueError(
+                f"engram {kind} table {ref.name} has {ref.shape[0]} rows, rank "
+                f"needs rows up to {self.vocab_end_idx}"
+            )
+        old = self._mmap_tables.pop(kind, None)
+        if old is not None:
+            old.close()
+        self._mmap_tables[kind] = EngramMmapTable.from_ref(
+            ref, self.vocab_start_idx, self.part_num_embeddings
+        )
+        logger.info(
+            "Engram %s table mapped from %s (rows %d..%d)",
+            kind,
+            ref.path,
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+        )
+
+    def _mmap_table_pair(self) -> tuple[EngramMmapTable, EngramMmapTable]:
+        """The mapped tables, or anonymous zero tables under a dummy load
+        (`--load-format dummy` never calls the weight loader)."""
+        if "weight" not in self._mmap_tables or "scale" not in self._mmap_tables:
+            for kind in ("weight", "scale"):
+                if kind in self._mmap_tables:
+                    continue
+                row_bytes = (
+                    self.dim if kind == "weight" else self.dim // self.block_size
+                )
+                self._mmap_tables[kind] = EngramMmapTable.anonymous(
+                    self.part_num_embeddings, row_bytes
+                )
+            logger.warning(
+                "Engram mmap tables were never attached (dummy load?); using "
+                "anonymous zero-filled tables for the host gather path"
+            )
+        return self._mmap_tables["weight"], self._mmap_tables["scale"]
+
+    def configure_mmap_staging(self, max_tokens: int) -> None:
+        """Size the staging for `max_tokens` tokens x local heads rows. Both
+        buffers are consumed only inside the eager segment, so resizing them
+        later (a larger batch than planned) does not invalidate captured
+        graphs; the kernel output `out` is the caller's static buffer."""
+        rows = max(1, max_tokens) * self.part_n_hash_cols
+        if rows <= self._mmap_staging_rows:
+            return
+        max_tokens = max(1, max_tokens)
+        self._mmap_staging_rows = rows
+        # Explicit device: model init runs under a `torch.device("cuda")`
+        # context, and only dense CPU tensors can be pinned.
+        host = {"device": "cpu", "pin_memory": True}
+        self._mmap_idx_host = torch.empty(
+            max_tokens, self.part_n_hash_cols, dtype=torch.int32, **host
+        )
+        self._mmap_raw_host = torch.empty(rows, self.dim, dtype=torch.uint8, **host)
+        self._mmap_scale_host = torch.empty(
+            rows, self.dim // self.block_size, dtype=torch.uint8, **host
+        )
+        device = torch.accelerator.current_device_index()
+        self._mmap_raw_dev = torch.empty(
+            rows, self.dim, dtype=torch.uint8, device=f"cuda:{device}"
+        )
+        self._mmap_scale_dev = torch.empty(
+            rows,
+            self.dim // self.block_size,
+            dtype=torch.uint8,
+            device=f"cuda:{device}",
+        )
+        # Identity indices: staging row r = token r // local_heads, local
+        # head r % local_heads. Laid out as [tokens, n_hash_cols] so the
+        # lookup kernel reads them exactly like real hash ids; heads beyond
+        # this rank's real heads (TP padding) never exist in the tensor and
+        # are masked by the kernel like in the other modes.
+        local_cols = self._mmap_local_cols()
+        ids = torch.zeros(max_tokens, self.n_hash_cols, dtype=torch.int32, device="cpu")
+        ids[:, self.head_start : self.head_start + local_cols] = (
+            torch.arange(max_tokens, dtype=torch.int32)[:, None] * self.part_n_hash_cols
+            + torch.arange(local_cols, dtype=torch.int32)[None, :]
+        )
+        self._mmap_ids = ids.to(f"cuda:{device}")
+
+    def _mmap_local_cols(self) -> int:
+        """Real (non-padded) hash heads on this rank."""
+        return max(0, min(self.part_n_hash_cols, self.n_hash_cols - self.head_start))
+
+    def stage_from_mmap(self, indices: torch.Tensor, out: torch.Tensor) -> None:
+        """mmap-mode lookup of [T, heads] into `out` [T, local_heads, dim].
+
+        Under a breakable cudagraph capture this becomes an eager segment
+        (the host gather can never be captured); `out` must be a static
+        buffer, `indices` is weak-referenced like the attention breaks do.
+        """
+        capture = BreakableCUDAGraphCapture.current()
+        if capture is not None and capture._capturing:
+            ids, dst = weak_ref_tensor(indices), weak_ref_tensor(out)
+            capture.add_eager(lambda: self._stage_from_mmap_eager(ids, dst))
+            return
+        if torch.cuda.is_current_stream_capturing():
+            if self.full_graph_prefetch:
+                # FULL graph capture: the runner stages `out` before each
+                # replay, so nothing is recorded here.
+                return
+            raise RuntimeError(
+                "engram table_mode='mmap' cannot run inside a plain cudagraph "
+                "capture; use breakable cudagraphs or --enforce-eager"
+            )
+        self._stage_from_mmap_eager(indices, out)
+
+    def _stage_from_mmap_eager(self, indices: torch.Tensor, out: torch.Tensor) -> None:
+        num_tokens = indices.shape[0]
+        if num_tokens == 0:
+            return
+        t0 = time.perf_counter()
+        self.configure_mmap_staging(num_tokens)
+        assert self._mmap_idx_host is not None and self._mmap_ids is not None
+        assert self._mmap_raw_host is not None and self._mmap_scale_host is not None
+        assert self._mmap_raw_dev is not None and self._mmap_scale_dev is not None
+        local_cols = self._mmap_local_cols()
+        rows = num_tokens * self.part_n_hash_cols
+        stream = torch.cuda.current_stream()
+        # 1. indices to the host (the hash kernel is the single source of
+        #    truth for them; the sync also retires last step's H2D copies out
+        #    of the pinned staging before it is rewritten below).
+        idx_host = self._mmap_idx_host[:num_tokens]
+        if local_cols:
+            idx_host[:, :local_cols].copy_(
+                indices[:, self.head_start : self.head_start + local_cols],
+                non_blocking=True,
+            )
+        stream.synchronize()
+        t1 = time.perf_counter()
+        idx = idx_host.numpy().reshape(-1).astype(np.int64, copy=False)
+        owned = (idx >= self.vocab_start_idx) & (idx < self.vocab_end_idx)
+        if local_cols < self.part_n_hash_cols:
+            owned.reshape(num_tokens, self.part_n_hash_cols)[:, local_cols:] = False
+        local = np.where(owned, idx - self.vocab_start_idx, 0)
+        # 2. host gather of raw fp8 rows + ue8m0 scale rows; rows another
+        #    rank owns are zero, which the kernel dequantises to 0 exactly
+        #    like its own masked loads do.
+        raw = self._mmap_raw_host[:rows].numpy()
+        scale = self._mmap_scale_host[:rows].numpy()
+        if owned.any():
+            weight_table, scale_table = self._mmap_table_pair()
+            weight_table.gather(local, raw)
+            scale_table.gather(local, scale)
+            if not owned.all():
+                unowned = ~owned
+                raw[unowned] = 0
+                scale[unowned] = 0
+        else:
+            # Nothing owned this step (or a TP rank with only padded heads).
+            raw[:] = 0
+            scale[:] = 0
+        # 3. H2D into the device staging, then the shared dequant kernel with
+        #    identity indices over the staged rows.
+        self._mmap_raw_dev[:rows].copy_(self._mmap_raw_host[:rows], non_blocking=True)
+        self._mmap_scale_dev[:rows].copy_(
+            self._mmap_scale_host[:rows], non_blocking=True
+        )
+        grid = min(triton.cdiv(rows, 16), self._num_sms)
+        _engram_lookup_kernel[(grid,)](
+            self._mmap_raw_dev,
+            self._mmap_scale_dev,
+            self._mmap_ids,
+            out,
+            0,
+            rows,
+            rows,
+            self._mmap_ids.stride(0),
+            self._mmap_ids.stride(1),
+            HEAD_START=self.head_start,
+            LOCAL_HEADS=self.part_n_hash_cols,
+            TOTAL_HEADS=self.n_hash_cols,
+            DIM=self.dim,
+            QUANT_BLOCK=self.block_size,
+            BLOCK_R=16,
+            GRID=grid,
+        )
+        stats = self.mmap_stats
+        stats["calls"] += 1
+        stats["rows"] += rows
+        stats["sync_s"] += t1 - t0
+        stats["gather_s"] += time.perf_counter() - t1
+        if stats["calls"] % 500 == 0:
+            logger.debug(
+                "engram mmap gather: %d calls, %.1f rows/call, %.3f ms/call "
+                "waiting for ids (GPU drain), %.3f ms/call host gather + H2D",
+                stats["calls"],
+                stats["rows"] / stats["calls"],
+                1e3 * stats["sync_s"] / stats["calls"],
+                1e3 * stats["gather_s"] / stats["calls"],
+            )
+
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Parameters when resident, else cached UVA views of the pinned shard.
 
         Rebuilt if anything swaps `.data`, so a stale device pointer cannot
         survive silently.
         """
+        if self.table_mode == "mmap":
+            raise RuntimeError("engram mmap mode has no device-readable table")
         if not self.cpu_offload:
             return self.weight.data, self.weight_scale_inv.data
         src = (self.weight.data_ptr(), self.weight_scale_inv.data_ptr())
@@ -728,6 +1139,10 @@ class ParallelEngramEmbedding(nn.Module):
         """
         rows = indices.shape[0] * self.part_n_hash_cols
         if not rows:
+            return
+        if self.table_mode == "mmap":
+            # dsv41 engram-mmap: host gather (eager break under capture).
+            self.stage_from_mmap(indices, out)
             return
         weight, scales = self._storage()
         # The table dwarfs TLB reach, so a persistent grid near the SM count
@@ -896,6 +1311,8 @@ class Engram(nn.Module):
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=engram_config.cpu_offload if engram_config else True,
+            # dsv41 engram-mmap: "pinned" / "resident" / "mmap".
+            table_mode=engram_config.resolved_table_mode if engram_config else None,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
@@ -923,6 +1340,9 @@ class Engram(nn.Module):
             layout.head_dim,
             dtype=torch.bfloat16,
         )
+        if self.embed_tokens.table_mode == "mmap":
+            # dsv41 engram-mmap: pinned + device staging for the host gather.
+            self.embed_tokens.configure_mmap_staging(max_tokens)
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Gather this layer's rows on the main stream before decoder layers."""

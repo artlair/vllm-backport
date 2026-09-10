@@ -587,34 +587,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             tensors.update(self.pp_relay.make_empty_tensors(batch_size, device))
         return IntermediateTensors(tensors)
 
-    def forward(
+    def _stage_engram_rows(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None,
-        inputs_embeds: torch.Tensor | None = None,
-        lookback_token_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.embed_input_ids(input_ids)
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            if self.pp_relay is not None:
-                # dsv41 pp-relay: rebuild the relayed shared caches / index
-                # rows before any local layer reads them.
-                self.pp_relay.consume(intermediate_tensors, positions)
+        lookback_token_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Hash the batch and gather every local engram layer's rows into its
+        static `staged_rows`. Returns (hashes, keep-mask), both None when
+        engram is skipped (no local layer, no ids, profile run).
 
-        if self.use_mega_moe:
-            input_ids = input_ids.to(torch.int64)
-
-        # Engram n-gram hashes for the whole (flattened) batch, computed once
-        # on the full token stream — before any sequence-parallel sharding —
-        # and consumed by the engram layers (1 and 14) below. Skipped on
-        # profile runs (KV cache unbound).
+        dsv41 engram-mmap: shared by `forward` and `engram_prefetch`.
+        """
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         if (
@@ -662,6 +646,61 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         engram.prepare_embeddings(
                             engram_hashes[:, engram.layer_hash_index]
                         )
+        return engram_hashes, engram_mask
+
+    def engram_prefetch(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        lookback_token_ids: torch.Tensor | None = None,
+        **_: object,
+    ) -> None:
+        """dsv41 engram-mmap: stage this step's engram rows outside a FULL
+        cudagraph. The V2 runner calls it (under the step's forward context,
+        inputs already in the static buffers) right before replaying a FULL
+        graph, whose captured lookup is a no-op in mmap mode
+        (`ParallelEngramEmbedding.full_graph_prefetch`). Same hash kernel,
+        same inputs, so the ids match what the graph computes."""
+        self._stage_engram_rows(input_ids, positions, lookback_token_ids)
+
+    def set_engram_full_graph_prefetch(self, enabled: bool) -> None:
+        """dsv41 engram-mmap: see `engram_prefetch`."""
+        for layer in self.layers:
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                engram.embed_tokens.full_graph_prefetch = enabled
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            if self.pp_relay is not None:
+                # dsv41 pp-relay: rebuild the relayed shared caches / index
+                # rows before any local layer reads them.
+                self.pp_relay.consume(intermediate_tensors, positions)
+
+        if self.use_mega_moe:
+            input_ids = input_ids.to(torch.int64)
+
+        # Engram n-gram hashes for the whole (flattened) batch, computed once
+        # on the full token stream — before any sequence-parallel sharding —
+        # and consumed by the engram layers (1 and 14) below. Skipped on
+        # profile runs (KV cache unbound).
+        engram_hashes, engram_mask = self._stage_engram_rows(
+            input_ids, positions, lookback_token_ids
+        )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
