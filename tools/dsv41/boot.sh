@@ -154,7 +154,7 @@ text = r["choices"][0]["message"].get("content")
 out = u.get("completion_tokens", 0)
 dt = t1 - t0
 print("text:", repr(text))
-print(f"prompt_tokens={u.get('prompt_tokens')} completion_tokens={out} wall={dt:.2f}s tokens/s={out / dt if dt else 0:.1f}")
+print(f"prompt_tokens={u.get("prompt_tokens")} completion_tokens={out} wall={dt:.2f}s tokens/s={out / dt if dt else 0:.1f}")
 ' "$t0" "$t1"
     ;;
   *) usage ;;
