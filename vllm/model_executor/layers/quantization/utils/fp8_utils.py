@@ -1071,8 +1071,6 @@ def deepgemm_post_process_weight_scale_block(
     is_sfa: bool = False,
 ) -> torch.Tensor:
     if ws.dtype in (torch.float8_e8m0fnu, torch.uint8):
-        # Scales already in E8M0 from checkpoint; upcast to fp32 and let
-        # DeepGEMM pack the layout expected by the target architecture.
         ws = _upcast_e8m0_to_fp32(ws)
     else:
         assert ws.dtype == torch.float32, (
@@ -1103,12 +1101,7 @@ def deepgemm_post_process_fp8_weight_block(
         f"to be torch.float8_e4m3fn, got {wq.dtype} instead."
     )
 
-    if ws.dtype in (torch.float8_e8m0fnu, torch.uint8):
-        # Scales already in E8M0 from checkpoint (float8_e8m0fnu, or raw E8M0
-        # bits as uint8 for MXFP8) - upcast to fp32 and skip requantization
-        # (weights already have power-of-two scales).
-        ws = _upcast_e8m0_to_fp32(ws)
-    else:
+    if ws.dtype not in (torch.float8_e8m0fnu, torch.uint8):
         assert ws.dtype == torch.float32, (
             f"Expected tensor scales dtype to be torch.float32 or "
             f"torch.float8_e8m0fnu or torch.uint8, got {ws.dtype} instead"
@@ -1119,7 +1112,7 @@ def deepgemm_post_process_fp8_weight_block(
     if is_bmm:
         # Reshape 2D weight/scale to 3D for grouped BMM (einsum):
         # wq: (g*r, d) -> (g, r, d)
-        # ws: (g*r/128, d/128) -> (g, r/128, d/128)
+        # Scale dimensions follow quant_block_shape.
         g = bmm_batch_size
         assert wq.ndim == 2 and ws.ndim == 2
         d = wq.size(1)

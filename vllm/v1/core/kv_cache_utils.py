@@ -1989,6 +1989,13 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, *swa_mla_groups]
 
 
+# TODO(dsv41): upstream #56201 teaches _get_packed_kv_cache_groups() to treat
+# CircularBufferSpec and unsplit SlidingWindowSpec buckets as "state buckets"
+# (capped at the states one packed block already fits, so 43 V4.1 SWA caches
+# do not widen the block), and gates the DeepseekV4 eagle fallback on
+# model_type in ("deepseek_v4", "deepseek_v41"). Our base has neither the
+# packed-group planner nor CircularBufferSpec; V4.1 attention still reports
+# model_version="deepseek_v4", so the eagle detection below covers it.
 def _annotate_eagle_groups_deepseek_v4(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],

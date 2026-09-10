@@ -325,6 +325,10 @@ class NixlBaseConnectorWorker:
             isinstance(g.kv_cache_spec, MambaSpec)
             for g in kv_cache_config.kv_cache_groups
         )
+        # TODO(dsv41): upstream #56201 relaxes the CSA-linear NIXL PLE-owner
+        # check (_is_csa_linear / _ple_group_index over CircularBufferSpec
+        # groups) to "at most one" owner. Our base has no CircularBufferSpec or
+        # CSA-linear NIXL support, so there is nothing to relax here.
         if self._has_mamba:
             assert self._is_hma_required
             from vllm.model_executor.layers.mamba.mamba_utils import (

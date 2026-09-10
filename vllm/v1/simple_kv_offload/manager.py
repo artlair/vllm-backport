@@ -31,7 +31,7 @@ from vllm.v1.simple_kv_offload.metadata import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+    from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -666,6 +666,13 @@ class SimpleCPUOffloadScheduler:
                 state.num_stored_blocks[g] += advanced_per_group[g]
 
         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids
+
+    # TODO(dsv41): upstream #56201 adds _cached_gpu_block() and, in
+    # _select_eager_blocks_to_store(), recovers a nulled sliding-window GPU
+    # block from the prefix-cache free queue (via resolve_block_hashes +
+    # BlockPool.get_cached_block) before storing it to CPU. Our base still has
+    # the older single-method _prepare_eager_store_specs() and simply skips
+    # null blocks, so that recovery was not ported.
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Handle async transfer completions from worker.

@@ -2450,3 +2450,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().apply_vllm_mapper(hf_to_vllm_mapper)
         if self.quantized_layers:
             self.quantized_layers = hf_to_vllm_mapper.apply_dict(self.quantized_layers)
+
+
+# TODO(dsv41): upstream #56201 extends the QuantKey-driven ModelOptLinearMethod
+# stack that landed after our base (CkptCtx.scale_block_size, a KMxfp8Static
+# scale loader that row-repeats coarse checkpoint scales, weight_block_size =
+# [1, MXFP8_BLOCK_SIZE] on MXFP8 layers, and BMM-aware
+# init_mxfp8_linear_kernel(bmm_batch_size=...) re-selection in
+# process_weights_after_loading). Our modelopt.py predates ModelOptLinearMethod
+# entirely, so none of that was ported; DeepSeek V4.1 native MXFP8 linear
+# checkpoints will not load through ModelOpt on this base.

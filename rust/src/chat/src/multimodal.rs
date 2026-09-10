@@ -169,6 +169,10 @@ impl MultimodalModelContext {
 
 /// Static model-specific tensor-layout behavior for one modality.
 #[derive(Clone)]
+// TODO(dsv41): upstream #56201 adds `encoder_input_key` (from
+// `ModelProcessorSpec::encoder_input_key_for`, a newer llm-multimodal crate
+// rev) so DeepSeek-V4.1 images are keyed as "patches". Our pinned crate rev
+// lacks that method; kept our version.
 struct ResolvedMultimodalSpec {
     raw: &'static dyn ModelProcessorSpec,
     modality: Modality,

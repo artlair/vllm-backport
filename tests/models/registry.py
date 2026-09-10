@@ -830,6 +830,9 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "DeepseekOCR2ForCausalLM": _HfExamplesInfo(
         "deepseek-ai/DeepSeek-OCR-2",
     ),
+    "DeepseekV41ForCausalLM": _HfExamplesInfo(
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+    ),
     "Dots3NoteForCausalLM": _HfExamplesInfo(
         "dots-studio/dots3-note-prev",
         is_available_online=False,

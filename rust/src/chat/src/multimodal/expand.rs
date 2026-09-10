@@ -47,6 +47,11 @@ impl<'a> ExpansionLane<'a> {
 ///
 /// The returned ranges point into the already-expanded prompt, grouped per
 /// modality in item order.
+// TODO(dsv41): upstream #56201 adds DeepSeek-V4.1 compressor-alignment
+// padding here (`PromptReplacement::alignment_pad` / `AlignmentPad::count_at`,
+// `structural_prefix`), which come from a newer llm-multimodal crate rev
+// (Inferact/llm-multimodal-internal) than the one pinned in Cargo.toml. Kept
+// our version; V4.1 image spans are not pad-aligned by the Rust renderer.
 pub(super) fn expand_prompt_token_ids(
     prompt_token_ids: &mut Vec<u32>,
     prepared: &[PreparedMedia],
