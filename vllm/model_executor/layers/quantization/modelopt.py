@@ -2458,5 +2458,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 # [1, MXFP8_BLOCK_SIZE] on MXFP8 layers, and BMM-aware
 # init_mxfp8_linear_kernel(bmm_batch_size=...) re-selection in
 # process_weights_after_loading). Our modelopt.py predates ModelOptLinearMethod
-# entirely, so none of that was ported; DeepSeek V4.1 native MXFP8 linear
-# checkpoints will not load through ModelOpt on this base.
+# entirely, so none of that was ported here. DeepSeek V4.1 native MXFP8 linear
+# checkpoints instead load through DeepseekV4Mxfp8LinearMethod
+# (vllm/models/deepseek_v4_1/quant_config.py), a ModelOptMxFp8LinearMethod
+# subclass that row-repeats the [N/32, K/32] checkpoint scales at load time;
+# BMM layers keep their raw layout via the is_bmm exemption in the Marlin
+# MXFP8 kernel rather than a kernel re-selection.

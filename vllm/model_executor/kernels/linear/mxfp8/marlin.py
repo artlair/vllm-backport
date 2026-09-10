@@ -26,6 +26,13 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_bmm", False):
+            # BMM layers (DeepSeek V4.1 ``wo_a``) are consumed as raw MXFP8
+            # weight + e8m0 weight_scale by the attention einsum, never
+            # through apply_weights(); the Marlin repack would destroy them.
+            # Same exemption the FP8 Marlin scaled-mm kernel makes.
+            return
+
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
             prepare_mxfp8_layer_for_marlin,
         )

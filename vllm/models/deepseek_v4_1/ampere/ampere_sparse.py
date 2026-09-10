@@ -37,3 +37,13 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
     """SM8x DeepSeek V4.1 attention: ROCm Triton path on CUDA Ampere."""
 
     backend_cls = DeepseekV41AmpereMLASparseBackend
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # The ROCm parent clears ``is_bmm`` so wo_a keeps the ordinary linear
+        # kernel for post-load processing. On sm8x that kernel is Marlin,
+        # whose repack would destroy the raw [N, K] weight and block scale
+        # that ``rocm_inv_rope_einsum`` dequantizes once into its bf16 cache.
+        # Restore the flag: both Marlin kernels (block FP8 and MXFP8) leave
+        # ``is_bmm`` layers untouched, as the V4 Ampere path already relies on.
+        self.wo_a.is_bmm = True

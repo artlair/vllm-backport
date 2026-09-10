@@ -6,8 +6,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
+import torch
+
 from vllm.config import get_current_vllm_config
-from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     UnquantizedFusedMoEMethod,
@@ -15,11 +16,15 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptMxFp8LinearMethod,
+)
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+    MXFP8_BLOCK_SIZE,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
-    kMxfp8Dynamic,
-    kMxfp8Static,
 )
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("fp4", "fp8")
@@ -28,6 +33,74 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.modelopt import (
         ModelOptNvFp4Config,
     )
+
+
+class DeepseekV4Mxfp8LinearMethod(ModelOptMxFp8LinearMethod):
+    """MXFP8 linear method for native DeepSeek V4.1 ``[32, 32]`` checkpoints.
+
+    Upstream (#56201) serves these layers through ``ModelOptLinearMethod``
+    with ``CkptCtx(scale_block_size=(32, 32))``, which this tree predates.
+    The checkpoint stores one ue8m0 exponent per 32x32 block of the
+    ``[N, K]`` e4m3 weight, i.e. a ``[N/32, K/32]`` scale tensor, while
+    ``ModelOptMxFp8LinearMethod`` and every kernel behind it (Marlin on
+    sm8x) take one scale per 32 elements of K for every output row,
+    ``[N, K/32]``. Mirroring upstream's ``KMxfp8Static`` scale loader, the
+    checkpoint scale is row-repeated 32x along N before the layer's regular
+    sharded loader runs, so TP and fused-shard offsets (expressed in output
+    elements) apply unchanged.
+    """
+
+    def __init__(self, quant_config: DeepseekV4FP8Config) -> None:
+        block_rows, block_cols = quant_config.weight_block_size
+        if block_rows < 1 or block_cols != MXFP8_BLOCK_SIZE:
+            raise NotImplementedError(
+                f"MXFP8 checkpoint scale block {quant_config.weight_block_size} "
+                "is unsupported"
+            )
+        self.scale_block_rows = block_rows
+        super().__init__(quant_config)  # type: ignore[arg-type]
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        # The attention layer keys its o_proj recipe off this
+        # (``DeepseekV4Attention._o_proj_block_size``).
+        layer.weight_block_size = [1, MXFP8_BLOCK_SIZE]
+        if self.scale_block_rows > 1:
+            layer.weight_scale.weight_loader = self._block_scale_loader(
+                layer.weight_scale.weight_loader
+            )
+
+    def _block_scale_loader(self, weight_loader):
+        block_rows = self.scale_block_rows
+
+        def loader(param, loaded_weight: torch.Tensor, *args, **kwargs):
+            assert loaded_weight.dtype in (torch.uint8, torch.float8_e8m0fnu), (
+                f"expected e8m0 block scales, got {loaded_weight.dtype}"
+            )
+            # Raw exponent bytes: view, never convert (2^-7 would round to 0).
+            loaded_weight = loaded_weight.view(torch.uint8).repeat_interleave(
+                block_rows, dim=0
+            )
+            return weight_loader(param, loaded_weight, *args, **kwargs)
+
+        return loader
 
 
 class DeepseekV4FP8Config(Fp8Config):
@@ -86,6 +159,11 @@ class DeepseekV4FP8Config(Fp8Config):
         # FP4 checkpoints store FP8 linear scales as e8m0fnu; FP8 expert
         # checkpoints (Flash-Base) store them as float32.
         return self.expert_dtype == "fp4"
+
+    @property
+    def is_checkpoint_mxfp8_serialized(self) -> bool:
+        # Read by ModelOptMxFp8LinearMethod through DeepseekV4Mxfp8LinearMethod.
+        return self.weight_block_size == [32, 32] and self.is_scale_e8m0
 
     def _resolve_moe_overrides(self) -> None:
         if self._resolved_moe_quant_algo is not None:
@@ -196,16 +274,12 @@ class DeepseekV4FP8Config(Fp8Config):
                 match_mode=self.ignored_layers_match_mode,
             ):
                 return UnquantizedLinearMethod()
-            from vllm.model_executor.layers.quantization.modelopt import (
-                CkptCtx,
-                ModelOptLinearMethod,
-            )
-
-            rows, cols = self.weight_block_size
-            return ModelOptLinearMethod(
-                QuantSpec(weight=kMxfp8Static, activation=kMxfp8Dynamic),
-                CkptCtx(scale_block_size=(rows, cols)),
-            )
+            # Upstream returns ModelOptLinearMethod(kMxfp8Static, kMxfp8Dynamic,
+            # CkptCtx(scale_block_size=(32, 32))), which this tree lacks;
+            # DeepseekV4Mxfp8LinearMethod (above) feeds the same kernels (Marlin
+            # on sm8x) through ModelOptMxFp8LinearMethod with the block-scale
+            # expansion loader.
+            return DeepseekV4Mxfp8LinearMethod(self)
         if isinstance(layer, RoutedExperts):
             if is_layer_skipped(
                 prefix=prefix,
