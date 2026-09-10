@@ -181,10 +181,14 @@ REASONING_EFFORT_TEMPLATE = (
     "Reasoning Effort: {budget} "
     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
 )
+# dsv41: budgets follow the HF DeepSeek-V4.1-Flash encoding reference
+# (encoding/encoding.py: low=50, high=75, max=100, default high). Upstream
+# vLLM #56201 shipped 25/50/75/100 from an earlier code drop. "xhigh" is not
+# defined by the vendor; keep it accepted as an alias for the max budget.
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
-    "low": 25,
-    "high": 50,
-    "xhigh": 75,
+    "low": 50,
+    "high": 75,
+    "xhigh": 100,
     "max": 100,
 }
 
