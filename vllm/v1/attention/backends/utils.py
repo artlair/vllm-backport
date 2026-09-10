@@ -202,7 +202,16 @@ def get_supported_kv_cache_layouts(
         for backend in backends
         if (layouts := backend.supported_kv_cache_layouts()) is not None
     ] or [_DEFAULT_LAYOUT_PREFERENCE]
+    return _merge_layout_preferences(supported_layouts_lists)
 
+
+def _merge_layout_preferences(
+    supported_layouts_lists: list[Sequence[KVCacheLayout]],
+) -> list[KVCacheLayout]:
+    """Intersect preference lists under the rules of
+    ``get_supported_kv_cache_layouts``; shared by the per-worker backend merge
+    and the engine core's per-worker merge (dsv41 engram: PP stages that hold
+    different backends report different lists)."""
     first = supported_layouts_lists[0]
     if all(layouts == first for layouts in supported_layouts_lists[1:]):
         return list(first)
@@ -244,8 +253,9 @@ def resolve_kv_cache_layout(
     """Resolve one KV cache layout for the whole model.
 
     Runs once in the engine core. Every worker reports the layouts its backends
-    support, most preferred first (``get_supported_kv_cache_layouts``); all
-    ranks run the same backends, so their lists must agree. Specs mixing HNC
+    support, most preferred first (``get_supported_kv_cache_layouts``); the
+    lists are merged like one worker's backends (PP stages may hold different
+    backends). Specs mixing HNC
     shapes narrow the candidates to block-compact layouts. An explicit
     ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
     with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
@@ -262,10 +272,14 @@ def resolve_kv_cache_layout(
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
     )
-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
+    # dsv41 engram: under PP a stage may run a different set of attention
+    # backends from its peers (a stage of SWA-only layers next to a sparse
+    # MLA stage), so the per-worker lists can legitimately differ. Merge
+    # them the way one worker merges its backends; identical lists (every
+    # non-PP model, every uniform partition) keep their order unchanged.
+    candidates = _merge_layout_preferences(
+        [[_layout_from_name(name) for name in names] for names in supported_layouts]
     )
-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of
