@@ -60,6 +60,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
     DeepseekV4MoE as DeepseekV4MoEBase,
 )
 from vllm.models.deepseek_v4.nvidia.model import (
+    _drafter_needs_target_embed,
     make_deepseek_v4_expert_params_mapping,
 )
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
@@ -455,7 +456,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank:
+        # dsv41 boot: as in the V4.0 model, the last stage also needs the table
+        # when a drafter runs there. DSpark embeds its own proposed tokens every
+        # step and aliases this module (load_dspark_model refuses a
+        # PPMissingLayer alias), so build it on the last rank under PP.
+        needs_embed = get_pp_group().is_first_rank or (
+            get_pp_group().is_last_rank and _drafter_needs_target_embed(vllm_config)
+        )
+        if needs_embed:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
