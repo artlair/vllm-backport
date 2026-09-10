@@ -13,7 +13,7 @@
 # Knobs (env), defaults in brackets:
 #   IMAGE (required)  MODEL_DIR [~/dsv41-test/models/full-dummy]  NAME [dsv41-head]
 #   OVERLAY [1] SRC_DIR [worktree containing this script, i.e. ~/dsv41-test/src]
-#   TP [4] PP [5] PARTITION [8,7,9,8,8]  (VLLM_PP_LAYER_PARTITION; the x299
+#   TP [4] PP [5] PARTITION [8,8,8,9,7]  (VLLM_PP_LAYER_PARTITION; the x299
 #     stages are the first two entries: 8,7 keeps layers 0..14, and with them
 #     BOTH engram layers (1 and 14) and their pinned host tables, on x299)
 #   CTX [32768] UTIL [0.9] SEQS [4] BATCHED [engine default] PORT [8080]

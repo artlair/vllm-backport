@@ -48,7 +48,7 @@ vision config, the real fp8/fp4 quantization_config) with only `engram_num_embed
 (default 50,000,000 rows per layer; the real 384M-row tables are 94 GiB each and both would have
 to be pinned on x299 under the default partition, which does not fit 125 GiB of host RAM).
 The prime-bucket logic re-derives `engram_vocab_size` for the smaller table. It also prints the
-expected weight VRAM per PP stage for `--partition` (repeatable, default `8,7,9,8,8`), `--tp 4`,
+expected weight VRAM per PP stage for `--partition` (repeatable, default `8,8,8,9,7`), `--tp 4`,
 `--util 0.9`. The per-stage estimate is prorated from the checkpoint totals (fp4 experts
 275.7 GiB over 40 layers, attention 5.2, shared experts 1.4, embed + head 2.6, vision 0.9
 replicated per GPU); the DSpark layers are an estimate (128 of 384 experts at the fp4 rate,
@@ -57,9 +57,11 @@ about 2.5 GiB each). The GLM lane rule of thumb applies: keep weights under ~19 
 Partition notes: the first two entries are x299. `8,7` keeps layers 0..14 on x299, and with
 them both engram layers (1 and 14) and their pinned host tables (2 x 12.3 GiB at 50M rows;
 2 x 94 GiB with real tables). Groups are split at 14|15 and 20|23|31 (`docs/dsv41-pp-kv-relay.md`),
-so `RELAY=1` is mandatory for any 5-stage split. `8,7,9,9,7` moves one layer off the last stage
-(which also carries lm_head + the three DSpark layers) and has the best worst-stage headroom;
-`7,8,9,8,8` additionally splits group 2 at 6|7 (intra-node relay, cheap). With real weights and
+so `RELAY=1` is mandatory for any 5-stage split. `8,8,8,9,7` (default) has one 9-layer stage and keeps
+the last stage (lm_head + the three DSpark layers, ~3 GiB per GPU with `SPEC=5`) at 7 layers;
+`8,8,8,8,8` is the best KV shape but only fits with `SPEC=0`; `7,8,9,8,8` additionally splits
+group 2 at 6|7 (intra-node relay, cheap). See the KV accounting section below for how the
+partition sets the KV pool. With real weights and
 a partition that puts layer 14 on rome (e.g. `7,7,...`), each node pins one 94 GiB table.
 
 ### Procedure
@@ -84,9 +86,11 @@ a partition that puts layer 14 on rome (e.g. `7,7,...`), each node pins one 94 G
 6. Concurrency smoke: `CONC=4 MAX_TOKENS=256 ./cluster-head.sh bench` (ignore_eos, prints
    per-request completion counts and aggregate tokens/s).
 
-Head knobs (defaults): `TP=4 PP=5 PARTITION=8,7,9,8,8 CTX=32768 UTIL=0.9 SEQS=4 SPEC=5 EAGER=1
+Head knobs (defaults): `TP=4 PP=5 PARTITION=8,8,8,9,7 CTX=32768 UTIL=0.9 SEQS=4 SPEC=5 EAGER=1
 CGMODE=PIECEWISE CAPSIZES=1,2,4,8,12,16,20,24,28,32 RELAY=1 PPMETA= ENGRAM_OFFLOAD=1 MEMLOCK=1
-NCCLALGO= NCCLPROTO= LOADFORMAT=dummy KVDTYPE=fp8_ds_mla LIMITMM= BATCHED= EXTRA= OVERLAY=1`.
+NCCLALGO= NCCLPROTO= LOADFORMAT=dummy KVDTYPE=fp8_ds_mla LIMITMM= BATCHED= SLOTTRACE= EXTRA= OVERLAY=1`.
+`SLOTTRACE=1` forwards `VLLM_SLOT_TRACE` (the fork's per-step `WTRACE exec pp=N ntok=T sendwait/mdrv/run/tot`
+lines, TP rank 0 of every stage); they land in the ray per-worker logs (`raylogs` / `stop`), not the head log.
 `LIMITMM='{"image":0}'` stubs the vision tower (saves 0.9 GiB per GPU). Real weights later:
 `LOADFORMAT=auto MODEL_DIR=<checkpoint with the real config>` on both nodes.
 
@@ -131,3 +135,66 @@ footprint of the pinned engram shards (ray's memory monitor OOM-killed an x299 r
 `eager_break_during_capture` checked `VLLM_USE_BREAKABLE_CUDAGRAPH` at import time, which ray
 workers (unlike multiproc ones) do not have yet, so every rank captured attention inline and the
 first host sync in the prefill path invalidated the PIECEWISE capture.
+
+### KV accounting and rebalance, 2026-09-11 (image 67c4aec4f-serve, code 5f4510062+)
+
+The 288k-token pool above was a planner artefact, not a memory limit. Per request the
+scheduler holds, from ONE pool shared by every KV group, 256 blocks of compressed KV (block
+128, the whole 32k context) plus, for EACH sliding-window group, `cdiv(window - 1 +
+max_in_flight_tokens, 32) + 1` = 389 blocks (6 in-flight batches x 2048 batched tokens at
+PP=5; `SlidingWindowSpec.max_admission_blocks_per_request`), plus 1 ring block. The packed
+planner (upstream 6c18bfc74's "state bucket" rule) split the 43 SWA layers into as many groups
+as fit the GLOBAL MLA anchor (230 KB -> 4 groups of 10-11), so a request cost 256 + 4 x 389 + 1
+= 1813 blocks. After PP projection each stage keeps 2-3 layers of every SWA group, so those
+blocks were charged at the stage's own anchor (130 KB on stage 2: mirror 14 + source 20) but
+filled 37-55 KB of it: 7.2 KB per token on the binding stage against ~1 KB of compressed KV.
+`_sliding_window_group_count` (kv_cache_utils.py) now picks the SWA split by a cost model over
+the per-worker projections (bytes per request on the worst stage); for the cluster the 43
+layers stay one group (646 blocks per request, pool block = the stage's SWA page, 148-190 KB),
+which halves the per-token cost on every stage. `tests/v1/core/test_dsv41_kv_cache_groups.py`
+pins the per-stage numbers; `kvprobe.py` (x299 `~/dsv41-test/kvprobe`, CPU-only container run
+of the synced tree) reproduces `get_kv_cache_configs` for any partition.
+
+| stage (8,7,9,9,7) | layers | pool block before | B/token before | pool block after | B/token after | free GiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | 0..7 | 46080 (src 2) | 2550 | 152064 (8 SWA) | 2998 | 3.17 |
+| 1 | 8..14 | 92160 (src 8+14) | 5099 | 133056 (7 SWA) | 2623 | 5.60 |
+| 2 | 15..23 (+mirror 14) | 129600 | 7171 | 171072 (9 SWA) | 3373 | 1.92 |
+| 3 | 24..32 (+mirror 20) | 92160 | 5099 | 171072 (9 SWA) | 3373 | 1.90 |
+| 4 | 33..39 (+3 DSpark) | 92160 | 5099 | 190080 (10 SWA) | 3747 | 2.60 |
+
+Measured: 288,206 -> 603,570 tokens (8.8x -> 18.4x of 32k) from the same free memory. What
+is left per token is the in-flight reserve (389 of 646 blocks): `BATCHED=1024` would take the
+SWA share to 197 blocks (~810k tokens on this shape), 512 to 101 (~1.05M), at the cost of
+prefill chunk size. `--kv-cache-memory` is one value for all ranks (each rank's num_blocks is
+still the minimum over ranks), so it cannot rebalance across stages.
+
+Partitions (free GiB per GPU after load is what the KV pool gets; every 9-layer stage lands at
+1.9 GiB free under UTIL=0.9, every 8-layer stage at 3.1-3.8, the DSpark last stage at 2.5):
+
+| run | partition | SPEC | UTIL / ViT | KV tokens (pred.) | VRAM after load, MiB (x299 s0/s1; rome s2/s3/s4) | tok/s CONC 1 / 4 / 8 |
+| --- | --- | --- | --- | --- | --- | --- |
+| b3 (before) | 8,7,9,9,7 | 0 | 0.9 / yes | 288k | 19.2k/17.4k; 21.8k/21.2k/17.5k | 49 / 152-162 / - |
+| r1 | 8,7,9,9,7 | 0 | 0.9 / yes | 604k (605k) | 20.3k/17.5k; 21.8k/21.8k/17.6k | 52.4 / 171 / 327 |
+| r2 | 8,8,8,8,8 | 0 | 0.9 / yes | 1,136k (1,124k) | 21.8k/21.2k; 21.1k/21.1k/21.4k | 52.2 / 176 / 256 (warm pass 324) |
+| r3 | 8,8,8,9,7 | 5 | 0.9 / yes | 604k (613k) | 20.3k/19.8k; 19.6k/21.8k/21.4k | 37.0 / 111 / 175 |
+| r4 | 8,8,8,8,8 | 0 | 0.93 / stubbed | 1,482k (1,700k) | 22.5k/22.0k; 21.8k/21.8k/22.1k | 52.1 / 182 / 293 |
+
+`SEQS=8` for all four (the earlier runs used 4). `8,8,8,8,8` cannot carry DSpark (the last stage
+would have ~0.7 GiB free), so the default is `8,8,8,9,7`; with `SPEC=0` use `8,8,8,8,8`.
+`UTIL=0.93` plus `LIMITMM='{"image":0}'` (text-only) adds ~1.5 GiB per GPU on every stage.
+
+GPU utilisation and bottleneck: `nvidia-smi` `utilization.gpu` reads 90-100% on every stage
+even at CONC=1 because the NCCL recv kernels spin, so power is the usable signal: 125-160 W per
+3090 at CONC=1, 140-185 W at CONC=8 (350 W TDP), flat across stages, i.e. no stage is
+compute-saturated; x299's x4 PCIe cards are not slower than rome's. With DSpark on, the last
+stage is the hottest (190-213 W at CONC 4-8, the draft layers + lm_head + sampling). The
+per-step trace (`SLOTTRACE=1`, r4) gives a median model run of 2.4 / 2.7 / 2.4 / 2.2 / 1.8 ms
+on stages 0..4 for 1-3 token steps (metadata 0.2-0.4 ms on stages 1-4, sendwait 0), i.e. ~12 ms
+of the 19.2 ms per token at CONC=1; the other ~7 ms is the four PP hops (one over 10 GbE) plus
+the scheduler round trip. At CONC=8 the async scheduler spreads the requests over the in-flight
+batches (steps still carry 1-3 tokens), so the pipeline saturates at ~200 steps/s, ~5 ms per
+step per stage against a 3 ms model run: the lane is per-step latency bound (cudagraph replay
+of 8 MoE layers + TP allreduce + hop), not bandwidth or SM bound. More tokens per step (DSpark
+with real acceptance, more requests per batch) is the lever; the 10 GbE bytes (44 KB per token
+per hop) are not.

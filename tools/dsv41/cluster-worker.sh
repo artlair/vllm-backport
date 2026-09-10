@@ -13,7 +13,7 @@
 # Knobs (env), defaults in brackets:
 #   IMAGE (required)  MODEL_DIR [~/dsv41-test/models/full-dummy]  NAME [dsv41-worker]
 #   OVERLAY [1] SRC_DIR [worktree containing this script]
-#   PARTITION [8,7,9,8,8] RELAY [1] PPMETA [] NCCLALGO/NCCLPROTO [] NCCL_DEBUG []
+#   PARTITION [8,8,8,9,7] RELAY [1] PPMETA [] NCCLALGO/NCCLPROTO [] NCCL_DEBUG []
 #     (VLLM_* env is mirrored here for parity with the head; ray copies the
 #     driver's VLLM_* env to workers anyway)
 #   MEMLOCK [1] LOGLEVEL [INFO] CUDA_VISIBLE_DEVICES [] FORCE [0]

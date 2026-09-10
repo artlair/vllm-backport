@@ -24,7 +24,7 @@ OVERLAY=${OVERLAY:-1}
 MEMLOCK=${MEMLOCK:-1}
 # VLLM_* knobs: exported into BOTH containers (ray also copies the driver's
 # VLLM_* env to its workers, so setting them on the worker is belt and braces).
-PARTITION=${PARTITION:-8,7,9,8,8}
+PARTITION=${PARTITION:-8,8,8,9,7}
 RELAY=${RELAY:-1}
 # dsv41 cluster: SLOTTRACE=1 turns on the fork's existing per-step worker trace
 # (gpu_worker.py WTRACE lines: sendwait / mdrv / run / tot ms per PP stage,

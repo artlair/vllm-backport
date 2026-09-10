@@ -12,7 +12,7 @@ it on one GPU.
 quantization_config) with only ``engram_num_embeddings`` shrunk (default
 50,000,000 rows per layer, about 12.3 GiB fp8+scales per layer instead of 94 GiB)
 so the dummy boot fits today's host RAM. It also prints the expected weight
-VRAM per PP stage for ``--partition`` (default 8,7,9,8,8) so a split can be
+VRAM per PP stage for ``--partition`` (default 8,8,8,9,7) so a split can be
 sanity-checked against 4x24 GB per stage before touching the cluster.
 
 Layer-topology rules enforced here (from vllm/models/deepseek_v4_1/*):
@@ -447,7 +447,7 @@ def main() -> int:
     ap.add_argument(
         "--partition",
         action="append",
-        help="VLLM_PP_LAYER_PARTITION to print the per-stage weight VRAM for (repeatable; default 8,7,9,8,8)",
+        help="VLLM_PP_LAYER_PARTITION to print the per-stage weight VRAM for (repeatable; default 8,8,8,9,7)",
     )
     ap.add_argument("--tp", type=int, default=4, help="TP size per stage for the VRAM table")
     ap.add_argument("--util", type=float, default=0.9, help="gpu_memory_utilization for the VRAM budget column")
@@ -579,7 +579,7 @@ def main() -> int:
     print()
     print(layer_table(text, keep))
     if not args.no_vram:
-        for part in args.partition or ["8,7,9,8,8"]:
+        for part in args.partition or ["8,8,8,9,7"]:
             print()
             print(f"expected weight VRAM per PP stage, VLLM_PP_LAYER_PARTITION={part} (x299 = first two stages, rome = the rest):")
             print(vram_table(text, parse_int_list(part) or [], args.tp, args.util, engram_offload=True))
