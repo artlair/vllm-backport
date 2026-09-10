@@ -492,36 +492,68 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.compressed_cache_prefix = None
 
         if vllm_config.kernel_config.enable_jit_warmup:
+            # dsv41 boot: upstream wraps several v4.1 triton kernels in
+            # VllmJitKernel warmup classes that this tree does not have yet
+            # (our sparse_swa/compressor_utils/indexer keep them as plain
+            # triton.jit functions, compiled on first use). Register the ones
+            # we do have and skip the rest so the default kernel config boots.
+            self._register_jit_warmup(vllm_config)
+
+    def _register_jit_warmup(self, vllm_config: VllmConfig) -> None:
+        # dsv41 boot: each import is tolerant; a missing warmup wrapper only
+        # means that kernel compiles on first use instead of at startup.
+        try:
             from vllm.v1.attention.backends.mla.sparse_swa import (
                 _COMPUTE_PREFILL_METADATA_KERNEL,
-                _COMPUTE_SWA_INDICES_AND_LENS_KERNEL,
             )
 
             _COMPUTE_PREFILL_METADATA_KERNEL.register_warmup()
+        except ImportError as e:
+            logger.warning_once("Skipping jit warmup registration: %s", e)
+        try:
+            from vllm.v1.attention.backends.mla.sparse_swa import (
+                _COMPUTE_SWA_INDICES_AND_LENS_KERNEL,
+            )
+
             _COMPUTE_SWA_INDICES_AND_LENS_KERNEL.register_warmup(
                 window_size=self.window_size,
                 block_size=self.swa_cache_layer.block_size,
                 max_image_tokens=self.max_image_tokens,
             )
+        except ImportError as e:
+            logger.warning_once("Skipping jit warmup registration: %s", e)
 
-            if self.compress_ratio > 1:
+        if self.compress_ratio > 1:
+            try:
                 from vllm.v1.attention.backends.mla.compressor_utils import (
                     _COMPRESSED_SLOT_MAPPING_KERNEL,
                 )
 
                 _COMPRESSED_SLOT_MAPPING_KERNEL.register_warmup()
+            except ImportError as e:
+                logger.warning_once("Skipping jit warmup registration: %s", e)
 
-            if self.indexer is not None:
+        if self.indexer is not None:
+            try:
                 from vllm.v1.attention.backends.mla.indexer import (
                     _BUILD_PREFILL_CHUNK_METADATA_KERNEL,
+                )
+
+                _BUILD_PREFILL_CHUNK_METADATA_KERNEL.register_warmup()
+            except ImportError as e:
+                logger.warning_once("Skipping jit warmup registration: %s", e)
+            try:
+                from vllm.v1.attention.backends.mla.indexer import (
                     _PREPARE_UNIFORM_DECODE_KERNEL,
                 )
 
                 _PREPARE_UNIFORM_DECODE_KERNEL.register_warmup()
-                _BUILD_PREFILL_CHUNK_METADATA_KERNEL.register_warmup()
+            except ImportError as e:
+                logger.warning_once("Skipping jit warmup registration: %s", e)
 
-            spec_config = vllm_config.speculative_config
-            if spec_config is not None and spec_config.use_dspark():
+        spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.use_dspark():
+            try:
                 from vllm.v1.attention.backends.mla.sparse_swa import (
                     _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL,
                 )
@@ -531,17 +563,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     num_speculative_tokens=spec_config.num_speculative_tokens,
                     block_size=self.swa_cache_layer.block_size,
                 )
+            except ImportError as e:
+                logger.warning_once("Skipping jit warmup registration: %s", e)
 
-            if self.backend_cls.get_name() in (
-                "FLASHMLA_SPARSE_DSV41",
-                "ROCM_FLASHMLA_SPARSE_DSV4",
-                "TRITON_MLA_SPARSE_DSV41",
-            ):
-                from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
-                    _COMBINE_TOPK_SWA_INDICES_KERNEL,
-                )
+        if self.backend_cls.get_name() in (
+            "FLASHMLA_SPARSE_DSV41",
+            "ROCM_FLASHMLA_SPARSE_DSV4",
+            "TRITON_MLA_SPARSE_DSV41",
+        ):
+            from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+                _COMBINE_TOPK_SWA_INDICES_KERNEL,
+            )
 
-                _COMBINE_TOPK_SWA_INDICES_KERNEL.register_warmup()
+            _COMBINE_TOPK_SWA_INDICES_KERNEL.register_warmup()
 
     def forward(
         self,
