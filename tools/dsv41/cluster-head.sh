@@ -23,6 +23,7 @@
 #   CGMODE [PIECEWISE]  PIECEWISE | FULL_AND_PIECEWISE | FULL_DECODE_ONLY
 #   CAPSIZES [1,2,4,8,12,16,20,24,28,32]  CAPMAX [max of CAPSIZES]
 #   RELAY [1]  VLLM_DSV41_PP_KV_RELAY (partition splits kv groups 14 and 20)
+#   SLOTTRACE []  1 = VLLM_SLOT_TRACE per-step worker trace (WTRACE log lines)
 #   PPMETA []  VLLM_PP_CACHED_METADATA (unset = off)
 #   ENGRAM_OFFLOAD [1]  --engram-config cpu_offload (pinned host tables)
 #   MEMLOCK [1]  --ulimit memlock=-1 (pinned tables need it)

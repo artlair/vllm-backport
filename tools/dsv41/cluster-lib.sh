@@ -26,6 +26,10 @@ MEMLOCK=${MEMLOCK:-1}
 # VLLM_* env to its workers, so setting them on the worker is belt and braces).
 PARTITION=${PARTITION:-8,7,9,8,8}
 RELAY=${RELAY:-1}
+# dsv41 cluster: SLOTTRACE=1 turns on the fork's existing per-step worker trace
+# (gpu_worker.py WTRACE lines: sendwait / mdrv / run / tot ms per PP stage,
+# TP rank 0 only); it costs a log line per step, so use it on short benches.
+SLOTTRACE=${SLOTTRACE:-}
 LOGLEVEL=${LOGLEVEL:-INFO}
 
 # dsv41 boot: OVERLAY=1 wrapper, run inside the container before ray/vllm.
@@ -73,6 +77,7 @@ common_podman_args() {
     -e HF_HUB_OFFLINE=1
     -e VLLM_LOGGING_LEVEL="$LOGLEVEL"
     ${PPMETA:+-e VLLM_PP_CACHED_METADATA=$PPMETA}
+    ${SLOTTRACE:+-e VLLM_SLOT_TRACE=$SLOTTRACE}
     ${NCCLALGO:+-e NCCL_ALGO=$NCCLALGO}
     ${NCCLPROTO:+-e NCCL_PROTO=$NCCLPROTO}
     ${NCCL_DEBUG:+-e NCCL_DEBUG=$NCCL_DEBUG}
