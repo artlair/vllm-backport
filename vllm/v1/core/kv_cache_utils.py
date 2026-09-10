@@ -2011,9 +2011,76 @@ def _get_kv_cache_groups_uniform_groups(
 # eagle annotation goes through _annotate_eagle_groups_deepseek_v4, which
 # detects the DeepseekV4 family via the specs' model_version rather than
 # hf_config.model_type in ("deepseek_v4", "deepseek_v41").
+def _group_blocks_per_request(vllm_config: VllmConfig, group: KVCacheGroupSpec) -> int:
+    """dsv41 kv: blocks one request at max_model_len holds in ``group``."""
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.max_memory_usage_pages(vllm_config)
+    return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+
+
+def _sliding_window_group_count(
+    vllm_config: VllmConfig,
+    spec: UniformTypeKVCacheSpecs,
+    other_groups: list[KVCacheGroupSpec],
+    worker_layer_sets: Sequence[set[str]],
+) -> int:
+    """dsv41 kv: how many groups an unsplit sliding-window bucket splits into.
+
+    All groups draw block ids from one pool, whose block is the widest group's
+    page on each worker (``_get_kv_cache_bytes_per_block`` of the PP-projected
+    groups). A sliding-window group holds a window-bounded number of blocks
+    per request (``SlidingWindowSpec.max_admission_blocks_per_request``, i.e.
+    window plus in-flight tokens, not context), so every group the bucket is
+    split into charges that whole reserve again, while one wide group widens
+    the block every other group's blocks (e.g. the MLA anchor's one per 128
+    tokens) are charged at. Upstream 6c18bfc74 splits the bucket into as many
+    groups as fit the global anchor, which is tuned for PP=1: after PP
+    projection each stage keeps a few layers of every group, so those blocks
+    are charged at the stage's anchor but fill a fraction of it (DeepSeek-V4.1
+    at TP4xPP5: 4 groups x 389 blocks per request at a 130 KB block the SWA
+    layers fill to 37-55 KB, 7 KB per token on the binding stage against 1 KB
+    of compressed KV). Choose the split that minimises the worst worker's
+    bytes per request; ties go to fewer groups.
+    """
+    names = list(spec.kv_cache_specs)
+    page = spec.first_spec.page_size_bytes
+    assert all(s.page_size_bytes == page for s in spec.kv_cache_specs.values())
+    swa_blocks = spec.max_memory_usage_pages(vllm_config)
+    other_blocks = sum(_group_blocks_per_request(vllm_config, g) for g in other_groups)
+    other_pages = [
+        max(
+            (
+                sum(
+                    _get_per_layer_spec(g, name).page_size_bytes
+                    for name in g.layer_names
+                    if name in worker
+                )
+                for g in other_groups
+            ),
+            default=0,
+        )
+        for worker in worker_layer_sets
+    ]
+    best_groups, best_cost = 1, None
+    for num_groups in range(1, len(names) + 1):
+        blocks = other_blocks + num_groups * swa_blocks
+        cost = 0
+        for worker, other_page in zip(worker_layer_sets, other_pages):
+            widest = max(
+                sum(1 for name in names[i::num_groups] if name in worker) * page
+                for i in range(num_groups)
+            )
+            cost = max(cost, max(widest, other_page) * blocks)
+        if best_cost is None or cost < best_cost:
+            best_groups, best_cost = num_groups, cost
+    return best_groups
+
+
 def _get_packed_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
+    worker_layer_sets: Sequence[Iterable[str]] | None = None,
 ) -> list[KVCacheGroupSpec] | None:
     """Group mixed-page-size layers for contiguous block-outermost packing.
 
@@ -2025,6 +2092,11 @@ def _get_packed_kv_cache_groups(
     split to fit the block the attention buckets already need.
     Returns None when the layout is not block-outermost or all layers already
     share one page size.
+
+    dsv41 kv: ``worker_layer_sets`` are the layer names each worker registers
+    (the per-worker spec dicts of ``get_kv_cache_configs``); unsplit
+    sliding-window buckets are split by a cost model over those projections
+    (``_sliding_window_group_count``). None means one worker with every layer.
     """
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}
@@ -2112,20 +2184,14 @@ def _get_packed_kv_cache_groups(
         default=0,
     )
 
-    groups = []
-    for spec, page_size_layers, balanced in bucketed:
-        num_groups = num_groups_for(spec, balanced)
-        # Cap a state group at the states a block already fits rather than let
-        # it widen the block.
-        if anchor_bytes and is_state_bucket(spec):
-            states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
-            num_groups = max(
-                num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
-            )
+    def split_bucket(
+        spec: UniformTypeKVCacheSpecs,
+        page_size_layers: dict[int, list[str]],
+        num_groups: int,
+    ) -> list[KVCacheGroupSpec]:
         if num_groups == 1:
-            groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
-            continue
-
+            return [KVCacheGroupSpec(list(spec.kv_cache_specs), spec)]
+        bucket_groups = []
         pattern_repeats = list(zip(*page_size_layers.values()))
         for i in range(num_groups):
             group_layer_names = [
@@ -2136,7 +2202,37 @@ def _get_packed_kv_cache_groups(
             }
             group_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
             assert group_spec is not None
-            groups.append(KVCacheGroupSpec(group_layer_names, group_spec))
+            bucket_groups.append(KVCacheGroupSpec(group_layer_names, group_spec))
+        return bucket_groups
+
+    # dsv41 kv: place every bucket whose split is fixed by the repeat pattern
+    # or the anchor first, then split the sliding-window state buckets against
+    # them (per worker, when the PP layer sets are known); emit in bucket order.
+    workers = (
+        [set(kv_cache_spec)]
+        if worker_layer_sets is None
+        else [set(layers) for layers in worker_layer_sets]
+    )
+    planned: dict[int, list[KVCacheGroupSpec]] = {}
+    for index, (spec, page_size_layers, balanced) in enumerate(bucketed):
+        if is_state_bucket(spec) and isinstance(spec.first_spec, SlidingWindowSpec):
+            continue
+        num_groups = num_groups_for(spec, balanced)
+        # Cap a state group at the states a block already fits rather than let
+        # it widen the block.
+        if anchor_bytes and is_state_bucket(spec):
+            states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
+            num_groups = max(
+                num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
+            )
+        planned[index] = split_bucket(spec, page_size_layers, num_groups)
+    for index, (spec, page_size_layers, balanced) in enumerate(bucketed):
+        if index in planned:
+            continue
+        others = [group for groups in planned.values() for group in groups]
+        num_groups = _sliding_window_group_count(vllm_config, spec, others, workers)
+        planned[index] = split_bucket(spec, page_size_layers, num_groups)
+    groups = [group for index in range(len(bucketed)) for group in planned[index]]
 
     _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, groups)
     return groups
@@ -2145,6 +2241,7 @@ def _get_packed_kv_cache_groups(
 def _get_dsv41_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
+    worker_layer_sets: Sequence[Iterable[str]] | None = None,
 ) -> list[KVCacheGroupSpec] | None:
     """dsv41: plan the DeepSeek V4.1 mix (MLA + SWA-MLA + compressor rings).
 
@@ -2152,6 +2249,7 @@ def _get_dsv41_kv_cache_groups(
     layer already shares one page size (the generic path handles that).
     Rings are one block per request, so they can only be placed by the
     packed planner; a non-block-outermost layout cannot express them.
+    ``worker_layer_sets``: see ``_get_packed_kv_cache_groups`` (dsv41 kv).
     """
     if not any(isinstance(spec, CircularBufferSpec) for spec in kv_cache_spec.values()):
         return None
@@ -2172,7 +2270,9 @@ def _get_dsv41_kv_cache_groups(
             "block-outermost KV cache layout (e.g. BLHNC) so mixed page sizes "
             f"pack per block; the resolved layout is {layout.name}."
         )
-    packed_groups = _get_packed_kv_cache_groups(vllm_config, filtered_spec)
+    packed_groups = _get_packed_kv_cache_groups(
+        vllm_config, filtered_spec, worker_layer_sets
+    )
     if packed_groups is None:
         return None
     # Block-outermost blocks are strided by the widest group, so hidden
@@ -2220,7 +2320,9 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
 
 
 def get_kv_cache_groups(
-    vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+    worker_kv_cache_specs: Sequence[dict[str, KVCacheSpec]] | None = None,
 ) -> list[KVCacheGroupSpec]:
     """
     Split the layers in the model into groups with the same KV cache spec.
@@ -2228,6 +2330,10 @@ def get_kv_cache_groups(
     Args:
         vllm_config: The global VllmConfig
         kv_cache_spec: The kv cache spec of each attention layer in the model
+        worker_kv_cache_specs: dsv41 kv: the per-worker spec dicts
+            ``kv_cache_spec`` was merged from, when planning for PP; only the
+            DeepSeek V4.1 packed planner uses them (to size its sliding-window
+            groups against each stage's projected pool block).
 
     Returns:
         The generated KVCacheGroups
@@ -2250,7 +2356,13 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
-    elif dsv41_groups := _get_dsv41_kv_cache_groups(vllm_config, kv_cache_spec):
+    elif dsv41_groups := _get_dsv41_kv_cache_groups(
+        vllm_config,
+        kv_cache_spec,
+        None
+        if worker_kv_cache_specs is None
+        else [spec.keys() for spec in worker_kv_cache_specs],
+    ):
         # dsv41: DeepSeek V4.1 adds one-block-per-request CircularBufferSpec
         # rings next to its MLA / SWA-MLA layers; the tuple packer below cannot
         # place them, the packed planner folds them in as state buckets.
@@ -2630,7 +2742,10 @@ def get_kv_cache_configs(
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
-    global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    # dsv41 kv: the per-worker dicts let the V4.1 planner see the PP projection.
+    global_kv_cache_groups = get_kv_cache_groups(
+        vllm_config, merged_kv_cache_specs, kv_cache_specs
+    )
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.

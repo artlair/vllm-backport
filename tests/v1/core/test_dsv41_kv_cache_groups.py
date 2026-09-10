@@ -381,3 +381,128 @@ def test_v41_without_rings_keeps_the_tuple_packer():
     groups = get_kv_cache_groups(make_vllm_config(), specs)
     assigned = [name for g in groups for name in g.layer_names]
     assert sorted(assigned) == sorted(specs)
+
+
+# dsv41 kv: per-PP-stage accounting. The planner sees the whole model, but
+# each stage's pool block is the widest group projected onto its own layers,
+# and a sliding-window group is charged its whole per-request reserve
+# (window + in-flight tokens) once per group.
+def real_flash_stage_specs(
+    partition: list[int], num_draft_layers: int = 3
+) -> list[dict[str, KVCacheSpec]]:
+    """The spec dict each PP stage registers: its layers plus the relay
+    mirrors (the kv source's compressed cache under the source's name, and its
+    indexer K cache when a local non-kv index source borrows it)."""
+    compress_ratios = [0, 0] + [2] * 18 + [1] * 20
+    kv_sources = [2, 8, 14, 20]
+    index_sources = [2, 8, 14, 20, 24, 28, 32, 36]
+
+    def kv_source_of(layer: int) -> int | None:
+        if compress_ratios[layer] == 0:
+            return None
+        return max(s for s in kv_sources if s <= layer)
+
+    stages = []
+    start = 0
+    for rank, count in enumerate(partition):
+        end = start + count
+        specs: dict[str, KVCacheSpec] = {}
+        for src in kv_sources:
+            if src >= start:
+                continue
+            consumers = [i for i in range(start, end) if kv_source_of(i) == src]
+            if not consumers:
+                continue
+            specs[f"model.layers.{src}.attn"] = mla_kv_spec(compress_ratios[src])
+            if any(i in index_sources and i not in kv_sources for i in consumers):
+                specs[f"model.layers.{src}.attn.indexer.k_cache"] = indexer_spec(
+                    compress_ratios[src]
+                )
+        for layer in range(start, end):
+            prefix = f"model.layers.{layer}.attn"
+            ratio = compress_ratios[layer]
+            if layer in kv_sources:
+                specs[prefix] = mla_kv_spec(ratio)
+                specs[f"{prefix}.indexer.k_cache"] = indexer_spec(ratio)
+            specs[f"{prefix}.swa_cache"] = swa_spec()
+            if layer in kv_sources and ratio > 1:
+                specs[f"{prefix}.compressor.state_cache"] = ring_spec()
+        if rank == len(partition) - 1:
+            for d in range(num_draft_layers):
+                specs[f"model.layers.{sum(partition) + d}.attn.swa_cache"] = swa_spec()
+        stages.append(specs)
+        start = end
+    return stages
+
+
+def test_pp_stage_accounting_keeps_one_sliding_window_group():
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_capacity,
+        get_kv_cache_configs,
+    )
+
+    ctx = 32768
+    vllm_config = make_vllm_config()
+    vllm_config.model_config.max_model_len = ctx
+    vllm_config.model_config.original_max_model_len = ctx
+    # TP4xPP5 on the cluster: 6 batches in flight x 2048 batched tokens.
+    vllm_config.max_in_flight_tokens = 6 * 2048
+    stage_specs = real_flash_stage_specs([8, 7, 9, 9, 7])
+    merged = {k: v for specs in stage_specs for k, v in specs.items()}
+    assert sorted(merged) == sorted(real_flash_specs())
+    gib = 1024**3
+    avail = [int(g * gib) for g in (3.17, 5.60, 1.92, 1.90, 2.60)]
+
+    configs = get_kv_cache_configs(vllm_config, stage_specs, avail)
+    groups = configs[0].kv_cache_groups
+    swa_groups = [
+        g
+        for g in groups
+        if all(isinstance(s, SlidingWindowMLASpec) for s in layer_specs_of(g))
+    ]
+    # The 43 SWA layers stay one group: every extra group would charge the
+    # full window + in-flight reserve (389 blocks per request here) again,
+    # against 256 blocks for the whole 32k context of compressed KV.
+    assert len(swa_groups) == 1
+    assert len(groups) == 3
+    swa_spec_ = swa_groups[0].kv_cache_spec
+    assert (
+        swa_spec_.max_memory_usage_bytes(vllm_config) // swa_spec_.page_size_bytes
+        == 389
+    )
+
+    # Per stage: pool block = max(projected MLA page, projected SWA page), and
+    # a request costs 256 + 389 + 1 blocks of it.
+    expected_block = {
+        0: 8 * 19008,  # source 2 (46080) < 8 SWA layers
+        1: 7 * 19008,  # sources 8 + 14 (92160) < 7 SWA layers
+        2: 9 * 19008,  # mirror 14 (latent only) + source 20 = 129600 < 9 SWA
+        3: 9 * 19008,  # mirror 20 with K cache (92160) < 9 SWA
+        4: 10 * 19008,  # 7 layers + 3 DSpark draft layers
+    }
+    per_request_blocks = 256 + 389 + 1
+    for rank, cfg in enumerate(configs):
+        block = _get_kv_cache_bytes_per_block(cfg.kv_cache_groups)
+        assert block == expected_block[rank], rank
+        bytes_per_token = per_request_blocks * block / ctx
+        # Within 4x of the compressed-cache cost the stage owns (720 B/token
+        # for source 20, 1080 with the mirror); before the fix stage 2 was 7171.
+        assert bytes_per_token < 3800, (rank, bytes_per_token)
+
+    # Stage 3 (1.90 GiB at 171072 B per block) binds the pool.
+    binding = avail[3] // expected_block[3]
+    assert all(cfg.num_blocks == binding for cfg in configs)
+    tokens, concurrency = get_kv_cache_capacity(
+        vllm_config, generate_scheduler_kv_cache_config(configs)
+    )
+    assert tokens == int(binding / per_request_blocks * ctx)
+    assert tokens > 600_000  # 287,501 with the 4-group split
+
+
+def test_single_worker_split_still_fits_the_anchor():
+    # PP=1 with a small in-flight reserve: the cost model agrees with the
+    # "as many groups as fit the anchor" rule (4 groups of 10-11).
+    vllm_config = make_vllm_config()
+    specs = real_flash_specs()
+    groups = get_kv_cache_groups(vllm_config, specs, [specs])
+    assert sorted(len(g.layer_names) for g in groups) == [3, 8, 10, 11, 11, 11]
