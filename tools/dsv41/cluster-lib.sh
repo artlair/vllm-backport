@@ -38,6 +38,18 @@ LOGLEVEL=${LOGLEVEL:-INFO}
 # in, PYTHONPATH=/work. Ray worker processes inherit the env of `ray start`,
 # so running this in the worker container is what makes rome's ranks import
 # the same python as the head's driver.
+# dsv41 engram-mmap: --engram-config JSON from ENGRAM_OFFLOAD (pinned or
+# resident) and, when set, ENGRAM_MODE (pinned | resident | mmap).
+engram_config_json() {
+  local offload=false
+  [ "${ENGRAM_OFFLOAD:-1}" = "1" ] && offload=true
+  if [ -n "${ENGRAM_MODE:-}" ]; then
+    printf '{"cpu_offload": %s, "table_mode": "%s"}' "$offload" "$ENGRAM_MODE"
+  else
+    printf '{"cpu_offload": %s}' "$offload"
+  fi
+}
+
 overlay_prelude() {
   cat <<'EOS'
 set -e

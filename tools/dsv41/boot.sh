@@ -9,6 +9,9 @@
 # Knobs (env): IMAGE (required for serve/start), MODEL_DIR (default ./trunc),
 # TP=1 PP=1 CTX=8192 UTIL=0.5 SEQS=2 SPEC=0 ENGRAM_OFFLOAD=1 EAGER=1 PORT=8080
 # NAME=dsv41-dummy BATCHED=2048 EXTRA (extra vllm args, word-split).
+# ENGRAM_MODE (unset | pinned | resident | mmap): engram_config.table_mode;
+# unset keeps the ENGRAM_OFFLOAD choice, mmap = page-cache tables, nothing
+# pinned (docs/dsv41-engram-mmap.md).
 # OVERLAY=1 mounts the repo (SRC_DIR, default the worktree containing this
 # script) at /src and runs the image's compiled ops with the worktree's python:
 # /src/vllm is copied to /work/vllm, every build-only file of the installed
@@ -31,6 +34,7 @@ UTIL=${UTIL:-0.5}
 SEQS=${SEQS:-2}
 SPEC=${SPEC:-0}
 ENGRAM_OFFLOAD=${ENGRAM_OFFLOAD:-1}
+ENGRAM_MODE=${ENGRAM_MODE:-}
 EAGER=${EAGER:-1}
 BATCHED=${BATCHED:-2048}
 HOST=${HOST:-127.0.0.1}
@@ -55,7 +59,19 @@ export PYTHONPATH=/work
 EOS
 }
 
-usage() { sed -n '2,15p' "$0"; exit 1; }
+usage() { sed -n '2,18p' "$0"; exit 1; }
+
+# dsv41 engram-mmap: ENGRAM_OFFLOAD picks pinned/resident; ENGRAM_MODE, when
+# set, adds table_mode (mmap needs the real checkpoint or a dummy load).
+engram_config_json() {
+  local offload=false
+  [ "$ENGRAM_OFFLOAD" = "1" ] && offload=true
+  if [ -n "$ENGRAM_MODE" ]; then
+    printf '{"cpu_offload": %s, "table_mode": "%s"}' "$offload" "$ENGRAM_MODE"
+  else
+    printf '{"cpu_offload": %s}' "$offload"
+  fi
+}
 
 vllm_args() {
   # Printed one-per-line so `serve` can show the exact command.
@@ -74,11 +90,7 @@ vllm_args() {
     --served-model-name dsv41 dsv41-dummy
     --host 0.0.0.0 --port "$PORT"
   )
-  if [ "$ENGRAM_OFFLOAD" = "1" ]; then
-    args+=(--engram-config '{"cpu_offload": true}')
-  else
-    args+=(--engram-config '{"cpu_offload": false}')
-  fi
+  args+=(--engram-config "$(engram_config_json)")
   [ "$EAGER" = "1" ] && args+=(--enforce-eager)
   if [ "${SPEC}" -gt 0 ]; then
     # V4.1 DSpark: n_predict := dspark_block_size (5); SPEC > 5 must be a multiple of 5.

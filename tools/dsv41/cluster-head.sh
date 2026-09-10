@@ -26,6 +26,9 @@
 #   SLOTTRACE []  1 = VLLM_SLOT_TRACE per-step worker trace (WTRACE log lines)
 #   PPMETA []  VLLM_PP_CACHED_METADATA (unset = off)
 #   ENGRAM_OFFLOAD [1]  --engram-config cpu_offload (pinned host tables)
+#   ENGRAM_MODE []  pinned | resident | mmap: --engram-config table_mode
+#              (mmap = tables read from the page cache, nothing pinned;
+#              docs/dsv41-engram-mmap.md); unset keeps ENGRAM_OFFLOAD
 #   MEMLOCK [1]  --ulimit memlock=-1 (pinned tables need it)
 #   NCCLALGO / NCCLPROTO []  unset = NCCL auto
 #   LOADFORMAT [dummy]  dummy | auto (real weights)
@@ -63,11 +66,12 @@ CGMODE=${CGMODE:-PIECEWISE}
 CAPSIZES=${CAPSIZES:-1,2,4,8,12,16,20,24,28,32}
 CAPMAX=${CAPMAX:-${CAPSIZES##*,}}
 ENGRAM_OFFLOAD=${ENGRAM_OFFLOAD:-1}
+ENGRAM_MODE=${ENGRAM_MODE:-}
 LOADFORMAT=${LOADFORMAT:-dummy}
 KVDTYPE=${KVDTYPE:-fp8_ds_mla}
 DSV41_CLUSTER_WAIT=${DSV41_CLUSTER_WAIT:-900}
 
-usage() { sed -n '2,37p' "$0"; exit 1; }
+usage() { sed -n '2,40p' "$0"; exit 1; }
 
 vllm_args() {
   local args=(
@@ -86,11 +90,7 @@ vllm_args() {
     --host 0.0.0.0 --port "$PORT"
   )
   [ -n "${BATCHED:-}" ] && args+=(--max-num-batched-tokens "$BATCHED")
-  if [ "$ENGRAM_OFFLOAD" = "1" ]; then
-    args+=(--engram-config '{"cpu_offload": true}')
-  else
-    args+=(--engram-config '{"cpu_offload": false}')
-  fi
+  args+=(--engram-config "$(engram_config_json)")
   if [ "$EAGER" = "1" ]; then
     args+=(--enforce-eager)
   else

@@ -695,7 +695,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids = input_ids.to(torch.int64)
 
         # Engram n-gram hashes for the whole (flattened) batch, computed once
-        # on the full token stream — before any sequence-parallel sharding —
+        # on the full token stream (before any sequence-parallel sharding)
         # and consumed by the engram layers (1 and 14) below. Skipped on
         # profile runs (KV cache unbound).
         engram_hashes, engram_mask = self._stage_engram_rows(

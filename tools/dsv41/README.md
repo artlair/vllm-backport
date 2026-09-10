@@ -12,7 +12,9 @@ DSpark MTP, vision tower) is exercised without downloading the 300 GB checkpoint
 2. Boot on one 3090: `IMAGE=<sm86 image> MODEL_DIR=$PWD/trunc ./boot.sh start`, then `./boot.sh smoke`
    (waits for /health, sends one chat completion at temperature 0, prints text and tokens/s),
    `./boot.sh logs`, `./boot.sh stop`. `./boot.sh serve` runs in the foreground; `./boot.sh print` shows the vllm argv.
-   Env knobs: `TP PP CTX UTIL SEQS SPEC ENGRAM_OFFLOAD EAGER PORT NAME BATCHED EXTRA`.
+   Env knobs: `TP PP CTX UTIL SEQS SPEC ENGRAM_OFFLOAD ENGRAM_MODE EAGER PORT NAME BATCHED EXTRA`
+   (`ENGRAM_MODE=mmap` serves the engram tables from the page cache instead of pinned memory,
+   `docs/dsv41-engram-mmap.md`; `tools/dsv41/engram_mmap_check.py` checks it against a real shard).
    `SPEC=5` enables DSpark (V4.1 sets n_predict to dspark_block_size=5; values above 5 must be multiples of 5).
    Dummy weights produce garbage text; the point is that the server boots and the request round-trips.
    Note: `tokenizer.json`, `tokenizer_config.json` come from the HF repo; `chat_template.jinja` is ours
@@ -87,7 +89,7 @@ a partition that puts layer 14 on rome (e.g. `7,7,...`), each node pins one 94 G
    per-request completion counts and aggregate tokens/s).
 
 Head knobs (defaults): `TP=4 PP=5 PARTITION=8,8,8,9,7 CTX=32768 UTIL=0.9 SEQS=4 SPEC=5 EAGER=1
-CGMODE=PIECEWISE CAPSIZES=1,2,4,8,12,16,20,24,28,32 RELAY=1 PPMETA= ENGRAM_OFFLOAD=1 MEMLOCK=1
+CGMODE=PIECEWISE CAPSIZES=1,2,4,8,12,16,20,24,28,32 RELAY=1 PPMETA= ENGRAM_OFFLOAD=1 ENGRAM_MODE= MEMLOCK=1
 NCCLALGO= NCCLPROTO= LOADFORMAT=dummy KVDTYPE=fp8_ds_mla LIMITMM= BATCHED= SLOTTRACE= EXTRA= OVERLAY=1`.
 `SLOTTRACE=1` forwards `VLLM_SLOT_TRACE` (the fork's per-step `WTRACE exec pp=N ntok=T sendwait/mdrv/run/tot`
 lines, TP rank 0 of every stage); they land in the ray per-worker logs (`raylogs` / `stop`), not the head log.
