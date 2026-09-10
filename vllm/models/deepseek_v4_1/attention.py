@@ -147,6 +147,40 @@ def _resolve_dsv4_kv_cache_dtype(
     return kv_cache_dtype, torch.bfloat16
 
 
+def compressed_kv_cache_spec(
+    vllm_config: VllmConfig,
+    head_dim: int,
+    compress_ratio: int,
+    kv_cache_dtype: str,
+    kv_cache_torch_dtype: torch.dtype,
+) -> MLAAttentionSpec:
+    """Spec of a kv source's compressed-KV cache.
+
+    dsv41 pp-relay: shared by ``DeepseekV4Attention.get_kv_cache_spec`` and
+    the PP relay mirror so a mirror registers a spec equal to the source's
+    (``get_kv_cache_configs`` asserts equality for a layer name seen on
+    several workers).
+    """
+    # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B
+    # alignment; plain bf16 / per-tensor fp8 rows use natural element-size
+    # pages.
+    uses_fp8_ds_mla_layout = kv_cache_dtype == "fp8_ds_mla"
+    return MLAAttentionSpec(
+        block_size=vllm_config.cache_config.block_size,
+        num_kv_heads=1,
+        head_size=head_dim,
+        dtype=torch.uint8 if uses_fp8_ds_mla_layout else kv_cache_torch_dtype,
+        tokens_per_state=compress_ratio,
+        cache_dtype_str=kv_cache_dtype,
+        alignment=576 if uses_fp8_ds_mla_layout else 512,
+        model_version="deepseek_v4",
+        kv_quant_mode=get_kv_quant_mode(kv_cache_dtype),
+        # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token;
+        # head_size stays semantic (512).
+        state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
+    )
+
+
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     """DeepseekV4 MLA attention layer.
 
@@ -366,6 +400,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.kv_cache = torch.tensor([])
         self._static_forward_context = compilation_config.static_forward_context
 
+        # dsv41 pp-relay: [max_num_batched_tokens, head_dim] bf16 send buffer
+        # the model installs on kv sources whose caches a later PP stage
+        # rebuilds; the compressor then emits its latent straight into it.
+        self.pp_relay_latent_out: torch.Tensor | None = None
+
         self.indexer = None
         if self.is_index_source:
             index_k_cache: DeepseekV4IndexerCache | None
@@ -390,10 +429,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 )
                 index_k_cache = self._static_forward_context.get(k_cache_prefix)
                 if index_k_cache is None:
+                    # dsv41 pp-relay: with VLLM_DSV41_PP_KV_RELAY=1 the model
+                    # registers a mirror under this name before building the
+                    # consumer layers, so this only fires with the relay off.
                     raise NotImplementedError(
                         f"Indexer K cache source {k_cache_prefix} not found on "
                         "this rank; PP splits inside a v4.1 kv-sharing group "
-                        "are not supported."
+                        "are not supported (set VLLM_DSV41_PP_KV_RELAY=1 to "
+                        "relay the shared caches across stages)."
                     )
             is_candidate_source = layer_id == self.candidate_source_layer
             uses_candidates = 0 <= self.candidate_source_layer < layer_id
@@ -483,10 +526,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 not self.is_kv_source
                 and self.compressed_cache_prefix not in self._static_forward_context
             ):
+                # dsv41 pp-relay: see the indexer K cache lookup above.
                 raise NotImplementedError(
                     f"Compressed-KV source {self.compressed_cache_prefix} not "
                     "found on this rank; PP splits inside a v4.1 kv-sharing "
-                    "group are not supported."
+                    "group are not supported (set VLLM_DSV41_PP_KV_RELAY=1 to "
+                    "relay the shared caches across stages)."
                 )
         else:
             self.compressed_cache_prefix = None
@@ -689,9 +734,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if compressor is not None:
             # Q projection / KV insertion on the default stream overlaps the
             # compressor on aux stream 0 (sequential on ROCm).
+            # dsv41 pp-relay: the latent goes straight into the relay send
+            # buffer when a later stage rebuilds this source's caches.
             q, latent = maybe_execute_in_parallel(
                 project_query_and_cache_kv,
-                lambda: compressor(kv_score, positions),
+                lambda: compressor(
+                    kv_score, positions, latent_out=self.pp_relay_latent_out
+                ),
                 self.ln_events[0],
                 self.ln_events[1],
                 aux_stream,
@@ -935,23 +984,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # DeepseekV4SWACache.
         if not self.is_kv_source:
             return None
-        # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B
-        # alignment; plain bf16 / per-tensor fp8 rows use natural element-size
-        # pages.
-        uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
-        return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
-            num_kv_heads=1,
-            head_size=self.head_dim,
-            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
-            tokens_per_state=self.compress_ratio,
-            cache_dtype_str=self.kv_cache_dtype,
-            alignment=576 if uses_fp8_ds_mla_layout else 512,
-            model_version="deepseek_v4",
-            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token;
-            # head_size stays semantic (512).
-            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
+        return compressed_kv_cache_spec(
+            vllm_config,
+            self.head_dim,
+            self.compress_ratio,
+            self.kv_cache_dtype,
+            self.kv_cache_torch_dtype,
         )
 
     def _compressed_kv_cache(self) -> torch.Tensor:

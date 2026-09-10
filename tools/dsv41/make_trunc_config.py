@@ -26,7 +26,8 @@ Layer-topology rules enforced here (from vllm/models/deepseek_v4_1/*):
 * ``candidate_source_layer_id`` must be an index source (only an indexer writes
   candidates); every later index source masks with those candidate blocks and
   must share the candidate source's ratio (blocks are compressed positions).
-* PP cannot split inside a kv-sharing group (source and consumers on one rank).
+* PP cannot split inside a kv-sharing group (source and consumers on one rank)
+  unless VLLM_DSV41_PP_KV_RELAY=1 relays the shared caches (docs/dsv41-pp-kv-relay.md).
 * Engram (common/engram.py): ``len(engram_layer_ids) == len(engram_num_embeddings)``;
   the injection runs only from the second layer on, so engram ids must be >= 1;
   each layer's table needs ``sum(24 primes drawn upward from engram_vocab_size-1,

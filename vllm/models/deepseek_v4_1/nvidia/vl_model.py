@@ -305,6 +305,11 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
     def token_lookback_depth(self) -> int:
         return self.language_model.token_lookback_depth
 
+    @property
+    def pp_all_gather_tensors(self) -> dict[str, bool]:
+        # dsv41 pp-relay: gpu_worker reads this off the top-level model.
+        return self.language_model.pp_all_gather_tensors
+
     def forward(
         self,
         input_ids: torch.Tensor,

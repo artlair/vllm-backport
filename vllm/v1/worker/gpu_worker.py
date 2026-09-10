@@ -1203,6 +1203,21 @@ class Worker(WorkerBase):
                 )
             }
 
+        if (
+            envs.VLLM_DSV41_PP_KV_RELAY
+            and parallel_config.pipeline_parallel_size > 1
+            and forward_pass
+        ):
+            # dsv41 pp-relay: the model may veto the TP all-gather split for
+            # relayed tensors that are not replicated across TP ranks
+            # (candidate blocks under VLLM_INDEXER_QUERY_SHARD). Both peers of
+            # a hop derive the same flags, so send and recv stay matched.
+            relay_flags = getattr(
+                self.model_runner.get_model(), "pp_all_gather_tensors", None
+            )
+            if relay_flags:
+                all_gather_tensors = {**all_gather_tensors, **relay_flags}
+
         pp_meta_sig = self._pp_metadata_sig(scheduler_output)
         _t2 = time.monotonic()
         if forward_pass and not get_pp_group().is_first_rank:

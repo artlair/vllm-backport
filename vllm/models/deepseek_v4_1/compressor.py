@@ -249,6 +249,10 @@ class DeepseekCompressor(nn.Module):
         kv_score: torch.Tensor,
         # [num_tokens]
         positions: torch.Tensor,
+        # dsv41 pp-relay: optional [num_tokens, head_dim] bf16 destination.
+        # Set by the model when a later PP stage consumes this source's
+        # caches, so the latent lands directly in the relay send buffer.
+        latent_out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Save states and return the BF16 latent for cache insertion and indexing.
 
@@ -270,12 +274,16 @@ class DeepseekCompressor(nn.Module):
             query_start_loc = state_metadata.query_start_loc
             token_to_req_indices = state_metadata.token_to_req_indices
 
-        latent = torch.empty(
-            kv_score.shape[0],
-            self.head_dim,
-            dtype=torch.bfloat16,
-            device=kv_score.device,
-        )
+        if latent_out is not None:
+            # dsv41 pp-relay: the kernel asserts the exact [tokens, 512] shape.
+            latent = latent_out[: kv_score.shape[0]]
+        else:
+            latent = torch.empty(
+                kv_score.shape[0],
+                self.head_dim,
+                dtype=torch.bfloat16,
+                device=kv_score.device,
+            )
         fused_save_compress_norm(
             kv_score,
             positions,

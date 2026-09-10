@@ -68,6 +68,7 @@ from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.models.deepseek_v4_1.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.models.deepseek_v4_1.pp_relay_runtime import DeepseekV41PPRelay
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -466,6 +467,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         self.engram_layout = EngramLayout.from_config(config)
 
+        # dsv41 pp-relay: when a PP stage holds consumers of a kv-sharing
+        # group but not its source, register mirrors of the source's caches
+        # under the source's layer names BEFORE the consumer layers are built
+        # (they resolve their source through the static forward context in
+        # __init__). Off by default; see docs/dsv41-pp-kv-relay.md.
+        self.pp_relay: DeepseekV41PPRelay | None = None
+        if envs.VLLM_DSV41_PP_KV_RELAY and get_pp_group().world_size > 1:
+            relay = DeepseekV41PPRelay(
+                vllm_config,
+                _select_dsv4_attn_cls(vllm_config),
+                f"{prefix}.layers",
+                self.topk_indices_buffer,
+                self.candidate_block_buffer,
+            )
+            if relay.plan.is_active:
+                self.pp_relay = relay
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -478,6 +496,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+
+        # dsv41 pp-relay: local kv sources a later stage depends on emit their
+        # latent straight into the send buffer; mirror weights (the source
+        # indexer's wk / k_norm) are loaded through a name redirect because
+        # is_pp_missing_parameter would otherwise skip the source layer's
+        # checkpoint names on this rank.
+        self._pp_relay_param_redirect: dict[str, str] = {}
+        if self.pp_relay is not None:
+            self.pp_relay.attach_sources(self.layers)
+            self._pp_relay_param_redirect = self.pp_relay.checkpoint_params("pp_relay")
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
         # (chunked prefill / decode lookback); key it off the first local
@@ -533,20 +561,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
-        )
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        if self.pp_relay is not None:
+            # dsv41 pp-relay: the payloads this stage receives, same row
+            # count as hidden_states so every entry is sliced [:T] together.
+            tensors.update(self.pp_relay.make_empty_tensors(batch_size, device))
+        return IntermediateTensors(tensors)
 
     def forward(
         self,
@@ -564,6 +595,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            if self.pp_relay is not None:
+                # dsv41 pp-relay: rebuild the relayed shared caches / index
+                # rows before any local layer reads them.
+                self.pp_relay.consume(intermediate_tensors, positions)
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -652,6 +687,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 engram_hashes,
                 engram_mask,
             )
+            if self.pp_relay is not None:
+                # dsv41 pp-relay: snapshot top-k / candidate rows a source
+                # just published (a later local index source overwrites them).
+                self.pp_relay.after_layer(idx, hidden_states.shape[0])
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
                 aux_recon = mhc_post_tilelang(
@@ -672,9 +711,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
-            )
+            tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
+            if self.pp_relay is not None:
+                # dsv41 pp-relay: produced payloads from the send buffers,
+                # forwarded ones straight from what this stage received.
+                tensors.update(
+                    self.pp_relay.outgoing(intermediate_tensors, hidden_states.shape[0])
+                )
+            return IntermediateTensors(tensors)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -739,6 +783,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 loaded_weight = self._pad_shared_expert_weight(
                     self.quant_config, name, loaded_weight
                 )
+            if redirected := self._pp_relay_param_redirect.get(name):
+                # dsv41 pp-relay: a mirrored source's indexer wk / k_norm.
+                # Must precede the PP-missing check, which would drop the
+                # source layer's names on this rank.
+                if redirected not in params_dict:
+                    # LoRA-wrapped mirror linear: ``<head>.base_layer.<leaf>``.
+                    head, _, leaf = redirected.rpartition(".")
+                    redirected = f"{head}.base_layer.{leaf}"
+                param = params_dict[redirected]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(redirected)
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -1114,6 +1171,13 @@ class DeepseekV41LLMForCausalLM(
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    @property
+    def pp_all_gather_tensors(self) -> dict[str, bool]:
+        """dsv41 pp-relay: per-key overrides for the PP send's TP all-gather
+        split, read by gpu_worker (empty when the relay is off)."""
+        relay = getattr(self.model, "pp_relay", None)
+        return relay.all_gather_tensors if relay is not None else {}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

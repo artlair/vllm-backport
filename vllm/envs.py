@@ -317,6 +317,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_RAGGED_FAST_SCAN: bool = False
     VLLM_DSV4_FIXED_DECODE_SPLITS: int = 16
     VLLM_DSV4_LOGITS_ROW_CHUNK: int = 128
+    VLLM_DSV41_PP_KV_RELAY: bool = False
     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
     VLLM_TOKEN_BUCKET_PAD: bool = True
     VLLM_DSPARK_FUSED_MARKOV: bool = True
@@ -2283,6 +2284,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "VLLM_DSV4_LOGITS_ROW_CHUNK",
             os.environ.get("DSV4_LOGITS_ROW_CHUNK", "128"),
         )
+    ),
+    # dsv41 pp-relay: let a pipeline stage hold consumers of a DeepSeek V4.1
+    # kv-sharing group without its source layer. The source stage relays its
+    # per-token compressor latent, top-k rows and candidate blocks in the PP
+    # intermediate tensors and the receiving stages rebuild the shared caches
+    # from lightweight mirrors (docs/dsv41-pp-kv-relay.md). Off: the model
+    # keeps refusing such partitions with NotImplementedError.
+    "VLLM_DSV41_PP_KV_RELAY": lambda: (
+        os.environ.get("VLLM_DSV41_PP_KV_RELAY", "0") == "1"
     ),
     # Pin the mHC TileLang GEMM split-k factor. The default heuristic derives
     # it from SM count / batch grid size, so every token's reduction order
