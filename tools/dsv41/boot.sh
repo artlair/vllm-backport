@@ -9,6 +9,10 @@
 # Knobs (env): IMAGE (required for serve/start), MODEL_DIR (default ./trunc),
 # TP=1 PP=1 CTX=8192 UTIL=0.5 SEQS=2 SPEC=0 ENGRAM_OFFLOAD=1 EAGER=1 PORT=8080
 # NAME=dsv41-dummy BATCHED=2048 EXTRA (extra vllm args, word-split).
+# OVERLAY=1 mounts the repo (SRC_DIR, default the worktree containing this
+# script) at /src and runs the image's compiled ops with the worktree's python:
+# /src/vllm is copied to /work/vllm, every build-only file of the installed
+# package (.so, vllm_flash_attn, _version.py) is linked in, PYTHONPATH=/work.
 # Anything after `serve`/`start` is appended to the vllm command line.
 #
 # Conventions mirror the GLM lane scripts on x299 (glm-head*.sh): host network,
@@ -30,6 +34,26 @@ ENGRAM_OFFLOAD=${ENGRAM_OFFLOAD:-1}
 EAGER=${EAGER:-1}
 BATCHED=${BATCHED:-2048}
 HOST=${HOST:-127.0.0.1}
+OVERLAY=${OVERLAY:-0}
+SRC_DIR=${SRC_DIR:-$(cd "$HERE/../.." && pwd)}
+
+# dsv41 boot: OVERLAY=1 wrapper, run inside the container before vllm.
+overlay_prelude() {
+  cat <<'EOS'
+set -e
+inst=/usr/local/lib/python3.12/dist-packages/vllm
+mkdir -p /work && cp -r /src/vllm /work/vllm
+cp "$inst/_version.py" /work/vllm/_version.py
+(cd "$inst" && find . -type f ! -path '*/__pycache__/*' -print0) |
+  while IFS= read -r -d '' f; do
+    [ -e "/work/vllm/$f" ] && continue
+    mkdir -p "/work/vllm/$(dirname "$f")"
+    ln -s "$inst/$f" "/work/vllm/$f"
+  done
+echo "overlay: $(find /work/vllm -type l | wc -l) build-only files linked from $inst" >&2
+export PYTHONPATH=/work
+EOS
+}
 
 usage() { sed -n '2,15p' "$0"; exit 1; }
 
@@ -80,9 +104,14 @@ run_podman() {
     ${VLLM_USE_V2_MODEL_RUNNER:+-e VLLM_USE_V2_MODEL_RUNNER=$VLLM_USE_V2_MODEL_RUNNER}
     ${CUDA_VISIBLE_DEVICES:+-e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES}
     -v "$MODEL_DIR":/model:ro
-    --entrypoint bash
-    "$IMAGE" -c "exec $*"
   )
+  local prelude=""
+  if [ "$OVERLAY" = "1" ]; then
+    podman_args+=(-v "$SRC_DIR":/src:ro)
+    prelude=$(overlay_prelude)
+  fi
+  podman_args+=(--entrypoint bash "$IMAGE" -c "$prelude
+exec $*")
   echo "+ vllm command: $*" >&2
   if [ "$mode" = "-d" ]; then
     podman run -d --rm "${podman_args[@]}"
@@ -125,7 +154,7 @@ text = r["choices"][0]["message"].get("content")
 out = u.get("completion_tokens", 0)
 dt = t1 - t0
 print("text:", repr(text))
-print(f"prompt_tokens={u.get('prompt_tokens')} completion_tokens={out} wall={dt:.2f}s tokens/s={out / dt if dt else 0:.1f}")
+print(f"prompt_tokens={u.get("prompt_tokens")} completion_tokens={out} wall={dt:.2f}s tokens/s={out / dt if dt else 0:.1f}")
 ' "$t0" "$t1"
     ;;
   *) usage ;;

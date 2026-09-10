@@ -26,7 +26,11 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
+from vllm.v1.attention.ops.flashmla import (
+    FlashMLASchedMeta,
+    _is_flashmla_available,
+    get_mla_metadata,
+)
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
@@ -738,6 +742,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            # dsv41 boot: the SM8x Triton sparse backends (TRITON_MLA_SPARSE_*)
+            # inherit this builder but never consume tile_sched_*; without a
+            # compiled _flashmla_C the stub below would raise, so hand them the
+            # same all-None sentinel the ROCm path gets.
+            or not _is_flashmla_available()[0]
         ):
             return out
         for layer_type in self._layer_types:
