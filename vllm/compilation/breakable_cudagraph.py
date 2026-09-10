@@ -94,8 +94,13 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    if not is_breakable_cudagraph_enabled():
-        return fn
+    # dsv41 cluster: decide at call time, not at import time. Ray workers
+    # import the model modules (via the pickled config) before the driver's
+    # auto-enabled VLLM_USE_BREAKABLE_CUDAGRAPH reaches their os.environ, so
+    # an import-time check bound the ops as plain functions on every rank and
+    # the first host sync inside attention invalidated the PIECEWISE capture.
+    # With no active capture the wrapper is a passthrough, so the disabled
+    # case costs one thread-local lookup.
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
