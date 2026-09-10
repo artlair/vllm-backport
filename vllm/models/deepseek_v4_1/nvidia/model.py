@@ -680,6 +680,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             pre_mix = intermediate_tensors["pre_mix"]
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        if (
+            not get_pp_group().is_first_rank
+            and self.start_layer in self.aux_hidden_state_layers
+        ):
+            # dsv41 boot: v4.1 aux ids name the attention *input* of target
+            # layer L, captured below when idx + 1 == L. For L == start_layer
+            # that capture happened on the previous stage: the incoming
+            # hidden_states is exactly its mhc_post reconstruction (the
+            # sender returns final_aux_recon in that case), so take the mean
+            # here instead of dropping the state.
+            aux_hidden_states.append(hidden_states.mean(dim=1))
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
