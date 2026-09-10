@@ -72,6 +72,9 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "DeepseekV2ForCausalLM",
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
+        # dsv41 boot: V4.1 targets the V2 runner (the V1 runner is not wired
+        # for its compressor / relay paths); without dspark it fell back to V1.
+        "DeepseekV41ForCausalLM",
         "Glm5NextForCausalLM",
         "Glm5NextForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
