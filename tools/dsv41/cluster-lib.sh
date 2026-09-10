@@ -108,6 +108,33 @@ gpu_preflight() {
   fi
 }
 
+# dsv41 cluster: keep a host-side copy of the container log. `podman run
+# --rm` discards it the moment the container exits, which is exactly when a
+# failed boot needs reading. LOGDIR [~/dsv41-test], LOGTAG [timestamp].
+LOGDIR=${LOGDIR:-$HOME/dsv41-test}
+start_log_capture() {
+  LOGFILE="$LOGDIR/$NAME-${LOGTAG:-$(date +%Y%m%d-%H%M%S)}.log"
+  mkdir -p "$LOGDIR"
+  nohup podman logs -f "$NAME" >"$LOGFILE" 2>&1 </dev/null &
+  echo "log: $LOGFILE"
+}
+
+# dsv41 cluster: snapshot the ray per-worker logs (/tmp/ray/session_latest
+# /logs/worker-*.out|err inside the container) to the host. The head log
+# dedups identical worker lines, so per-rank evidence only lives here; it is
+# lost with the container, hence `stop` calls this first and DSV41_KEEP=1
+# keeps a failed container alive (sleep) so it can still be collected.
+ray_logs_snapshot() {
+  local dir="$LOGDIR/$NAME-${LOGTAG:-$(date +%Y%m%d-%H%M%S)}-ray"
+  [ -n "$(podman ps -q -f name="^$NAME\$" 2>/dev/null)" ] || { echo "$NAME is not running; no ray logs to snapshot" >&2; return 0; }
+  mkdir -p "$dir"
+  if podman exec "$NAME" bash -c 'cd /tmp/ray/session_latest/logs 2>/dev/null && tar -cf - worker-*.out worker-*.err raylet.err raylet.out 2>/dev/null' | tar -C "$dir" -xf - 2>/dev/null; then
+    echo "ray logs: $dir ($(find "$dir" -type f | wc -l) files)"
+  else
+    echo "ray logs: nothing collected from $NAME" >&2
+  fi
+}
+
 status_common() {
   echo "== podman"
   podman ps --filter "name=^$NAME\$" --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'

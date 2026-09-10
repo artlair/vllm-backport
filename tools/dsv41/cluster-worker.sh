@@ -2,7 +2,7 @@
 # DeepSeek-V4.1-Flash two-node WORKER (rome): ray worker joining the x299 head.
 #
 #   IMAGE=<sm86 image> MODEL_DIR=~/dsv41-test/models/full-dummy ./cluster-worker.sh start
-#   ./cluster-worker.sh status | logs | stop | run (foreground)
+#   ./cluster-worker.sh status | logs | raylogs | stop | run (foreground)
 #
 # Start this BEFORE cluster-head.sh on x299; the same IMAGE, the same MODEL_DIR
 # contents at the same in-container path (/model) and, with OVERLAY=1, the same
@@ -19,6 +19,8 @@
 #   MEMLOCK [1] LOGLEVEL [INFO] CUDA_VISIBLE_DEVICES [] FORCE [0]
 #   DSV41_HEAD_IP [192.168.1.31] DSV41_WORKER_IP [192.168.1.7]
 #   DSV41_WORKER_GPUS [12] NCCL_IFNAME [enp66s0f0] RAY_PORT [6379]
+#   LOGDIR [~/dsv41-test] LOGTAG [timestamp]  host copy of the container log
+#   DSV41_KEEP [0]  1 = keep the container alive after ray exits (raylogs)
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -31,11 +33,16 @@ SRC_DIR=${SRC_DIR:-$(cd "$HERE/../.." && pwd)}
 NODE_IP=$DSV41_WORKER_IP
 NCCL_IFNAME=${NCCL_IFNAME:-enp66s0f0}
 
-usage() { sed -n '2,25p' "$0"; exit 1; }
+usage() { sed -n '2,23p' "$0"; exit 1; }
 
 container_script() {
   [ "$OVERLAY" = "1" ] && overlay_prelude
-  echo "exec ray start --address $DSV41_HEAD_IP:$RAY_PORT --node-ip-address $NODE_IP --num-gpus $DSV41_WORKER_GPUS --block --disable-usage-stats"
+  echo "ray start --address $DSV41_HEAD_IP:$RAY_PORT --node-ip-address $NODE_IP --num-gpus $DSV41_WORKER_GPUS --block --disable-usage-stats"
+  # dsv41 cluster: `ray start --block` exits when the head's GCS goes away;
+  # DSV41_KEEP=1 keeps the container (and /tmp/ray) around for `raylogs`.
+  if [ "${DSV41_KEEP:-0}" = "1" ]; then
+    echo 'echo "dsv41-worker: ray exited $?; DSV41_KEEP=1 so staying up for log collection (./cluster-worker.sh raylogs; stop)" >&2; sleep infinity'
+  fi
 }
 
 run_podman() {
@@ -45,6 +52,7 @@ run_podman() {
   PODMAN_ARGS+=(--entrypoint bash "$IMAGE" -c "$(container_script)")
   if [ "$mode" = "-d" ]; then
     podman run -d --rm "${PODMAN_ARGS[@]}"
+    start_log_capture
     echo "started $NAME (joining $DSV41_HEAD_IP:$RAY_PORT); ./cluster-worker.sh logs"
   else
     exec podman run --rm "${PODMAN_ARGS[@]}"
@@ -58,6 +66,7 @@ case "$cmd" in
   script) container_script ;;
   logs)   exec podman logs "${@:--f}" "$NAME" ;;
   status) status_common ;;
-  stop)   podman stop -t 30 "$NAME" ;;
+  raylogs) ray_logs_snapshot ;;
+  stop)   ray_logs_snapshot; podman stop -t 5 "$NAME" ;;  # ray start --block ignores SIGTERM; nothing to flush
   *) usage ;;
 esac

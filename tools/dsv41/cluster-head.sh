@@ -2,7 +2,9 @@
 # DeepSeek-V4.1-Flash two-node HEAD (x299): ray head + `vllm serve` in podman.
 #
 #   IMAGE=<sm86 image> MODEL_DIR=~/dsv41-test/models/full-dummy ./cluster-head.sh start
-#   ./cluster-head.sh smoke | status | logs | stop | print | serve (foreground)
+#   ./cluster-head.sh smoke | bench | status | logs | raylogs | stop | print | serve (foreground)
+#   (bench: CONC [4] concurrent requests of MAX_TOKENS [256] each, ignore_eos,
+#   prints per-request completion and aggregate tokens/s)
 #
 # Run it from the synced copy on x299 (~/dsv41-test/src/tools/dsv41) after
 # cluster-sync.sh, and start cluster-worker.sh on rome FIRST (the head waits
@@ -33,6 +35,9 @@
 #   NCCL_DEBUG [] LOGLEVEL [INFO] CUDA_VISIBLE_DEVICES [] FORCE [0]
 #   DSV41_HEAD_IP [192.168.1.31] DSV41_HEAD_GPUS [8] DSV41_WORLD_GPUS [20]
 #   NCCL_IFNAME [br1] RAY_PORT [6379] DSV41_CLUSTER_WAIT [900]
+#   LOGDIR [~/dsv41-test] LOGTAG [timestamp]  host copy of the container log
+#   DSV41_KEEP [0]  1 = keep the container alive after a failed vllm exit so
+#              `raylogs` can still snapshot /tmp/ray per-worker logs
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -61,7 +66,7 @@ LOADFORMAT=${LOADFORMAT:-dummy}
 KVDTYPE=${KVDTYPE:-fp8_ds_mla}
 DSV41_CLUSTER_WAIT=${DSV41_CLUSTER_WAIT:-900}
 
-usage() { sed -n '2,45p' "$0"; exit 1; }
+usage() { sed -n '2,37p' "$0"; exit 1; }
 
 vllm_args() {
   local args=(
@@ -113,8 +118,19 @@ while ! python3 -c "import ray, sys; ray.init(address='auto', log_to_driver=Fals
   sleep 5
 done
 echo "dsv41-head: ray has $DSV41_WORLD_GPUS+ GPUs; starting vllm" >&2
-exec $vllm_cmd
 EOS
+  # dsv41 cluster: exec keeps podman stop's SIGTERM reaching vllm; DSV41_KEEP=1
+  # trades that for a container that survives a failed boot (raylogs).
+  if [ "${DSV41_KEEP:-0}" = "1" ]; then
+    cat <<EOS
+$vllm_cmd
+rc=\$?
+echo "dsv41-head: vllm exited \$rc; DSV41_KEEP=1 so staying up for log collection (./cluster-head.sh raylogs; stop)" >&2
+sleep infinity
+EOS
+  else
+    echo "exec $vllm_cmd"
+  fi
 }
 
 run_podman() {
@@ -125,6 +141,7 @@ run_podman() {
   echo "+ vllm command: $*" >&2
   if [ "$mode" = "-d" ]; then
     podman run -d --rm "${PODMAN_ARGS[@]}"
+    start_log_capture
     echo "started $NAME; ./cluster-head.sh logs | ./cluster-head.sh smoke"
   else
     exec podman run --rm "${PODMAN_ARGS[@]}"
@@ -153,10 +170,45 @@ r = json.load(sys.stdin)
 u = r.get("usage", {})
 text = r["choices"][0]["message"].get("content")
 out = u.get("completion_tokens", 0)
+pt = u.get("prompt_tokens")
 dt = t1 - t0
 print("text:", repr(text))
-print(f"prompt_tokens={u.get(\"prompt_tokens\")} completion_tokens={out} wall={dt:.2f}s tokens/s={out / dt if dt else 0:.1f}")
+print(f"prompt_tokens={pt} completion_tokens={out} wall={dt:.2f}s tokens/s={out / dt if dt else 0:.1f}")
 ' "$t0" "$t1"
+}
+
+# dsv41 cluster: concurrency smoke. CONC requests of MAX_TOKENS tokens each
+# (ignore_eos so every request runs to max_tokens), aggregate tokens/s.
+bench() {
+  local base="http://$HOST:$PORT" n=${CONC:-4} max_tokens=${MAX_TOKENS:-256} i t0 t1 tmp body
+  curl -sf "$base/health" >/dev/null || { echo "$base is not serving" >&2; exit 1; }
+  tmp=$(mktemp -d)
+  t0=$(date +%s.%N)
+  for ((i = 0; i < n; i++)); do
+    body=$(printf '{"model":"dsv41","messages":[{"role":"user","content":"Write a long story about request %d."}],"temperature":0,"max_tokens":%d,"ignore_eos":true}' "$i" "$max_tokens")
+    curl -sf "$base/v1/chat/completions" -H 'content-type: application/json' -d "$body" -o "$tmp/$i.json" &
+  done
+  wait
+  t1=$(date +%s.%N)
+  python3 - "$tmp" "$t0" "$t1" "$n" <<'EOF'
+import glob, json, os, sys
+tmp, t0, t1, n = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
+tot = ok = 0
+for f in sorted(glob.glob(os.path.join(tmp, "*.json"))):
+    try:
+        with open(f) as fh:
+            r = json.load(fh)
+        c = r["usage"]["completion_tokens"]
+    except Exception as e:  # noqa: BLE001
+        print(f"{os.path.basename(f)}: {e}")
+        continue
+    ok += 1
+    tot += c
+    print(f"{os.path.basename(f)}: completion_tokens={c} finish={r['choices'][0].get('finish_reason')}")
+dt = t1 - t0
+print(f"completed={ok}/{n} completion_tokens={tot} wall={dt:.2f}s aggregate tokens/s={tot / dt if dt else 0:.1f}")
+EOF
+  rm -rf "$tmp"
 }
 
 cmd=${1:-start}; shift || true
@@ -167,7 +219,9 @@ case "$cmd" in
   script) container_script "$(vllm_args "$@")" ;;
   logs)   exec podman logs "${@:--f}" "$NAME" ;;
   status) status_common; echo "== health"; curl -sf "http://$HOST:$PORT/health" >/dev/null && echo "OK $HOST:$PORT" || echo "not serving" ;;
-  stop)   podman stop -t 30 "$NAME" ;;
+  raylogs) ray_logs_snapshot ;;
+  stop)   ray_logs_snapshot; podman stop -t 30 "$NAME" ;;
   smoke)  smoke ;;
+  bench)  bench ;;
   *) usage ;;
 esac
