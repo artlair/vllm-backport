@@ -314,10 +314,15 @@ def _repack_marlin_experts(
     size_k: int,
     perm: torch.Tensor,
     is_a_8bit: bool,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Repack each expert to marlin format into a preallocated output."""
+    """Repack each expert to marlin format into a preallocated output.
+
+    dsv41 repack: ``out`` may alias ``weight``. Each expert is copied out
+    (the transpose) before its repacked tile is written back, so the source
+    and the repacked layer never have to coexist.
+    """
     num_experts = weight.shape[0]
-    out: torch.Tensor | None = None
     for i in range(num_experts):
         qweight = weight[i].view(torch.int32).T.contiguous()
         marlin_qweight = ops.gptq_marlin_repack(
@@ -602,7 +607,11 @@ def prepare_moe_mxfp4_layer_for_marlin(
     """Pure-function version of prepare_moe_fp4_layer_for_marlin for MXFP4.
 
     Takes weight tensors as inputs and returns transformed tensors.
-    Does NOT modify the layer in-place.
+    Does NOT modify the layer in-place. dsv41 repack: the returned weights
+    and scales reuse the storage of the contiguous inputs (the Marlin 4-bit
+    tile and e8m0 scale layouts have exactly the bytes of the packed source),
+    so the repack streams one expert at a time instead of holding a second
+    copy of the layer; callers replace the layer parameters with the result.
     """
     input_dtype = get_marlin_input_dtype()
     if (
@@ -635,7 +644,12 @@ def prepare_moe_mxfp4_layer_for_marlin(
 
         assert weight.shape == (e, size_n, size_k // 2)
 
-        return _repack_marlin_experts(weight, size_n, size_k, perm, is_a_8bit)
+        # dsv41 repack: repacked tile (size_k / 16, 2 * size_n) int32 has the
+        # bytes of the packed expert, so write it back over the source.
+        out = None
+        if weight.is_contiguous():
+            out = weight.view(torch.int32).view(e, size_k // 16, size_n * 2)
+        return _repack_marlin_experts(weight, size_n, size_k, perm, is_a_8bit, out)
 
     w13 = repack_weight(w13, "w13")
     w2 = repack_weight(w2, "w2")
@@ -643,16 +657,20 @@ def prepare_moe_mxfp4_layer_for_marlin(
     # WEIGHT SCALES: Permute scales
     def permute_scales(scales: torch.Tensor, name: str) -> torch.Tensor:
         scales = scales.view(torch.float8_e8m0fnu)
-        scales = scales.to(param_dtype)
 
-        tensor_list = []
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
             size_n, size_k = k, n
 
+        # dsv41 repack: convert and permute one expert at a time straight
+        # into the e8m0 source storage; the whole-layer .to(param_dtype)
+        # plus per-expert list and torch.cat held the scales four times over.
+        out: torch.Tensor | None = None
+        if scales.is_contiguous():
+            out = scales.view(e, size_k // group_size, size_n)
         for i in range(e):
-            scale = scales[i].T
+            scale = scales[i].to(param_dtype).T
             marlin_scales = marlin_permute_scales(
                 s=scale,
                 size_k=size_k,
@@ -663,8 +681,15 @@ def prepare_moe_mxfp4_layer_for_marlin(
             marlin_scales = mxfp4_marlin_process_scales(
                 marlin_scales, input_dtype=input_dtype
             )
-            tensor_list.append(marlin_scales)
-        return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+            if out is None:
+                out = torch.empty(
+                    (e, *marlin_scales.shape),
+                    dtype=marlin_scales.dtype,
+                    device=marlin_scales.device,
+                )
+            out[i] = marlin_scales
+        assert out is not None
+        return out
 
     w13_scale = permute_scales(w13_scale, "w13")
     w2_scale = permute_scales(w2_scale, "w2")
