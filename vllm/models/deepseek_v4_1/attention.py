@@ -51,7 +51,9 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4_1.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -1158,6 +1160,40 @@ class DeepseekV4Indexer(nn.Module):
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
         )
+
+        # dsv41 boot: SparseAttnIndexer primes the SM80 Triton paged-logits
+        # autotuner for {64, 256, cache_config.block_size}, but the v4.1
+        # sparse backends force the KV block size (128 on sm8x) only after the
+        # model is built, so at this point the config still holds the default
+        # and the runtime keys (block, block // compress_ratio) would be tuned
+        # on first use, which for FULL cudagraph decode means a synchronizing
+        # benchmark inside capture. Prime them here.
+        if (
+            current_platform.is_cuda()
+            and not is_deep_gemm_supported()
+            and not self.use_fp4_kv
+            and topk_indices_buffer is not None
+        ):
+            from vllm.models.deepseek_v4_1.sparse_mla import (
+                DeepseekV4SparseMLABackend,
+            )
+            from vllm.v1.attention.ops.mqa_logits_triton import (
+                warmup_fp8_paged_mqa_logits_triton,
+            )
+
+            kernel_block = (
+                DeepseekV4SparseMLABackend.get_supported_kernel_block_sizes()[0]
+            )
+            assert isinstance(kernel_block, int)
+            for block_size in sorted(
+                {kernel_block, kernel_block // max(self.compress_ratio, 1)}
+            ):
+                warmup_fp8_paged_mqa_logits_triton(
+                    self.n_head,
+                    self.head_dim,
+                    block_size,
+                    topk_indices_buffer.device,
+                )
 
     def _produce_k(
         self,
