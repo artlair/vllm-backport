@@ -1652,8 +1652,12 @@ def get_kv_cache_config_from_groups(
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
+            # dsv41 pp-relay: walk the group's (PP-projected) layer names, not
+            # the uniform spec's own dict. A group with no layer on this worker
+            # keeps the global spec after projection, and emitting tensors for
+            # its foreign layers makes allocate_kv_cache fail on the worker.
+            for layer_name in group.layer_names:
+                layers_by_spec[group_spec.kv_cache_specs[layer_name]].append(layer_name)
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 
