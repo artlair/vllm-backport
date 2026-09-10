@@ -501,8 +501,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and engram_config.resolved_table_mode == "mmap"
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
             and hasattr(self.model, "engram_prefetch")
+            # dsv41 real: only the PP stages that hold an engram layer stage
+            # rows; the others skip the hook and the (per-rank) log line.
+            and self.model.set_engram_full_graph_prefetch(True)
         ):
-            self.model.set_engram_full_graph_prefetch(True)
             self.engram_prefetch = self.model.engram_prefetch
             logger.info_once("Engram mmap: staging rows before FULL graph replays")
 

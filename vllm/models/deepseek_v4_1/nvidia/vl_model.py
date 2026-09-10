@@ -356,8 +356,8 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         (see `DeepseekV4Model.engram_prefetch`)."""
         self.language_model.model.engram_prefetch(**model_inputs)
 
-    def set_engram_full_graph_prefetch(self, enabled: bool) -> None:
-        self.language_model.model.set_engram_full_graph_prefetch(enabled)
+    def set_engram_full_graph_prefetch(self, enabled: bool) -> bool:
+        return self.language_model.model.set_engram_full_graph_prefetch(enabled)
 
     def lazy_mmap_weight_names(self, name: str) -> bool:
         """dsv41 engram-mmap: checkpoint tensors the safetensors iterator

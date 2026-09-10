@@ -675,12 +675,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         same inputs, so the ids match what the graph computes."""
         self._stage_engram_rows(input_ids, positions, lookback_token_ids)
 
-    def set_engram_full_graph_prefetch(self, enabled: bool) -> None:
-        """dsv41 engram-mmap: see `engram_prefetch`."""
+    def set_engram_full_graph_prefetch(self, enabled: bool) -> bool:
+        """dsv41 engram-mmap: see `engram_prefetch`.
+
+        dsv41 real: returns whether this PP rank holds an engram layer at
+        all, so the runner only installs the prefetch hook (and logs it)
+        where it does something; on the other stages `engram_prefetch`
+        is a no-op and the log line was misleading.
+        """
+        found = False
         for layer in self.layers:
             engram = getattr(layer, "engram", None)
             if engram is not None:
                 engram.embed_tokens.full_graph_prefetch = enabled
+                found = True
+        return found
 
     def forward(
         self,
