@@ -7,6 +7,14 @@ fewer experts, tiny engram tables, fewer vision layers) plus the tokenizer files
 and a minimal chat template, so ``vllm serve <out> --load-format dummy`` can boot
 it on one GPU.
 
+``--full-dummy`` is the two-node cluster preset: the REAL 40-layer topology
+(all layer lists, 384 experts, 3 DSpark layers, the real vision config, the real
+quantization_config) with only ``engram_num_embeddings`` shrunk (default
+50,000,000 rows per layer, about 12.3 GiB fp8+scales per layer instead of 94 GiB)
+so the dummy boot fits today's host RAM. It also prints the expected weight
+VRAM per PP stage for ``--partition`` (default 8,7,9,8,8) so a split can be
+sanity-checked against 4x24 GB per stage before touching the cluster.
+
 Layer-topology rules enforced here (from vllm/models/deepseek_v4_1/*):
 
 * ``compress_ratios`` has one entry per layer INCLUDING the MTP/DSpark layers
@@ -300,6 +308,110 @@ def layer_table(text: dict, keep: list[int]) -> str:
 
 
 # ----------------------------------------------------------------------------
+# Weight VRAM per PP stage (sanity check for VLLM_PP_LAYER_PARTITION)
+# ----------------------------------------------------------------------------
+
+# Checkpoint weight totals in GiB (from the safetensors index of the real
+# DeepSeek-V4.1-Flash checkpoint): routed experts are fp4 over 40 layers, the
+# rest is fp8/bf16. Prorated per backbone layer below.
+WEIGHTS_GIB = {
+    "experts_total": 275.7,  # 40 layers x 384 fp4 experts
+    "attention_total": 5.2,  # 40 layers
+    "shared_experts_total": 1.4,  # 40 layers
+    "embed": 1.3,  # embed_tokens, first stage
+    "head": 1.3,  # lm_head, last stage
+    "vision": 0.9,  # ViT + aligner, built on EVERY rank (vl_model.py)
+}
+GIB = 1024**3
+CARD_GIB = 24.0  # RTX 3090
+
+
+def engram_table_gib(num_embeddings: int, head_dim: int, block_size: int = 32) -> float:
+    """fp8 rows + ue8m0 per-block scales, as ParallelEngramEmbedding allocates."""
+    return num_embeddings * (head_dim + head_dim // block_size) / GIB
+
+
+def vram_table(text: dict, partition: list[int], tp: int, util: float, engram_offload: bool) -> str:
+    n = text["num_hidden_layers"]
+    n_orig = 40
+    if sum(partition) != n:
+        return f"partition {partition} sums to {sum(partition)}, not num_hidden_layers={n}"
+    per_layer = {
+        "experts": WEIGHTS_GIB["experts_total"] / n_orig * text["n_routed_experts"] / 384,
+        "attention": WEIGHTS_GIB["attention_total"] / n_orig,
+        "shared": WEIGHTS_GIB["shared_experts_total"] / n_orig,
+    }
+    dense = sum(per_layer.values())
+    # DSpark draft layers: MoE with dspark_n_routed_experts (128 of 384) plus
+    # attention + shared expert, estimated at the backbone's fp4 rate.
+    nextn = text.get("num_nextn_predict_layers", 0)
+    dspark_layer = (
+        per_layer["experts"] * text.get("dspark_n_routed_experts", 0) / max(1, text["n_routed_experts"])
+        + per_layer["attention"]
+        + per_layer["shared"]
+    )
+    engram = dict(zip(text.get("engram_layer_ids", []), text.get("engram_num_embeddings", [])))
+    head_dim = text.get("engram_head_dim", 256)
+    rows = [("stage", "layers", "n", "dense", "extras", "stage GiB", "per-GPU", "budget", "headroom", "host pinned")]
+    start = 0
+    budget = CARD_GIB * util
+    worst = None
+    for stage, count in enumerate(partition):
+        end = start + count
+        extras: list[str] = []
+        extra_gib = 0.0
+        host_gib = 0.0
+        if stage == 0:
+            extra_gib += WEIGHTS_GIB["embed"]
+            extras.append("embed")
+        if stage == len(partition) - 1:
+            extra_gib += WEIGHTS_GIB["head"] + nextn * dspark_layer
+            extras.append("head")
+            if nextn:
+                extras.append(f"dspark x{nextn} ({nextn * dspark_layer:.1f})")
+        for layer in range(start, end):
+            if layer in engram:
+                gib = engram_table_gib(engram[layer], head_dim)
+                if engram_offload:
+                    host_gib += gib
+                    extras.append(f"engram{layer} host")
+                else:
+                    extra_gib += gib
+                    extras.append(f"engram{layer} ({gib:.1f})")
+        stage_gib = count * dense + extra_gib
+        # TP shards experts/attention/embed/head/engram; the ViT is replicated.
+        per_gpu = stage_gib / tp + WEIGHTS_GIB["vision"]
+        headroom = budget - per_gpu
+        worst = headroom if worst is None else min(worst, headroom)
+        rows.append(
+            (
+                str(stage),
+                f"{start}..{end - 1}",
+                str(count),
+                f"{count * dense:.1f}",
+                ", ".join(extras) or "-",
+                f"{stage_gib:.1f}",
+                f"{per_gpu:.1f}",
+                f"{budget:.1f}",
+                f"{headroom:.1f}",
+                f"{host_gib:.1f}",
+            )
+        )
+        start = end
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    out = "\n".join("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)) for r in rows)
+    out += (
+        f"\n  per layer: experts {per_layer['experts']:.2f} + attention {per_layer['attention']:.2f}"
+        f" + shared {per_layer['shared']:.2f} = {dense:.2f} GiB; dspark layer ~{dspark_layer:.2f} GiB (estimate);"
+        f" vision {WEIGHTS_GIB['vision']} GiB replicated per GPU; TP={tp}; budget = {CARD_GIB} GiB x util {util};"
+        f" headroom is what is left per GPU for KV cache, activations and cudagraph pools"
+        f" (GLM lane rule of thumb: keep weights under ~19 GiB/GPU)."
+        f"\n  worst-stage headroom: {worst:.1f} GiB per GPU"
+    )
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 
@@ -314,16 +426,32 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="real config.json")
     ap.add_argument("--out", type=Path, required=True, help="output model directory")
-    ap.add_argument("--layers", type=int, default=6, help="backbone layers to keep (N)")
+    ap.add_argument(
+        "--full-dummy",
+        action="store_true",
+        help="cluster preset: real 40-layer topology, 384 experts, 3 DSpark layers, real vision + "
+        "quantization_config; only engram_num_embeddings shrunk (default 50,000,000 rows/layer)",
+    )
+    ap.add_argument("--layers", type=int, help="backbone layers to keep (N); default 6, or all 40 with --full-dummy")
     ap.add_argument("--keep", type=parse_int_list, help="explicit original layer ids to keep (overrides --layers)")
-    ap.add_argument("--experts", type=int, default=16, help="n_routed_experts")
+    ap.add_argument("--experts", type=int, help="n_routed_experts (default 16; real 384 with --full-dummy)")
     ap.add_argument("--experts-per-tok", type=int, default=6, help="num_experts_per_tok")
-    ap.add_argument("--dspark-experts", type=int, default=8, help="dspark_n_routed_experts (MTP layers)")
-    ap.add_argument("--nextn", type=int, default=1, help="num_nextn_predict_layers (DSpark stages)")
+    ap.add_argument("--dspark-experts", type=int, help="dspark_n_routed_experts (default 8; real 128 with --full-dummy)")
+    ap.add_argument("--nextn", type=int, help="num_nextn_predict_layers (default 1; real 3 with --full-dummy)")
     ap.add_argument("--dspark-targets", type=parse_int_list, help="dspark_target_layer_ids (new ids); default = last len(orig) backbone layers")
     ap.add_argument("--engram-layers", type=parse_int_list, help="engram_layer_ids (new ids); default = kept originals, else new layer 1")
-    ap.add_argument("--engram-num-embeddings", type=int, default=1_000_000, help="rows per engram table")
-    ap.add_argument("--vision-layers", type=int, default=2, help="vision_config.num_hidden_layers")
+    ap.add_argument(
+        "--engram-num-embeddings", type=int, help="rows per engram table (default 1,000,000; 50,000,000 with --full-dummy)"
+    )
+    ap.add_argument("--vision-layers", type=int, help="vision_config.num_hidden_layers (default 2; real 32 with --full-dummy)")
+    ap.add_argument(
+        "--partition",
+        action="append",
+        help="VLLM_PP_LAYER_PARTITION to print the per-stage weight VRAM for (repeatable; default 8,7,9,8,8)",
+    )
+    ap.add_argument("--tp", type=int, default=4, help="TP size per stage for the VRAM table")
+    ap.add_argument("--util", type=float, default=0.9, help="gpu_memory_utilization for the VRAM budget column")
+    ap.add_argument("--no-vram", action="store_true", help="skip the per-stage VRAM table")
     ap.add_argument("--max-position-embeddings", type=int, help="override max_position_embeddings (rope tables are max_pos x 64 fp32)")
     ap.add_argument("--bf16", action="store_true", help="drop quantization_config (bf16 dummy weights)")
     args = ap.parse_args()
@@ -331,6 +459,33 @@ def main() -> int:
     full = json.loads(args.config.read_text())
     text = dict(full["text_config"])
     n_orig = text["num_hidden_layers"]
+    vision_orig = full.get("vision_config", {})
+
+    if args.full_dummy:
+        if args.bf16:
+            raise SystemExit("--full-dummy keeps the real fp8/fp4 quantization_config; bf16 experts would need ~1 TiB")
+        defaults = {
+            "layers": n_orig,
+            "experts": text["n_routed_experts"],
+            "experts_per_tok": text["num_experts_per_tok"],
+            "dspark_experts": text.get("dspark_n_routed_experts", 128),
+            "nextn": text.get("num_nextn_predict_layers", 3),
+            "engram_num_embeddings": 50_000_000,
+            "vision_layers": vision_orig.get("num_hidden_layers", 32),
+        }
+    else:
+        defaults = {
+            "layers": 6,
+            "experts": 16,
+            "experts_per_tok": 6,
+            "dspark_experts": 8,
+            "nextn": 1,
+            "engram_num_embeddings": 1_000_000,
+            "vision_layers": 2,
+        }
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
 
     keep = sorted(args.keep) if args.keep else sorted(priority_layers(text)[: args.layers])
     if any(k >= n_orig for k in keep):
@@ -353,7 +508,12 @@ def main() -> int:
     # DSpark / MTP
     n_targets = len(text.get("dspark_target_layer_ids", [])) or 3
     text["num_nextn_predict_layers"] = args.nextn
-    text["dspark_target_layer_ids"] = args.dspark_targets or list(range(max(0, n - n_targets), n))
+    if args.dspark_targets:
+        text["dspark_target_layer_ids"] = args.dspark_targets
+    elif keep == list(range(n_orig)):
+        text["dspark_target_layer_ids"] = list(text.get("dspark_target_layer_ids", []))
+    else:
+        text["dspark_target_layer_ids"] = list(range(max(0, n - n_targets), n))
 
     # engram
     if args.engram_layers is not None:
@@ -418,6 +578,11 @@ def main() -> int:
         )
     print()
     print(layer_table(text, keep))
+    if not args.no_vram:
+        for part in args.partition or ["8,7,9,8,8"]:
+            print()
+            print(f"expected weight VRAM per PP stage, VLLM_PP_LAYER_PARTITION={part} (x299 = first two stages, rome = the rest):")
+            print(vram_table(text, parse_int_list(part) or [], args.tp, args.util, engram_offload=True))
     return 0
 
 
