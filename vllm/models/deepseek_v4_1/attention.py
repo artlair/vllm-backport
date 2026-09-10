@@ -509,7 +509,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
             _COMPUTE_PREFILL_METADATA_KERNEL.register_warmup()
         except ImportError as e:
-            logger.warning_once("Skipping jit warmup registration: %s", e)
+            logger.warning_once("Skipping jit warmup registration: %s", str(e))
         try:
             from vllm.v1.attention.backends.mla.sparse_swa import (
                 _COMPUTE_SWA_INDICES_AND_LENS_KERNEL,
@@ -521,7 +521,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 max_image_tokens=self.max_image_tokens,
             )
         except ImportError as e:
-            logger.warning_once("Skipping jit warmup registration: %s", e)
+            logger.warning_once("Skipping jit warmup registration: %s", str(e))
 
         if self.compress_ratio > 1:
             try:
@@ -531,7 +531,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
                 _COMPRESSED_SLOT_MAPPING_KERNEL.register_warmup()
             except ImportError as e:
-                logger.warning_once("Skipping jit warmup registration: %s", e)
+                logger.warning_once("Skipping jit warmup registration: %s", str(e))
 
         if self.indexer is not None:
             try:
@@ -541,7 +541,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
                 _BUILD_PREFILL_CHUNK_METADATA_KERNEL.register_warmup()
             except ImportError as e:
-                logger.warning_once("Skipping jit warmup registration: %s", e)
+                logger.warning_once("Skipping jit warmup registration: %s", str(e))
             try:
                 from vllm.v1.attention.backends.mla.indexer import (
                     _PREPARE_UNIFORM_DECODE_KERNEL,
@@ -549,7 +549,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
                 _PREPARE_UNIFORM_DECODE_KERNEL.register_warmup()
             except ImportError as e:
-                logger.warning_once("Skipping jit warmup registration: %s", e)
+                logger.warning_once("Skipping jit warmup registration: %s", str(e))
 
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.use_dspark():
@@ -564,7 +564,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     block_size=self.swa_cache_layer.block_size,
                 )
             except ImportError as e:
-                logger.warning_once("Skipping jit warmup registration: %s", e)
+                logger.warning_once("Skipping jit warmup registration: %s", str(e))
 
         if self.backend_cls.get_name() in (
             "FLASHMLA_SPARSE_DSV41",
