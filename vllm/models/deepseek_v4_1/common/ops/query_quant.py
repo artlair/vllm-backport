@@ -7,6 +7,7 @@ from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivati
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
 
 
 @triton.jit
@@ -60,7 +61,12 @@ def _q_kv_norm_quant_kernel(
             inv_bits = tl.where(sf == 0, 0, (254 - sf) << 23)
             inv_scale = inv_bits.to(tl.float32, bitcast=True)
             quantized = tl.reshape(grouped * inv_scale[:, None], (BLOCK,))
-            tl.store(qo + row * Q_SIZE + cols, quantized, cols < Q_SIZE)
+            # ``qo`` is the fp8 output viewed as uint8; the encoder emits the
+            # e4m3fn bytes (RNE satfinite, bit-exact with the fp8 store) so
+            # pre-SM89 CUDA never asks Triton for a native fp8 convert.
+            tl.store(
+                qo + row * Q_SIZE + cols, _encode_e4m3fn_u8(quantized), cols < Q_SIZE
+            )
         else:
             sf = tl.full((BLOCK // 32,), 0, tl.uint32)
         padded_groups: tl.constexpr = triton.cdiv(Q_SIZE // 32, 4) * 4
@@ -107,7 +113,7 @@ def fused_q_kv_rmsnorm_quant(
             kv,
             q_weight,
             kv_weight,
-            qo,
+            qo.view(torch.uint8),
             kvo,
             scales,
             tokens,

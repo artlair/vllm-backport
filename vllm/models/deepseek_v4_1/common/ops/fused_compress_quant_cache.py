@@ -6,6 +6,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.fp8_sm80 import _encode_e4m3fn_u8
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -250,7 +251,8 @@ def rope_quant_insert(
         latent,
         positions,
         cos_sin_cache,
-        kv_cache,
+        # Same strides (1-byte elements); the kernel stores encoded bytes.
+        kv_cache.view(torch.uint8) if store_fp8 else kv_cache,
         slot_mapping,
         fp8_scale if store_fp8 else None,
         COS_STRIDE=cos_sin_cache.stride(0),
@@ -294,8 +296,8 @@ def _rope_quant_insert_kernel(
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
     scaled = quant * tl.reshape(tl.exp2(-exponent), (8, 1))
-    fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
-    packed = tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,))
+    fp8_u8 = _encode_e4m3fn_u8(tl.clamp(scaled, -448.0, 448.0))
+    packed = tl.reshape(fp8_u8, (512,))
     tl.store(values + d, packed, d < 448)
     s = tl.arange(0, 8)
     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
@@ -354,7 +356,10 @@ def _rope_plain_insert_kernel(
         + (slot % CACHE_BLOCK) * ROW_STRIDE
     )
     if STORE_FP8:
+        # ``cache`` is the fp8 cache viewed as uint8 (see rope_quant_insert):
+        # the encoder emits raw e4m3fn bytes so pre-SM89 CUDA avoids the
+        # native fp8 convert.
         scaled = row.to(tl.float32) * (1.0 / tl.load(fp8_scale))
-        tl.store(dst + d, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv))
+        tl.store(dst + d, _encode_e4m3fn_u8(tl.clamp(scaled, -448.0, 448.0)))
     else:
         tl.store(dst + d, row)
