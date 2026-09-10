@@ -65,7 +65,12 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KpoolTailSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    KVCacheConfig,
+    KpoolTailSpec,
+    MambaSpec,
+)
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -626,8 +631,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # (position 130560 IMA'd on 4090s upstream; silent garbage here).
             # VLLM_KPOOL_TAIL_GENERIC_EXCLUDE=0 restores the old behavior for
             # the VLLM_KPOOL_TAIL_CHECK diagnostic only.
+            # CircularBufferSpec (DeepSeek V4.1 compressor ring) likewise owns
+            # its slot mapping; the generic position-indexed path is never
+            # valid for a 1-block ring.
             slot_mapping_enabled.append(
                 not (isinstance(spec, KpoolTailSpec) and _KPOOL_TAIL_GENERIC_EXCLUDE)
+                and not isinstance(spec, CircularBufferSpec)
             )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
@@ -636,7 +645,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             # Preserve each cache type's alignment requirements after applying
             # its topology-aware block-table width.
-            if isinstance(spec, MambaSpec):
+            if isinstance(spec, (MambaSpec, CircularBufferSpec)):
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )

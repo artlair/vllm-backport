@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KpoolTailSpec,
@@ -1839,6 +1840,12 @@ def group_and_unify_kv_cache_specs(
     # SlidingWindowMLASpec models with uniform page sizes don't need tuple packing.
     page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}
     if len(page_sizes) <= 1:
+        return None
+    # TODO(dsv41): upstream's packed planner folds CircularBufferSpec rings in
+    # as "state buckets". Our MLA/SWA-MLA tuple packer below would silently
+    # drop ring layers and _get_kv_cache_groups_uniform_groups asserts every
+    # non-first group is SlidingWindowMLASpec, so bail to the general path.
+    if any(isinstance(spec, CircularBufferSpec) for spec in kv_cache_spec.values()):
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
