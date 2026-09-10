@@ -1144,6 +1144,34 @@ class VllmConfig:
         self.engram_config.verify_model_config(model_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
+    def _verify_engram_mmap_cudagraph(self) -> None:
+        """dsv41 engram-mmap: the host gather runs as an eager segment of the
+        breakable cudagraph capture; the torch.compile piecewise splitter
+        would try to trace the host sync into a graph. Runs after
+        `cudagraph_mode` and the breakable auto-enable are resolved."""
+        if (
+            self.engram_config is None
+            or self.engram_config.resolved_table_mode != "mmap"
+            or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        ):
+            return
+        if not envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
+            raise ValueError(
+                "engram_config.table_mode='mmap' needs breakable cudagraphs "
+                "(VLLM_USE_BREAKABLE_CUDAGRAPH=1, the DeepSeek V4.1 default) "
+                "or --enforce-eager."
+            )
+        if (
+            self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            and not self.use_v2_model_runner
+        ):
+            # Only the V2 runner stages the rows before FULL replays.
+            logger.warning(
+                "engram table_mode='mmap' with FULL cudagraphs needs Model "
+                "Runner V2; falling back to cudagraph_mode=PIECEWISE"
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1923,6 +1951,7 @@ class VllmConfig:
                 custom_ops.append("+quant_fp8")
 
         self._verify_kv_transfer_compat()
+        self._verify_engram_mmap_cudagraph()
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 

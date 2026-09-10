@@ -8,13 +8,16 @@ import fnmatch
 import glob
 import hashlib
 import json
+import math
 import os
+import struct
 import tempfile
 import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
@@ -826,6 +829,85 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+# dsv41 engram-mmap: safetensors dtype strings -> torch dtypes for the
+# lazy references below (only what the engram tables use, plus the common
+# ones so the helper is not engram-specific).
+_SAFETENSORS_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "I32": torch.int32,
+    "I64": torch.int64,
+}
+
+
+@dataclass(frozen=True)
+class SafetensorsMmapRef:
+    """dsv41 engram-mmap: where a tensor lives inside a safetensors shard,
+    yielded by `safetensors_weights_iterator` instead of the tensor itself
+    for names the caller marked lazy. The weight loader of the receiving
+    parameter memory-maps the byte range it needs (a row slice of a table
+    that must not be read into memory), so the iterator never touches the
+    tensor's bytes. `shape`, `dtype`, `ndim` and `numel` mirror the tensor
+    API for loaders that only inspect metadata before dispatching.
+    """
+
+    path: str
+    name: str
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    data_begin: int
+    """Absolute byte offset of the tensor's first byte inside the file."""
+    data_end: int
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def numel(self) -> int:
+        return math.prod(self.shape)
+
+    @property
+    def nbytes(self) -> int:
+        return self.data_end - self.data_begin
+
+
+def read_safetensors_header(path: str) -> tuple[dict[str, Any], int]:
+    """dsv41 engram-mmap: parse a safetensors file header without safe_open.
+
+    Returns the header JSON and the absolute offset of the data section
+    (8-byte little-endian header length + header bytes), which every
+    `data_offsets` pair in the header is relative to.
+    """
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    return header, 8 + header_len
+
+
+def safetensors_mmap_ref(path: str, name: str) -> SafetensorsMmapRef:
+    """dsv41 engram-mmap: the `SafetensorsMmapRef` of tensor `name` in `path`."""
+    header, data_start = read_safetensors_header(path)
+    entry = header[name]
+    begin, end = entry["data_offsets"]
+    dtype = _SAFETENSORS_DTYPES.get(entry["dtype"])
+    if dtype is None:
+        raise ValueError(f"unsupported safetensors dtype {entry['dtype']} for {name}")
+    return SafetensorsMmapRef(
+        path=path,
+        name=name,
+        dtype=dtype,
+        shape=tuple(entry["shape"]),
+        data_begin=data_start + begin,
+        data_end=data_start + end,
+    )
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -834,12 +916,18 @@ def safetensors_weights_iterator(
     *,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
+    lazy_mmap_names: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP.
+
+    dsv41 engram-mmap: names for which *lazy_mmap_names* returns True are
+    yielded as `SafetensorsMmapRef` (header metadata only, no bytes read);
+    their weight loaders memory-map the slice they need. Only the default
+    (non-prefetch, non-multithread, non-torchao) path honours it.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -958,6 +1046,10 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
+                        continue
+                    if lazy_mmap_names is not None and lazy_mmap_names(name):
+                        # dsv41 engram-mmap: metadata only, never the bytes.
+                        yield name, safetensors_mmap_ref(st_file, name)
                         continue
                     param = f.get_tensor(name)
                     yield name, param

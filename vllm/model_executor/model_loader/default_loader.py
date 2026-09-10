@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from typing import cast
 
 import torch
@@ -74,6 +74,8 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         self.local_expert_ids: set[int] | None = None
+        # dsv41 engram-mmap: set per model in load_weights (see there).
+        self.lazy_mmap_names: Callable[[str], bool] | None = None
 
         extra_config = load_config.model_loader_extra_config
         if not isinstance(extra_config, dict):
@@ -295,6 +297,7 @@ class DefaultModelLoader(BaseModelLoader):
                         safetensors_prefetch_block_size=(
                             self.load_config.safetensors_prefetch_block_size
                         ),
+                        lazy_mmap_names=self.lazy_mmap_names,
                     )
         else:
             if extra_config.get("enable_multithread_load"):
@@ -423,6 +426,11 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.safetensors_load_strategy = "torchao"
 
         self._init_ep_weight_filter(model_config)
+        # dsv41 engram-mmap: a model may ask for some checkpoint tensors as
+        # `SafetensorsMmapRef` instead of loaded tensors (the engram tables
+        # in mmap mode); the predicate is consulted by the safetensors
+        # iterator before it reads any bytes.
+        self.lazy_mmap_names = getattr(model, "lazy_mmap_weight_names", None)
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
