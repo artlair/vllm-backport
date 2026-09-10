@@ -1148,6 +1148,9 @@ class DeepseekV4Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            # dsv41 boot: our SparseAttnIndexer (SM80 row-chunking port) takes
+            # num_heads for its fp8 mqa-logits warmup; upstream v4.1 does not.
+            num_heads=self.n_head,
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
             compress_ratio=self.compress_ratio,
