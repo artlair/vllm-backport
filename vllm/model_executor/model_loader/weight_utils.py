@@ -1286,6 +1286,11 @@ def composed_weight_loader(
     return composed_loader
 
 
+# dsv41 cluster: elements per chunk when dummy-filling sub-16-bit params
+# (64M elements = 128 MiB of fp16 temporary).
+_DUMMY_FILL_CHUNK = 64 << 20
+
+
 def initialize_dummy_weights(
     model: torch.nn.Module,
     model_config: ModelConfig,
@@ -1355,6 +1360,18 @@ def initialize_single_dummy_weight(
     if torch.finfo(param.data.dtype).bits < 16:
         # uniform_ doesn't support < 16-bit datatypes (FP8)
         dtype = param.data.dtype
+        # dsv41 cluster: fill big sub-16-bit params in bounded chunks. The
+        # whole-tensor fp16 temporary (2x) plus its fp8 copy (1x) tripled the
+        # host footprint of every 3 GiB pinned engram shard, and 8 x299 ranks
+        # doing that at once tripped ray's 95% host-memory monitor.
+        if param.data.is_contiguous() and param.data.numel() > _DUMMY_FILL_CHUNK:
+            flat = param.data.view(-1)
+            for start in range(0, flat.numel(), _DUMMY_FILL_CHUNK):
+                chunk = flat[start : start + _DUMMY_FILL_CHUNK]
+                chunk.copy_(
+                    chunk.to(torch.float16).uniform_(low, high, generator=generator)
+                )
+            return
         tmp_param = param.data.to(torch.float16)
         tmp_param = tmp_param.uniform_(low, high, generator=generator).to(dtype)
         param.data.copy_(tmp_param)
