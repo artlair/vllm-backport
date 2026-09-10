@@ -773,8 +773,11 @@ class CircularBufferSpec(AttentionSpec):
             isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
         )
 
+    # dsv41: upstream names this ``prefix_cacheable``; our base still reads
+    # ``participates_in_prefix_caching`` (see KpoolTailSpec), so the ring must
+    # opt out under that name or its block size leaks into hash_block_size.
     @property
-    def prefix_cacheable(self) -> bool:
+    def participates_in_prefix_caching(self) -> bool:
         return False
 
 
@@ -1029,6 +1032,11 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         )
 
     @property
+    def first_spec(self) -> KVCacheSpec:
+        """Return the first spec in the group."""
+        return next(iter(self.kv_cache_specs.values()))
+
+    @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
@@ -1085,6 +1093,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         return Counter(
             spec.page_size_bytes for spec in self.kv_cache_specs.values()
         ).most_common(1)[0][1]
+
+    # dsv41: upstream #56201 name for the same count, used by the packed
+    # group planner (``_get_packed_kv_cache_groups``).
+    def get_max_layers_per_page_size(self) -> int:
+        """Max number of layers sharing a page size. For a balanced bucket
+        this equals the number of repetitions of the layer pattern."""
+        return self.get_num_layer_tuples()
 
     def max_memory_usage_pages(self, vllm_config: VllmConfig) -> int:
         return max(

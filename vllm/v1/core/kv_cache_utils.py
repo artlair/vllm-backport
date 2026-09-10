@@ -1841,12 +1841,16 @@ def group_and_unify_kv_cache_specs(
     page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}
     if len(page_sizes) <= 1:
         return None
-    # TODO(dsv41): upstream's packed planner folds CircularBufferSpec rings in
-    # as "state buckets". Our MLA/SWA-MLA tuple packer below would silently
-    # drop ring layers and _get_kv_cache_groups_uniform_groups asserts every
-    # non-first group is SlidingWindowMLASpec, so bail to the general path.
-    if any(isinstance(spec, CircularBufferSpec) for spec in kv_cache_spec.values()):
-        return None
+    # dsv41: CircularBufferSpec rings (DeepSeek V4.1 compressor state) are
+    # planned by _get_packed_kv_cache_groups, which get_kv_cache_groups picks
+    # before this tuple packer. The packer below only knows MLA / SWA-MLA
+    # layers and would silently drop ring layers, so refuse them here.
+    assert not any(
+        isinstance(spec, CircularBufferSpec) for spec in kv_cache_spec.values()
+    ), (
+        "CircularBufferSpec layers must be grouped by _get_packed_kv_cache_groups "
+        "(block-outermost KV cache layout), not the DeepseekV4 tuple packer."
+    )
 
     mla_specs: dict[str, KVCacheSpec] = {}
     grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
@@ -1996,13 +2000,190 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, *swa_mla_groups]
 
 
-# TODO(dsv41): upstream #56201 teaches _get_packed_kv_cache_groups() to treat
-# CircularBufferSpec and unsplit SlidingWindowSpec buckets as "state buckets"
-# (capped at the states one packed block already fits, so 43 V4.1 SWA caches
-# do not widen the block), and gates the DeepseekV4 eagle fallback on
-# model_type in ("deepseek_v4", "deepseek_v41"). Our base has neither the
-# packed-group planner nor CircularBufferSpec; V4.1 attention still reports
-# model_version="deepseek_v4", so the eagle detection below covers it.
+# dsv41: port of upstream #56201's packed group planner. Upstream replaced the
+# DeepseekV4 tuple packer above with it for every mixed-page-size model; here
+# it only serves the DeepSeek V4.1 mix (see get_kv_cache_groups), so the
+# GLM-5.3 and DeepseekV4 tuple paths stay untouched. Deviation from upstream:
+# eagle annotation goes through _annotate_eagle_groups_deepseek_v4, which
+# detects the DeepseekV4 family via the specs' model_version rather than
+# hf_config.model_type in ("deepseek_v4", "deepseek_v41").
+def _get_packed_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """Group mixed-page-size layers for contiguous block-outermost packing.
+
+    Greedily buckets layers into uniform-type specs. Buckets with equal layer
+    counts per page size are treated as a repeating layer pattern (one layer
+    per page size) and split into groups covering the same number of pattern
+    repeats (picked by ``_approximate_gcd`` to minimize padding), so all
+    groups pack into the same per-block layout. Mamba buckets are additionally
+    split to fit the block the attention buckets already need.
+    Returns None when the layout is not block-outermost or all layers already
+    share one page size.
+    """
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}
+    if not layout.is_block_outermost or len(page_sizes) <= 1:
+        return None
+
+    buckets: list[dict[str, KVCacheSpec]] = []
+    for name, spec in kv_cache_spec.items():
+        for bucket in buckets:
+            candidate = {**bucket, name: spec}
+            if UniformTypeKVCacheSpecs.is_uniform_type(candidate):
+                bucket[name] = spec
+                break
+        else:
+            buckets.append({name: spec})
+
+    bucketed = []
+    for bucket in buckets:
+        uniform_spec = UniformTypeKVCacheSpecs.from_specs(bucket)
+        assert uniform_spec is not None
+        page_size_layers: dict[int, list[str]] = defaultdict(list)
+        for layer_name, layer_spec in bucket.items():
+            page_size_layers[layer_spec.page_size_bytes].append(layer_name)
+        # Only 1:1 patterns (one layer of each page size per repeat) are
+        # supported; counts sharing a gcd > 1 (e.g. 2:1) could in principle
+        # repeat too, but such buckets are emitted whole instead.
+        balanced = len(set(map(len, page_size_layers.values()))) == 1
+        bucketed.append((uniform_spec, page_size_layers, balanced))
+
+    # Balanced buckets that mix page sizes must stay whole, so the largest one
+    # sets a floor on the repeats per group; larger single-size buckets are
+    # split down toward it. No such bucket means nothing needs packing.
+    min_repeats_per_group = max(
+        (
+            spec.get_max_layers_per_page_size()
+            for spec, page_size_layers, balanced in bucketed
+            if balanced and len(page_size_layers) > 1
+        ),
+        default=0,
+    )
+    repeats_per_group = (
+        _approximate_gcd(
+            [
+                spec.get_max_layers_per_page_size()
+                for spec, _, balanced in bucketed
+                if balanced
+            ],
+            lower_bound=min_repeats_per_group,
+        )
+        if min_repeats_per_group
+        else None
+    )
+
+    def num_groups_for(spec: UniformTypeKVCacheSpecs, balanced: bool) -> int:
+        if balanced and repeats_per_group is not None:
+            return cdiv(spec.get_max_layers_per_page_size(), repeats_per_group)
+        return 1
+
+    def widest_group_bytes(page_size_layers: dict[int, list[str]], n: int) -> int:
+        """Page bytes of the largest of the n groups a bucket splits into."""
+        return sum(
+            cdiv(len(names), n) * page for page, names in page_size_layers.items()
+        )
+
+    # Bytes a block must hold however the state buckets end up split: mamba,
+    # circular-buffer and unsplit sliding-window buckets can go down to one
+    # state per group, every other bucket's split is fixed by the repeat pattern.
+    def is_state_bucket(spec: UniformTypeKVCacheSpecs) -> bool:
+        if isinstance(spec.first_spec, (MambaSpec, CircularBufferSpec)):
+            return True
+        return repeats_per_group is None and isinstance(
+            spec.first_spec, SlidingWindowSpec
+        )
+
+    anchor_bytes = max(
+        (
+            widest_group_bytes(
+                page_size_layers,
+                len(spec.kv_cache_specs)
+                if is_state_bucket(spec)
+                else num_groups_for(spec, balanced),
+            )
+            for spec, page_size_layers, balanced in bucketed
+        ),
+        default=0,
+    )
+
+    groups = []
+    for spec, page_size_layers, balanced in bucketed:
+        num_groups = num_groups_for(spec, balanced)
+        # Cap a state group at the states a block already fits rather than let
+        # it widen the block.
+        if anchor_bytes and is_state_bucket(spec):
+            states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
+            num_groups = max(
+                num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
+            )
+        if num_groups == 1:
+            groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
+            continue
+
+        pattern_repeats = list(zip(*page_size_layers.values()))
+        for i in range(num_groups):
+            group_layer_names = [
+                name for repeat in pattern_repeats[i::num_groups] for name in repeat
+            ]
+            group_layer_specs = {
+                name: spec.kv_cache_specs[name] for name in group_layer_names
+            }
+            group_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
+            assert group_spec is not None
+            groups.append(KVCacheGroupSpec(group_layer_names, group_spec))
+
+    _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, groups)
+    return groups
+
+
+def _get_dsv41_kv_cache_groups(
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec] | None:
+    """dsv41: plan the DeepSeek V4.1 mix (MLA + SWA-MLA + compressor rings).
+
+    Returns None when no CircularBufferSpec ring is present, or when every
+    layer already shares one page size (the generic path handles that).
+    Rings are one block per request, so they can only be placed by the
+    packed planner; a non-block-outermost layout cannot express them.
+    """
+    if not any(isinstance(spec, CircularBufferSpec) for spec in kv_cache_spec.values()):
+        return None
+    # Hidden-state layers use their own block table and must not be absorbed
+    # into a compatible attention bucket.
+    hidden_specs = {
+        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)
+    }
+    filtered_spec = {
+        k: v
+        for k, v in kv_cache_spec.items()
+        if not isinstance(v, HiddenStateCacheSpec)
+    }
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    if not layout.is_block_outermost:
+        raise NotImplementedError(
+            "DeepSeek V4.1 compressor rings (CircularBufferSpec) need a "
+            "block-outermost KV cache layout (e.g. BLHNC) so mixed page sizes "
+            f"pack per block; the resolved layout is {layout.name}."
+        )
+    packed_groups = _get_packed_kv_cache_groups(vllm_config, filtered_spec)
+    if packed_groups is None:
+        return None
+    # Block-outermost blocks are strided by the widest group, so hidden
+    # groups need no page alignment.
+    packed_groups += [
+        KVCacheGroupSpec([name], spec) for name, spec in hidden_specs.items()
+    ]
+    return packed_groups
+
+
+# dsv41: V4.1 attention reports model_version="deepseek_v4" on its specs, so
+# the detection below covers both DeepseekV4 and V4.1 (upstream #56201 gates
+# the same positional fallback on hf_config.model_type instead). The rule is
+# only valid where the groups partition exactly the layers of kv_cache_spec,
+# which holds for the tuple packer and _get_packed_kv_cache_groups.
 def _annotate_eagle_groups_deepseek_v4(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -2065,6 +2246,11 @@ def get_kv_cache_groups(
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif dsv41_groups := _get_dsv41_kv_cache_groups(vllm_config, kv_cache_spec):
+        # dsv41: DeepSeek V4.1 adds one-block-per-request CircularBufferSpec
+        # rings next to its MLA / SWA-MLA layers; the tuple packer below cannot
+        # place them, the packed planner folds them in as state buckets.
+        return dsv41_groups
     elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
         # DeepseekV4 case: All layers need the same number of token slots,
         # yet some layers are full attention while others are sliding window

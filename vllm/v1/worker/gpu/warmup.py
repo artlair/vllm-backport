@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     KVCacheSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -44,6 +45,11 @@ def _reserved_block_count(
     `KVCacheManager.allocate_slots` reserves: the token range plus
     `num_lookahead_tokens`, where the speculator writes the KV of its drafts.
     """
+    # dsv41: ring groups are UniformTypeKVCacheSpecs of CircularBufferSpec.
+    if isinstance(kvcache_spec, UniformTypeKVCacheSpecs) and isinstance(
+        kvcache_spec.first_spec, CircularBufferSpec
+    ):
+        kvcache_spec = kvcache_spec.first_spec
     if isinstance(kvcache_spec, CircularBufferSpec):
         # Circular caches keep one physical ring block for the request lifetime.
         return 1

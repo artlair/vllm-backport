@@ -67,9 +67,10 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
-    KVCacheConfig,
     KpoolTailSpec,
+    KVCacheConfig,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
     DraftTokenIds,
@@ -624,6 +625,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            # dsv41: a ring group arrives as a UniformTypeKVCacheSpecs of
+            # CircularBufferSpec (the packed planner groups rings together), so
+            # the per-layer type has to be read through the wrapper.
+            layer_spec = (
+                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            )
             # KpoolTailSpec is a 1-block-per-request ring with its own mapping
             # (KpoolTailMetadataBuilder). The generic position-indexed kernel
             # reads its 32-column block-table row at pos // kpool with no
@@ -636,7 +643,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # valid for a 1-block ring.
             slot_mapping_enabled.append(
                 not (isinstance(spec, KpoolTailSpec) and _KPOOL_TAIL_GENERIC_EXCLUDE)
-                and not isinstance(spec, CircularBufferSpec)
+                and not isinstance(layer_spec, CircularBufferSpec)
             )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
@@ -645,7 +652,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             # Preserve each cache type's alignment requirements after applying
             # its topology-aware block-table width.
-            if isinstance(spec, (MambaSpec, CircularBufferSpec)):
+            if isinstance(spec, MambaSpec) or isinstance(
+                layer_spec, CircularBufferSpec
+            ):
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )
