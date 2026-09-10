@@ -200,3 +200,67 @@ step per stage against a 3 ms model run: the lane is per-step latency bound (cud
 of 8 MoE layers + TP allreduce + hop), not bandwidth or SM bound. More tokens per step (DSpark
 with real acceptance, more requests per batch) is the lever; the 10 GbE bytes (44 KB per token
 per hop) are not.
+
+### Real weights, 2026-09-11 (image 67c4aec4f-serve, code 8cf2fab8f, PARTITION=8,8,8,9,7, TP=4 x PP=5)
+
+First real-weights boots of `~/models/DeepSeek-V4.1-Flash` (476 GB, 48 shards, resolved
+copies on both nodes) with `LOADFORMAT=auto ENGRAM_MODE=mmap RELAY=1 SPEC=0 CTX=32768 UTIL=0.9
+SEQS=8` plus `--reasoning-parser deepseek_v41 --tool-call-parser deepseek_v41
+--enable-auto-tool-choice` (via `EXTRA`). Transcripts and the harness (`real_quality.py`:
+`checks`, `compare`, `det`) live in x299 `~/dsv41-test/real/`; boot logs are
+`~/dsv41-test/dsv41-{head,worker}-real{1,2}.log` (+ `-ray/` snapshots).
+
+Loading (eager run 1): `Loading weights took` 105-133 s per stage, `Model loading took`
+16.6 / 16.06 GiB (x299 stages 0/1, 151 s) and 15.89 / 17.8 / 14.25 GiB (rome stages 2/3/4,
+115-125 s); `/health` 5m44s after `start` (ray cluster ~50 s, engine init 94 s). The second
+boot (cudagraphs) loaded in 80-91 s per stage from a warm page cache, `/health` at 5m20s
+including 19-30 s of graph capture (0.2 GiB per rank). Host RAM peaks (used / buff-cache /
+available, GB): x299 56 / 78 / 69 (of 125, 24 GB of VMs included; 8 x 23.6 GiB engram
+shards mapped, nothing pinned), rome 38 / 95 / 87. `Engram table in mmap mode: rows
+0..96000564 of 384006168 (23.60 GiB of checkpoint per rank, page-cache backed, nothing
+pinned)` on all four stage-0 ranks (layer 1) and the 384,016,682-row layer-14 table on
+stage 1. Relay plan as documented above (rank 1 -> 2: latent_14 + topk_14, 3072 B/token;
+2 -> 3: latent_20 + cand_20, 9216; 3 -> 4: + topk_32, 11264). `GPU KV cache size: 603,570
+tokens` (18.42x of 32k), the same as the dummy r1/r3 shape. VRAM after load (MiB): x299
+20.0k / 19.6k, rome 19.4k / 21.5k / 17.4k.
+
+Quality (all coherent, no repetition, temperature 0): chat mode (`reasoning_effort: none`)
+answered Canberra / 1913 with the 1927 parliament nuance and wrote a two-pointer
+`merge_sorted_lists` with a docstring; thinking mode returned `reasoning_content` ("...All
+but 9 run away => 9 left ... buys 18 ... Total 27") separate from `content` ("27"); the
+`get_weather` tool request came back as a structured `tool_calls` entry
+(`{"city": "Sydney"}`, `finish_reason=tool_calls`) and the tool-result turn produced a
+correct summary; a 20,195-token prompt with the needle in the middle returned exactly
+`7391-MARLIN-42` (prefill + 8 tokens in 10.6 s, eager); the 3-turn conversation with tools
+issued three parallel tool calls, then one, then a sensible final paragraph with prior
+`reasoning_content` fed back (drop_thinking path).
+
+Speeds: eager 3.6-4.5 tok/s at one stream (real weights + the mmap engram gather; dummy
+eager was 9.7). Cudagraphs `FULL_AND_PIECEWISE` + `PPMETA=1`: 36-50 tok/s at one stream
+(the first request after boot 36-40, warm 41-50), `bench` CONC 1 / 4 / 8 at 256 tokens =
+36.1 / 140.9 / 165.3 tok/s (engine stats 183 tok/s at 8 running).
+
+Greedy outputs are NOT bit-stable: the same chat-mode prompt gave four different (all
+correct) continuations across one cudagraph boot and differed from the eager boot; `det`
+(5 repeats with top logprobs) showed 2 distinct completions, diverging at token 82 where
+the top-2 were an exact tie in one run (-0.6948 / -0.6948) and 0.25 nats apart in the
+others, with per-token logprobs already differing at token 0 (-0.000187 vs -0.000184).
+After a 45 s idle gap and back-to-back, 5 further repeats were identical. So the noise is
+in the kernels (prefill included), not stateful; the Marlin atomic-add reduce is off
+(`VLLM_MARLIN_USE_ATOMIC_ADD` unset, bf16 on sm86 disables it anyway), so the source is
+still open (candidates: the Triton sparse-indexer fallback, MoE routing ties, NCCL
+reduction order across the TP=4 groups).
+
+Issues: (1) every rome rank logged `expandable_segments: memory mapping failed with OOM`
+warnings (8-12 MiB free of 24 GiB) during the Marlin repack of the fp4 experts; the
+allocator recovered each time (memory fell back to 15-19 GiB), i.e. repack headroom on the
+9-layer stages is a few MiB. (2) rome's swap grew 15.6 -> 30.2 GB during the load (12 ray
+workers x ~650 MiB swapped out; `vm.swappiness=60` prefers the weight stream's page cache)
+and shrank back to 16.7 GB after the stop. (3) `Engram mmap: staging rows before FULL
+graph replays` was logged by rome's stage 2, which holds no engram layer (fixed, hook now
+installed only where a table is mapped). (4) During the second CONC=8 bench pass x299's
+GPUs 0-3 (bus 17-1A, the known PSU-domain drop) fell off the bus: `CUDA error: unspecified
+launch failure` on the stage-0 ranks at 09:33:42, NVRM `GPU lost from the bus
+[NV_ERR_GPU_IS_LOST]` at 09:36:01, `nvidia-smi` "Unable to determine the device handle"
+for 0000:17..1A; the head died and rome's `ray start --block` exited with it. That ended the
+session before run 3 (DSpark `SPEC=5` on real text) could run; a cold power cycle is needed.
