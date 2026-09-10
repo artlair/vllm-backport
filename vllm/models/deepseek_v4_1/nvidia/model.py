@@ -339,6 +339,18 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
             else:
                 residual = x
+                if self.engram is not None and engram_hashes is not None:
+                    # dsv41 engram: first layer of a later PP stage. The
+                    # incoming stream is the previous stage's mhc_post
+                    # reconstruction, i.e. exactly the point where the
+                    # in-stage path below injects engram; without this the
+                    # injection was skipped whenever a partition started a
+                    # stage on layer 1 or 14.
+                    residual = self.engram(
+                        residual,
+                        engram_hashes[:, self.engram.layer_hash_index],
+                        engram_mask,
+                    )
                 post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
                     residual,
                     self.hc_attn_fn,
@@ -1206,6 +1218,16 @@ class DeepseekV41LLMForCausalLM(
         passes them as `lookback_token_ids`."""
         engram_hash = self.model.engram_hash
         return engram_hash.lookback_depth if engram_hash is not None else 0
+
+    @property
+    def needs_input_ids_on_all_pp_ranks(self) -> bool:
+        """dsv41 engram: the n-gram hash runs on the stage that owns an engram
+        layer, from the step's raw token ids. Under PP the runner passes
+        `input_ids=None` to every stage but the first, which made
+        `_stage_engram_rows` skip silently (no hashes, no injection) on any
+        partition that places layer 14 (or 1) past stage 0. Ask for the ids
+        on this rank whenever a local layer is an engram layer."""
+        return self.model.engram_hash is not None
 
     def forward(
         self,

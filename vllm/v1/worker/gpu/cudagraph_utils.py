@@ -28,6 +28,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import needs_input_ids_on_all_pp_ranks
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -540,6 +541,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
+        # dsv41 engram: see the same gate in model_runner.execute_model.
+        pp_input_ids_on_all_ranks = (
+            not self.is_first_pp_rank and needs_input_ids_on_all_pp_ranks(model)
+        )
 
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
@@ -565,7 +570,10 @@ class ModelCudaGraphManager(CudaGraphManager):
             }
             if not self.is_first_pp_rank:
                 # Update for non-first PP ranks.
-                model_inputs["input_ids"] = None
+                if not pp_input_ids_on_all_ranks:
+                    model_inputs["input_ids"] = None
+                # dsv41 engram: else capture with the static input_ids
+                # buffer, matching what execute_model passes on replay.
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]

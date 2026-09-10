@@ -312,6 +312,11 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return self.language_model.token_lookback_depth
 
     @property
+    def needs_input_ids_on_all_pp_ranks(self) -> bool:
+        # dsv41 engram: see DeepseekV41ForCausalLM.
+        return self.language_model.needs_input_ids_on_all_pp_ranks
+
+    @property
     def pp_all_gather_tensors(self) -> dict[str, bool]:
         # dsv41 pp-relay: gpu_worker reads this off the top-level model.
         return self.language_model.pp_all_gather_tensors

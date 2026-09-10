@@ -590,6 +590,14 @@ def requires_raw_input_tokens(model: type[object] | object) -> bool:
     return getattr(model, "requires_raw_input_tokens", False)
 
 
+def needs_input_ids_on_all_pp_ranks(model: type[object] | object) -> bool:
+    """dsv41 engram: True when a model wants the step's `input_ids` on every
+    PP rank, not only the first. The V2 runner builds the same input batch
+    on every rank (that is how attention metadata and slot mappings agree),
+    so it can hand the ids to later stages too; by default they get None."""
+    return getattr(model, "needs_input_ids_on_all_pp_ranks", False)
+
+
 def supports_multimodal_encoder_tp_data(model: type[object] | object) -> bool:
     return getattr(model, "supports_encoder_tp_data", False)
 

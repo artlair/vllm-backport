@@ -49,7 +49,10 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.models.interfaces import requires_raw_input_tokens
+from vllm.model_executor.models.interfaces import (
+    needs_input_ids_on_all_pp_ranks,
+    requires_raw_input_tokens,
+)
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -221,6 +224,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # tables are memory-mapped and FULL cudagraphs are on (set in
         # load_model); called before every FULL graph replay.
         self.engram_prefetch: Callable[..., None] | None = None
+        # dsv41 engram: set in load_model from the model's
+        # `needs_input_ids_on_all_pp_ranks`; False keeps the stock
+        # `input_ids=None` on PP ranks > 0.
+        self.pp_input_ids_on_all_ranks = False
         self.is_last_pp_rank = get_pp_group().is_last_rank
 
         # Size the UVA buffer pools to the max number of concurrent in-flight
@@ -476,6 +483,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
         )
+        # dsv41 engram: later PP stages that hash the step's token ids get
+        # the ids the runner already built for this rank.
+        self.pp_input_ids_on_all_ranks = (
+            self.use_pp
+            and not self.is_first_pp_rank
+            and needs_input_ids_on_all_pp_ranks(self.model)
+        )
+        if self.pp_input_ids_on_all_ranks:
+            logger.info("Passing input_ids to the model on this PP rank")
         # dsv41 engram-mmap: with memory-mapped engram tables a FULL graph
         # cannot contain the host gather, so the runner stages the rows
         # itself before each FULL replay (see execute_model).
@@ -1827,7 +1843,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
+            if not self.pp_input_ids_on_all_ranks:
+                model_inputs["input_ids"] = None
+            # dsv41 engram: otherwise keep `input_batch.input_ids`, which
+            # prepare_inputs filled on this rank exactly as on rank 0
+            # (prefill ids from the token history, decode / draft ids from
+            # the PP-relayed sampled tokens), so the engram hash on a later
+            # stage sees the real step. Same inputs feed the FULL-graph
+            # `engram_prefetch` below and the PIECEWISE / eager calls.
             model_inputs["inputs_embeds"] = None
 
             # Prepare the intermediate tensors.
