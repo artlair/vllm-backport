@@ -23,7 +23,10 @@ else()
         # vllm-project/FlashMLA (only via refs/pull/*), so point at the fork.
         # https://github.com/vllm-project/FlashMLA/pull/17
         GIT_REPOSITORY https://github.com/JaredforReal/FlashMLA.git
-        GIT_TAG 8447acbcb558db892bf7c1197d225be1c95b168c
+        # rope_dim head as of 2026-09-10 (the old 8447acbc pin was rebased
+        # away and is unreachable). FlashMLA only builds for sm90+, so the
+        # sm86 lane only vendors its Python interface from this checkout.
+        GIT_TAG ebaf7688c651d03419f442dbd6cfa8616084aed8
         GIT_PROGRESS TRUE
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""
