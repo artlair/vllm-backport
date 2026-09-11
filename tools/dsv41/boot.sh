@@ -12,6 +12,8 @@
 # ENGRAM_MODE (unset | pinned | resident | mmap): engram_config.table_mode;
 # unset keeps the ENGRAM_OFFLOAD choice, mmap = page-cache tables, nothing
 # pinned (docs/dsv41-engram-mmap.md).
+# ENGRAM_WARM (unset | none | async | sync): engram_config.mmap_warm, the
+# boot-time page-cache warmup of the mmap slices (dsv41 engram-warm).
 # OVERLAY=1 mounts the repo (SRC_DIR, default the worktree containing this
 # script) at /src and runs the image's compiled ops with the worktree's python:
 # /src/vllm is copied to /work/vllm, every build-only file of the installed
@@ -35,6 +37,7 @@ SEQS=${SEQS:-2}
 SPEC=${SPEC:-0}
 ENGRAM_OFFLOAD=${ENGRAM_OFFLOAD:-1}
 ENGRAM_MODE=${ENGRAM_MODE:-}
+ENGRAM_WARM=${ENGRAM_WARM:-}
 EAGER=${EAGER:-1}
 BATCHED=${BATCHED:-2048}
 HOST=${HOST:-127.0.0.1}
@@ -63,14 +66,14 @@ usage() { sed -n '2,18p' "$0"; exit 1; }
 
 # dsv41 engram-mmap: ENGRAM_OFFLOAD picks pinned/resident; ENGRAM_MODE, when
 # set, adds table_mode (mmap needs the real checkpoint or a dummy load).
+# dsv41 engram-warm: ENGRAM_WARM, when set, adds mmap_warm.
 engram_config_json() {
   local offload=false
   [ "$ENGRAM_OFFLOAD" = "1" ] && offload=true
-  if [ -n "$ENGRAM_MODE" ]; then
-    printf '{"cpu_offload": %s, "table_mode": "%s"}' "$offload" "$ENGRAM_MODE"
-  else
-    printf '{"cpu_offload": %s}' "$offload"
-  fi
+  local json="{\"cpu_offload\": $offload"
+  [ -n "$ENGRAM_MODE" ] && json="$json, \"table_mode\": \"$ENGRAM_MODE\""
+  [ -n "$ENGRAM_WARM" ] && json="$json, \"mmap_warm\": \"$ENGRAM_WARM\""
+  printf '%s}' "$json"
 }
 
 vllm_args() {

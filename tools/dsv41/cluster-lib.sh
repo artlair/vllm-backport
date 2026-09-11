@@ -40,14 +40,15 @@ LOGLEVEL=${LOGLEVEL:-INFO}
 # the same python as the head's driver.
 # dsv41 engram-mmap: --engram-config JSON from ENGRAM_OFFLOAD (pinned or
 # resident) and, when set, ENGRAM_MODE (pinned | resident | mmap).
+# dsv41 engram-warm: ENGRAM_WARM (none | async | sync), when set, adds
+# mmap_warm (boot-time page-cache warmup of the mmap slices).
 engram_config_json() {
   local offload=false
   [ "${ENGRAM_OFFLOAD:-1}" = "1" ] && offload=true
-  if [ -n "${ENGRAM_MODE:-}" ]; then
-    printf '{"cpu_offload": %s, "table_mode": "%s"}' "$offload" "$ENGRAM_MODE"
-  else
-    printf '{"cpu_offload": %s}' "$offload"
-  fi
+  local json="{\"cpu_offload\": $offload"
+  [ -n "${ENGRAM_MODE:-}" ] && json="$json, \"table_mode\": \"$ENGRAM_MODE\""
+  [ -n "${ENGRAM_WARM:-}" ] && json="$json, \"mmap_warm\": \"$ENGRAM_WARM\""
+  printf '%s}' "$json"
 }
 
 overlay_prelude() {

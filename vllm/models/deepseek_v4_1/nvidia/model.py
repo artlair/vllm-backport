@@ -1006,6 +1006,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             layer.ffn.finalize_mega_moe_weights()
 
+    def warm_engram_tables(self) -> None:
+        """dsv41 engram-warm: page-cache warmup of this rank's mmap engram
+        slices (`engram_config.mmap_warm`); only stages holding an engram
+        layer have anything to warm. Idempotent."""
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                engram.embed_tokens.warm_mmap()
+
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:
             return
@@ -1277,6 +1286,8 @@ class DeepseekV41LLMForCausalLM(
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
+        # dsv41 engram-warm: after the weight stream, before profiling.
+        self.model.warm_engram_tables()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

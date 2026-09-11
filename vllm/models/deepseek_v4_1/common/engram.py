@@ -37,6 +37,7 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
 import mmap
 import os
 import re
+import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -92,6 +93,12 @@ _MMAP_GATHER_MIN_CHUNK = 32
 _MMAP_GATHER_MAX_CHUNK = 1024
 _mmap_gather_pool: ThreadPoolExecutor | None = None
 
+# dsv41 engram-warm: the warmup reads a slice in steps this big (readahead
+# friendly, one scratch buffer per warm thread, so the footprint is bounded).
+# `mmap.madvise` holds the GIL, so MADV_WILLNEED is issued per step (one step
+# ahead of the read) rather than over the whole slice at once.
+_MMAP_WARM_CHUNK = 64 << 20
+
 
 def _mmap_gather_executor() -> ThreadPoolExecutor:
     global _mmap_gather_pool
@@ -122,10 +129,18 @@ class EngramMmapTable:
         rows: np.ndarray,
         mapping: mmap.mmap | None,
         source: str,
+        path: str | None = None,
+        file_offset: int = 0,
     ) -> None:
         self.rows = rows
         self._mapping = mapping
         self.source = source
+        # dsv41 engram-warm: the file and the byte range the mapping covers
+        # (page aligned start, so `mapped_bytes` includes the slack); None
+        # for an anonymous table.
+        self.path = path
+        self.file_offset = file_offset
+        self.mapped_bytes = len(mapping) if mapping is not None else 0
 
     @classmethod
     def from_ref(
@@ -153,7 +168,11 @@ class EngramMmapTable:
         mapping.madvise(mmap.MADV_RANDOM)
         rows = np.frombuffer(mapping, dtype=np.uint8, count=byte_count, offset=slack)
         return cls(
-            rows.reshape(row_count, row_bytes), mapping, f"{ref.path}:{ref.name}"
+            rows.reshape(row_count, row_bytes),
+            mapping,
+            f"{ref.path}:{ref.name}",
+            path=ref.path,
+            file_offset=aligned,
         )
 
     @classmethod
@@ -184,6 +203,48 @@ class EngramMmapTable:
         ]
         for f in futures:
             f.result()
+
+    def warm(self, scratch: bytearray | None = None) -> int:
+        """dsv41 engram-warm: pull the mapped byte range into the page cache
+        and return the bytes read (0 for an anonymous table).
+
+        Sequential over the slice in `_MMAP_WARM_CHUNK` steps: MADV_WILLNEED
+        one step ahead (the kernel queues the readahead; MADV_RANDOM on the
+        mapping only affects fault-time readahead), then `preadv` of the
+        current step into the scratch buffer, which waits for the pages and
+        so paces the loop at disk speed. `preadv` releases the GIL, so an
+        async warm does not stall the engine. Nothing is copied but the
+        scratch step; the pages land in the page cache that the mapping
+        shares with the file.
+        """
+        if self._mapping is None or self.path is None:
+            return 0
+        total = self.mapped_bytes
+        chunk = _MMAP_WARM_CHUNK
+        if scratch is None or len(scratch) < chunk:
+            scratch = bytearray(chunk)
+        view = memoryview(scratch)[:chunk]
+        fd = os.open(self.path, os.O_RDONLY)
+        try:
+            self._mapping.madvise(mmap.MADV_WILLNEED, 0, min(chunk, total))
+            done = 0
+            while done < total:
+                ahead = done + chunk
+                if ahead < total:
+                    self._mapping.madvise(
+                        mmap.MADV_WILLNEED, ahead, min(chunk, total - ahead)
+                    )
+                want = min(chunk, total - done)
+                got = os.preadv(fd, [view[:want]], self.file_offset + done)
+                if got <= 0:
+                    raise OSError(
+                        f"engram warm: short read at {self.file_offset + done} "
+                        f"of {self.path} ({got} of {want} bytes)"
+                    )
+                done += got
+        finally:
+            os.close(fd)
+        return done
 
     def close(self) -> None:
         self.rows = None  # type: ignore[assignment]
@@ -785,6 +846,11 @@ class ParallelEngramEmbedding(nn.Module):
     # dsv41 engram-mmap: class default so instances built without __init__
     # (tests) take the non-mmap paths.
     table_mode: str | None = None
+    # dsv41 engram-warm: `engram_config.mmap_warm`, set by `Engram.__init__`;
+    # `warm_mmap()` reads it after the weights load.
+    mmap_warm: str = "none"
+    mmap_warm_stats: dict[str, float] | None = None
+    _mmap_warm_thread: threading.Thread | None = None
     # dsv41 engram-mmap: set by the V2 runner when it stages the rows itself
     # before every FULL cudagraph replay (`DeepseekV4Model.engram_prefetch`);
     # a lookup met inside a plain (non-breakable) capture is then a no-op
@@ -935,6 +1001,66 @@ class ParallelEngramEmbedding(nn.Module):
             self.vocab_start_idx,
             self.vocab_end_idx,
         )
+
+    def warm_mmap(self) -> threading.Thread | None:
+        """dsv41 engram-warm: read this rank's mapped slices of both tables
+        into the page cache per `mmap_warm` ("sync" joins the thread here,
+        "async" returns it running). Called once the weights are loaded so
+        the reads do not compete with the weight stream; a second call is a
+        no-op. Returns None when there is nothing to do (mode "none", another
+        table mode, or anonymous dummy tables).
+        """
+        if self.mmap_warm == "none" or self.table_mode != "mmap":
+            return None
+        if self._mmap_warm_thread is not None:
+            return self._mmap_warm_thread
+        assert self.mmap_warm in ("async", "sync"), self.mmap_warm
+        tables = [self._mmap_tables.get(kind) for kind in ("weight", "scale")]
+        if any(t is None or t.path is None for t in tables):
+            logger.info(
+                "Engram mmap warm (%s) skipped: tables not mapped from a file "
+                "(dummy load, anonymous tables)",
+                self.mmap_warm,
+            )
+            return None
+        total = sum(t.mapped_bytes for t in tables)  # type: ignore[union-attr]
+        logger.info(
+            "Engram mmap warm (%s) started: %d bytes (%.2f GiB, rows %d..%d of %s)",
+            self.mmap_warm,
+            total,
+            total / 1024**3,
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            tables[0].path,  # type: ignore[union-attr]
+        )
+
+        def run() -> None:
+            t0 = time.perf_counter()
+            scratch = bytearray(_MMAP_WARM_CHUNK)
+            done = 0
+            try:
+                for table in tables:
+                    done += table.warm(scratch)  # type: ignore[union-attr]
+            except Exception:
+                logger.exception(
+                    "Engram mmap warm failed after %d of %d bytes", done, total
+                )
+            elapsed = time.perf_counter() - t0
+            self.mmap_warm_stats = {"bytes": done, "seconds": elapsed}
+            logger.info(
+                "Engram mmap warm done: %d bytes (%.2f GiB) in %.1f s (%.2f GB/s)",
+                done,
+                done / 1024**3,
+                elapsed,
+                done / 1e9 / max(elapsed, 1e-9),
+            )
+
+        thread = threading.Thread(target=run, name="engram-warm", daemon=True)
+        self._mmap_warm_thread = thread
+        thread.start()
+        if self.mmap_warm == "sync":
+            thread.join()
+        return thread
 
     def _mmap_table_pair(self) -> tuple[EngramMmapTable, EngramMmapTable]:
         """The mapped tables, or anonymous zero tables under a dummy load
@@ -1313,6 +1439,10 @@ class Engram(nn.Module):
             cpu_offload=engram_config.cpu_offload if engram_config else True,
             # dsv41 engram-mmap: "pinned" / "resident" / "mmap".
             table_mode=engram_config.resolved_table_mode if engram_config else None,
+        )
+        # dsv41 engram-warm: applied by `warm_mmap()` after the weights load.
+        self.embed_tokens.mmap_warm = (
+            engram_config.mmap_warm if engram_config else "none"
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(

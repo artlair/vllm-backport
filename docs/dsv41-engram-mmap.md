@@ -93,6 +93,39 @@ are also accepted). Real-table check without the model:
 (x299: `~/dsv41-test/engram_mmap_check.sh`, runs it in the image with the
 overlay). Unit test: `tests/kernels/test_engram_mmap.py`.
 
+## Boot-time warmup (`engram_config.mmap_warm`, tagged `# dsv41 engram-warm:`)
+
+The page cache starts cold after every boot (the ~200 GB weight stream
+evicts it) and a cold row is one NVMe read. With DSpark the rejected
+drafts hash to never-seen n-grams, so the first 8-stream bench on x299
+decayed from 124 to 12 tok/s while the pages warmed and later passes ran
+at 270 tok/s. x299 now has 256 GB with the VMs stopped, so both tables
+(2 x 94.6 GiB, each rank maps a contiguous quarter) fit in the page cache
+with room to spare.
+
+`mmap_warm` (default `"none"`) reads each rank's mapped slices of *both*
+tables (weight and scales, sequentially) into the page cache once the
+weights are loaded (`DeepseekV4ForCausalLM.process_weights_after_loading`,
+i.e. after `load_weights`, so the reads do not compete with the weight
+stream): `ParallelEngramEmbedding.warm_mmap` starts one thread per engram
+layer on the rank, `EngramMmapTable.warm` walks the slice in 64 MiB steps
+with `madvise(MADV_WILLNEED)` one step ahead and `preadv` of the current
+step into a single scratch buffer (readahead-friendly, paced by the disk,
+`preadv` releases the GIL; `mmap.madvise` holds it, hence per step rather
+than over the whole slice). No copy of the table is kept: only the page
+cache fills. `"sync"` blocks until the slices are cached, `"async"`
+returns at once and logs completion later; each rank logs one line at
+start and one at the end with bytes and seconds. Only ranks holding an
+engram layer do anything; a dummy load (anonymous tables) skips with a
+log line. The cold-miss gather path is untouched. Harness: `ENGRAM_WARM`
+in `boot.sh` / `cluster-head.sh`.
+
+Expected time: a quarter of the weight table (23.6 GiB) plus its scales
+(0.74 GiB) is ~26 GB per rank, ~13 s at ~2 GB/s sequential; the four TP
+ranks of a stage stream their quarters concurrently from the same NVMe,
+so a stage holding one table should warm in ~1 minute at the drive's
+sequential rate, both tables on one node in ~2 minutes.
+
 ## Measured (2026-09-11, image 67c4aec4f-serve)
 
 Unit test (3090): mmap vs pinned on a random table, TP 1/2/4, every rank,
@@ -148,10 +181,11 @@ spend anyway, not added latency, but the GPU idles during the gather.
 ## Limits and risks
 
 * **Page-cache pressure.** The hot rows must stay cached; the kernel
-  evicts them like any file page. Both tables (2 x 97 GiB) do not fit
-  x299's page cache, one does barely (97 GB available while idle). Weight
-  loading streams the other 200 GB of shards through the cache first, so
-  the tables start cold after every boot. Real text hashes are Zipfian,
+  evicts them like any file page. With 128 GB the two tables (2 x 97 GiB)
+  do not fit x299's page cache, one does barely; with 256 GB both fit and
+  `mmap_warm` preloads them. Weight loading streams the other 200 GB of
+  shards through the cache first, so without the warmup the tables start
+  cold after every boot. Real text hashes are Zipfian,
   so the steady-state working set is far smaller than the table, but it
   is unmeasured. Watch `buff/cache` and the `engram mmap gather` debug
   stats (`VLLM_LOGGING_LEVEL=DEBUG`, every 500 calls).

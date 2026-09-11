@@ -12,7 +12,7 @@ DSpark MTP, vision tower) is exercised without downloading the 300 GB checkpoint
 2. Boot on one 3090: `IMAGE=<sm86 image> MODEL_DIR=$PWD/trunc ./boot.sh start`, then `./boot.sh smoke`
    (waits for /health, sends one chat completion at temperature 0, prints text and tokens/s),
    `./boot.sh logs`, `./boot.sh stop`. `./boot.sh serve` runs in the foreground; `./boot.sh print` shows the vllm argv.
-   Env knobs: `TP PP CTX UTIL SEQS SPEC ENGRAM_OFFLOAD ENGRAM_MODE EAGER PORT NAME BATCHED EXTRA`
+   Env knobs: `TP PP CTX UTIL SEQS SPEC ENGRAM_OFFLOAD ENGRAM_MODE ENGRAM_WARM EAGER PORT NAME BATCHED EXTRA`
    (`ENGRAM_MODE=mmap` serves the engram tables from the page cache instead of pinned memory,
    `docs/dsv41-engram-mmap.md`; `tools/dsv41/engram_mmap_check.py` checks it against a real shard).
    `SPEC=5` enables DSpark (V4.1 sets n_predict to dspark_block_size=5; values above 5 must be multiples of 5).

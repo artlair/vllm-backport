@@ -40,6 +40,19 @@ class EngramConfig:
     (HBM), "mmap" (host page cache, gathered on the CPU) or "auto", which
     follows `cpu_offload` (True = pinned, False = resident)."""
 
+    # dsv41 engram-warm: boot-time page-cache warmup of the mmap slices. The
+    # page cache starts cold after every boot (the weight stream evicts it)
+    # and a cold row is one NVMe read; with DSpark's rejected drafts hashing
+    # to never-seen n-grams the first benches decayed 10x while pages warmed.
+    # "sync" blocks weight loading until the slices are cached, "async" reads
+    # them in a background thread while the runner profiles and captures.
+    # Ignored unless the resolved table mode is "mmap"; a dummy load (anonymous
+    # tables) skips it with a log line.
+    mmap_warm: Literal["none", "async", "sync"] = "none"
+    """Read each rank's mmap slices of both tables into the page cache after
+    the weights load: "none", "async" (background thread) or "sync" (block
+    until cached). Only meaningful with `table_mode = "mmap"`."""
+
     @property
     def resolved_table_mode(self) -> str:
         """`table_mode` with "auto" folded into the `cpu_offload` choice."""
@@ -71,4 +84,5 @@ class EngramConfig:
 
     def compute_hash(self) -> str:
         """Hash settings that affect embedding execution and graph structure."""
-        return hash_factors(get_hash_factors(self, set()))
+        # dsv41 engram-warm: the warmup changes no computation.
+        return hash_factors(get_hash_factors(self, {"mmap_warm"}))

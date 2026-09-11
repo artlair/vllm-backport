@@ -5,7 +5,10 @@ pinned/UVA mode (same kernel, rows gathered on the host instead of read
 over UVA), survive breakable cudagraph replay as an eager segment, and be
 fed by the safetensors iterator without reading the table."""
 
+import ctypes
 import json
+import mmap
+import os
 import struct
 
 import numpy as np
@@ -267,3 +270,153 @@ def test_engram_mmap_plain_capture_needs_prefetch(monkeypatch):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.all(out == 5.0)  # untouched: the runner's prefetch fills it
+
+
+# ---- dsv41 engram-warm ---------------------------------------------------
+
+WARM_HEAD_SIZES = (250_000,) * 4  # 1M rows: 256 MiB of fp8 + 8 MiB of scales
+
+
+@pytest.fixture(scope="module")
+def big_table_file(tmp_path_factory):
+    """A few hundred MB table so the warm walks several 64 MiB steps."""
+    num_rows = sum(WARM_HEAD_SIZES) + 3
+    gen = torch.Generator().manual_seed(2)
+    # Finite e4m3 bit patterns only (0x7f / 0xff are NaN).
+    weight = torch.randint(0, 0x7F, (num_rows, DIM), dtype=torch.uint8, generator=gen)
+    scales = torch.randint(
+        120, 134, (num_rows, DIM // 32), dtype=torch.uint8, generator=gen
+    )
+    path = tmp_path_factory.mktemp("warm") / "model-00048-of-00048.safetensors"
+    _write_safetensors(
+        path,
+        {
+            WEIGHT_NAME: ("F8_E4M3", tuple(weight.shape), weight.numpy().tobytes()),
+            SCALE_NAME: ("F8_E8M0", tuple(scales.shape), scales.numpy().tobytes()),
+        },
+    )
+    return str(path), weight.view(torch.float8_e4m3fn), scales
+
+
+def _drop_page_cache(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
+def _resident_pages(table) -> tuple[int, int]:
+    """(resident, total) pages of the table's mapping, via mincore(2)."""
+    page = mmap.PAGESIZE
+    addr = table.rows.ctypes.data
+    addr -= addr % page
+    total = -(-table.mapped_bytes // page)
+    vec = (ctypes.c_ubyte * total)()
+    libc = ctypes.CDLL(None, use_errno=True)
+    rc = libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(total * page), vec)
+    assert rc == 0, os.strerror(ctypes.get_errno())
+    return sum(b & 1 for b in vec), total
+
+
+def _attach(layer, path):
+    layer.weight.weight_loader(layer.weight, safetensors_mmap_ref(path, WEIGHT_NAME))
+    layer.weight_scale_inv.weight_loader(
+        layer.weight_scale_inv, safetensors_mmap_ref(path, SCALE_NAME)
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_engram_mmap_warm(big_table_file, mode, monkeypatch):
+    """The warm reads every page of the rank's slices of both tables into
+    the page cache (mincore), in both modes, and the gather afterwards is
+    bit-identical to the unwarmed mmap path and to the pinned path."""
+    path, weight, scales = big_table_file
+    num_rows = weight.shape[0]
+    tp_size, rank = 2, 1  # rank 1: the slice starts mid-file (page slack)
+
+    def make(table_mode):
+        monkeypatch.setattr(
+            engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
+        )
+        monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: rank)
+        with torch.device("cuda"):
+            return ParallelEngramEmbedding(
+                num_rows, DIM, WARM_HEAD_SIZES, table_mode=table_mode
+            )
+
+    # Evict the file before anything maps it (DONTNEED skips mapped pages).
+    _drop_page_cache(path)
+    cold = make("mmap")
+    _attach(cold, path)
+    assert cold.mmap_warm == "none"
+    assert cold.warm_mmap() is None and cold.mmap_warm_stats is None
+
+    warm = make("mmap")
+    _attach(warm, path)
+    warm.mmap_warm = mode
+    tables = [warm._mmap_tables["weight"], warm._mmap_tables["scale"]]
+    expected_bytes = sum(t.mapped_bytes for t in tables)
+    assert expected_bytes >= warm.part_num_embeddings * (DIM + DIM // 32)
+    assert expected_bytes < warm.part_num_embeddings * (DIM + DIM // 32) + 2 * 4096
+    before = sum(_resident_pages(t)[0] for t in tables)
+    thread = warm.warm_mmap()
+    assert thread is not None
+    if mode == "sync":
+        assert not thread.is_alive()
+    else:
+        thread.join(120)
+        assert not thread.is_alive()
+    assert warm.warm_mmap() is thread  # idempotent
+    assert warm.mmap_warm_stats is not None
+    assert warm.mmap_warm_stats["bytes"] == expected_bytes
+    assert warm.mmap_warm_stats["seconds"] > 0
+    resident = [_resident_pages(t) for t in tables]
+    assert all(r == n for r, n in resident), (before, resident)
+    assert before < sum(n for _, n in resident), f"nothing evicted: {before}"
+
+    pinned = make("pinned")
+    pinned.weight.weight_loader(pinned.weight, weight)
+    pinned.weight_scale_inv.weight_loader(
+        pinned.weight_scale_inv, scales.view(torch.float8_e8m0fnu)
+    )
+    num_tokens = 700
+    torch.manual_seed(3)
+    ids = torch.randint(
+        0, num_rows, (num_tokens, len(WARM_HEAD_SIZES)), dtype=torch.int32
+    )
+    ids = ids.cuda()
+    shape = (num_tokens, warm.part_n_hash_cols, DIM)
+    outs = []
+    for layer in (cold, warm, pinned):
+        out = torch.full(shape, 7.0, dtype=torch.bfloat16, device="cuda")
+        layer.lookup(ids, out)
+        torch.cuda.synchronize()
+        outs.append(out)
+    assert torch.equal(outs[0], outs[1]) and torch.equal(outs[1], outs[2])
+    assert torch.count_nonzero(outs[1]) > 0
+    for layer in (cold, warm):  # unmap so the next run can evict the file
+        for table in layer._mmap_tables.values():
+            table.close()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_engram_mmap_warm_skips_anonymous_tables(monkeypatch):
+    """A dummy load has no file to read: the warm is a logged no-op both
+    before and after the anonymous tables materialise."""
+    num_rows = sum(HEAD_SIZES) + 7
+    layer = _make_layer("mmap", num_rows, 1, 0, monkeypatch)
+    layer.mmap_warm = "sync"
+    assert layer.warm_mmap() is None
+    ids = torch.randint(0, num_rows, (3, len(HEAD_SIZES)), dtype=torch.int32).cuda()
+    out = torch.empty((3, len(HEAD_SIZES), DIM), dtype=torch.bfloat16).cuda()
+    layer.lookup(ids, out)
+    torch.cuda.synchronize()
+    assert layer._mmap_tables["weight"].source == "anonymous"
+    assert layer._mmap_tables["weight"].warm() == 0
+    assert layer.warm_mmap() is None and layer.mmap_warm_stats is None
+    pinned = _make_layer("pinned", num_rows, 1, 0, monkeypatch)
+    pinned.mmap_warm = "sync"
+    assert pinned.warm_mmap() is None  # other table modes: nothing to warm

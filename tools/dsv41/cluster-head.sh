@@ -29,6 +29,9 @@
 #   ENGRAM_MODE []  pinned | resident | mmap: --engram-config table_mode
 #              (mmap = tables read from the page cache, nothing pinned;
 #              docs/dsv41-engram-mmap.md); unset keeps ENGRAM_OFFLOAD
+#   ENGRAM_WARM []  none | async | sync: --engram-config mmap_warm, reads
+#              each rank's mmap slices into the page cache after the
+#              weights load (sync blocks, async runs in the background)
 #   MEMLOCK [1]  --ulimit memlock=-1 (pinned tables need it)
 #   NCCLALGO / NCCLPROTO []  unset = NCCL auto
 #   LOADFORMAT [dummy]  dummy | auto (real weights)
@@ -67,6 +70,7 @@ CAPSIZES=${CAPSIZES:-1,2,4,8,12,16,20,24,28,32}
 CAPMAX=${CAPMAX:-${CAPSIZES##*,}}
 ENGRAM_OFFLOAD=${ENGRAM_OFFLOAD:-1}
 ENGRAM_MODE=${ENGRAM_MODE:-}
+ENGRAM_WARM=${ENGRAM_WARM:-}
 LOADFORMAT=${LOADFORMAT:-dummy}
 KVDTYPE=${KVDTYPE:-fp8_ds_mla}
 DSV41_CLUSTER_WAIT=${DSV41_CLUSTER_WAIT:-900}
