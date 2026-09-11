@@ -41,13 +41,18 @@ LOGLEVEL=${LOGLEVEL:-INFO}
 # dsv41 engram-mmap: --engram-config JSON from ENGRAM_OFFLOAD (pinned or
 # resident) and, when set, ENGRAM_MODE (pinned | resident | mmap).
 # dsv41 engram-warm: ENGRAM_WARM (none | async | sync), when set, adds
-# mmap_warm (boot-time page-cache warmup of the mmap slices).
+# mmap_warm (boot-time page-cache warmup of the mmap slices); ENGRAM_DROP
+# (0 | 1), when set, adds drop_weight_pages (unset = drop with mmap tables).
 engram_config_json() {
   local offload=false
   [ "${ENGRAM_OFFLOAD:-1}" = "1" ] && offload=true
   local json="{\"cpu_offload\": $offload"
   [ -n "${ENGRAM_MODE:-}" ] && json="$json, \"table_mode\": \"$ENGRAM_MODE\""
   [ -n "${ENGRAM_WARM:-}" ] && json="$json, \"mmap_warm\": \"$ENGRAM_WARM\""
+  case "${ENGRAM_DROP:-}" in
+    1) json="$json, \"drop_weight_pages\": true" ;;
+    0) json="$json, \"drop_weight_pages\": false" ;;
+  esac
   printf '%s}' "$json"
 }
 

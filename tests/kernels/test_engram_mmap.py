@@ -17,6 +17,7 @@ import torch
 
 from vllm.model_executor.model_loader.weight_utils import (
     SafetensorsMmapRef,
+    WeightPageCacheDropper,
     safetensors_mmap_ref,
     safetensors_weights_iterator,
 )
@@ -298,10 +299,32 @@ def big_table_file(tmp_path_factory):
     return str(path), weight.view(torch.float8_e4m3fn), scales
 
 
+def _make_clean(path: str) -> None:
+    """Rewrite a file the test just wrote through O_DIRECT, so no dirty page
+    of it is left in the page cache: the test container's overlayfs is
+    mounted volatile, where fsync is a no-op and DONTNEED keeps the dirty
+    pages a buffered write leaves behind (eviction then depends on the
+    background writeback timing, which made the warm test flaky)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    size, page = len(data), mmap.PAGESIZE
+    padded = -(-size // page) * page
+    buf = mmap.mmap(-1, padded)  # page aligned, as O_DIRECT requires
+    buf[:size] = data
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_DIRECT)
+    try:
+        written = os.write(fd, memoryview(buf))
+        assert written == padded, (written, padded)
+        os.ftruncate(fd, size)
+    finally:
+        os.close(fd)
+        buf.close()
+
+
 def _drop_page_cache(path: str) -> None:
+    _make_clean(path)
     fd = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(fd)
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     finally:
         os.close(fd)
@@ -376,6 +399,18 @@ def test_engram_mmap_warm(big_table_file, mode, monkeypatch):
     resident = [_resident_pages(t) for t in tables]
     assert all(r == n for r, n in resident), (before, resident)
     assert before < sum(n for _, n in resident), f"nothing evicted: {before}"
+    # The final pass (end of init) is a separate, idempotent thread that
+    # reads the same bytes again and keeps its own stats.
+    assert warm.mmap_warm_final_stats is None
+    final = warm.warm_mmap(final=True)
+    assert final is not None and final is not thread
+    final.join(120)
+    assert not final.is_alive()
+    assert warm.warm_mmap(final=True) is final
+    assert warm.warm_mmap() is thread
+    assert warm.mmap_warm_final_stats is not None
+    assert warm.mmap_warm_final_stats["bytes"] == expected_bytes
+    assert all(_resident_pages(t) == (n, n) for t, (_, n) in zip(tables, resident))
 
     pinned = make("pinned")
     pinned.weight.weight_loader(pinned.weight, weight)
@@ -417,6 +452,102 @@ def test_engram_mmap_warm_skips_anonymous_tables(monkeypatch):
     assert layer._mmap_tables["weight"].source == "anonymous"
     assert layer._mmap_tables["weight"].warm() == 0
     assert layer.warm_mmap() is None and layer.mmap_warm_stats is None
+    assert layer.warm_mmap(final=True) is None
     pinned = _make_layer("pinned", num_rows, 1, 0, monkeypatch)
     pinned.mmap_warm = "sync"
     assert pinned.warm_mmap() is None  # other table modes: nothing to warm
+    assert pinned.warm_mmap(final=True) is None
+
+
+# ---- dsv41 engram-warm: weight page-cache drop ---------------------------
+
+WEIGHT_TENSOR_NAME = "layers.0.attn.wq_a.weight"
+
+
+@pytest.fixture
+def weight_file(tmp_path):
+    """A 64 MiB ordinary weight shard, sorted before the table shard."""
+    path = tmp_path / "model-00001-of-00048.safetensors"
+    blob = torch.ones(32 << 20, dtype=torch.bfloat16).view(torch.uint8).numpy()
+    _write_safetensors(
+        path, {WEIGHT_TENSOR_NAME: ("BF16", (32 << 20,), blob.tobytes())}
+    )
+    return str(path)
+
+
+def _make_clean_and_resident(path: str) -> None:
+    """Clean pages only (see `_make_clean`), then read every byte so the
+    whole file is in the page cache."""
+    _make_clean(path)
+    with open(path, "rb") as f:
+        while f.read(1 << 20):
+            pass
+
+
+def _file_resident_pages(path: str) -> tuple[int, int]:
+    """(resident, total) pages of a file via a throwaway mapping and
+    mincore(2); unmapped again on return so a later DONTNEED can evict."""
+    page = mmap.PAGESIZE
+    total = -(-os.path.getsize(path) // page)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        mapping = mmap.mmap(fd, 0, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+    finally:
+        os.close(fd)
+    try:
+        view = np.frombuffer(mapping, dtype=np.uint8)
+        addr = view.ctypes.data
+        del view  # release the buffer export so the mapping can close
+        vec = (ctypes.c_ubyte * total)()
+        libc = ctypes.CDLL(None, use_errno=True)
+        rc = libc.mincore(ctypes.c_void_p(addr), ctypes.c_size_t(total * page), vec)
+        assert rc == 0, os.strerror(ctypes.get_errno())
+        return sum(b & 1 for b in vec), total
+    finally:
+        mapping.close()
+
+
+def test_weight_page_cache_drop(weight_file, tmp_path):
+    """`WeightPageCacheDropper.drop` evicts every resident page of a clean,
+    unmapped file and reports its size; a missing file is a 0-byte no-op."""
+    _make_clean_and_resident(weight_file)
+    resident, total = _file_resident_pages(weight_file)
+    assert resident == total and total > 16000
+    assert WeightPageCacheDropper.drop(weight_file) == os.path.getsize(weight_file)
+    resident, total = _file_resident_pages(weight_file)
+    assert resident < total // 100, (resident, total)
+    assert WeightPageCacheDropper.drop(str(tmp_path / "missing.safetensors")) == 0
+
+
+def test_weight_page_cache_drop_skips_engram_shard(weight_file, table_file):
+    """Streaming a weight shard and the engram table shard through the
+    iterator drops the weight shard's pages (one file behind, once its
+    tensors are consumed) and never the table shard's; `finish` counts."""
+    table_path = table_file[0]
+    for path in (weight_file, table_path):
+        _make_clean_and_resident(path)
+    dropper = WeightPageCacheDropper()
+    seen = []
+    for name, loaded in safetensors_weights_iterator(
+        [weight_file, table_path],
+        use_tqdm_on_load=False,
+        lazy_mmap_names=is_engram_table_weight,
+        page_cache_drop=dropper,
+    ):
+        seen.append(name)
+        if isinstance(loaded, torch.Tensor):
+            loaded.sum()  # fault the pages in through the private mapping
+        del loaded
+    assert seen[0] == WEIGHT_TENSOR_NAME  # the weight shard sorts first
+    assert set(seen[1:]) == {WEIGHT_NAME, SCALE_NAME, "layers.1.engram.q_weight"}
+    assert dropper.files == {weight_file: False, table_path: True}
+    # The lagged per-file drop ran when the table shard finished.
+    resident, total = _file_resident_pages(weight_file)
+    assert resident < total // 100, (resident, total)
+    resident, total = _file_resident_pages(table_path)
+    assert resident == total, (resident, total)
+    dropper.finish()
+    assert (dropper.dropped_files, dropper.kept_files) == (1, 1)
+    assert dropper.dropped_bytes == os.path.getsize(weight_file)
+    resident, total = _file_resident_pages(table_path)
+    assert resident == total, "engram shard must never be dropped"

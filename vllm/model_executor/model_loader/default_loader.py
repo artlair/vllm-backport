@@ -20,6 +20,7 @@ from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
 from vllm.model_executor.model_loader.weight_utils import (
+    WeightPageCacheDropper,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
@@ -76,6 +77,8 @@ class DefaultModelLoader(BaseModelLoader):
         self.local_expert_ids: set[int] | None = None
         # dsv41 engram-mmap: set per model in load_weights (see there).
         self.lazy_mmap_names: Callable[[str], bool] | None = None
+        # dsv41 engram-warm: set per model in load_weights (see there).
+        self.page_cache_drop: WeightPageCacheDropper | None = None
 
         extra_config = load_config.model_loader_extra_config
         if not isinstance(extra_config, dict):
@@ -298,6 +301,7 @@ class DefaultModelLoader(BaseModelLoader):
                             self.load_config.safetensors_prefetch_block_size
                         ),
                         lazy_mmap_names=self.lazy_mmap_names,
+                        page_cache_drop=self.page_cache_drop,
                     )
         else:
             if extra_config.get("enable_multithread_load"):
@@ -431,6 +435,15 @@ class DefaultModelLoader(BaseModelLoader):
         # in mmap mode); the predicate is consulted by the safetensors
         # iterator before it reads any bytes.
         self.lazy_mmap_names = getattr(model, "lazy_mmap_weight_names", None)
+        # dsv41 engram-warm: a model may ask for the page cache of the shards
+        # it streamed to be dropped once loaded (the engram tables in mmap
+        # mode must not be evicted by pages nothing reads again); shards
+        # holding an mmap slice are kept. Off unless the model asks.
+        self.page_cache_drop = (
+            WeightPageCacheDropper()
+            if getattr(model, "drop_weight_pages", False)
+            else None
+        )
 
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
@@ -439,6 +452,9 @@ class DefaultModelLoader(BaseModelLoader):
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
         )
+        if self.page_cache_drop is not None:
+            # dsv41 engram-warm: every shard's tensors are consumed by now.
+            self.page_cache_drop.finish()
         # We only enable strict check for non-quantized models
         # that have loaded weights tracking by default.
         default_enable_weights_track = (

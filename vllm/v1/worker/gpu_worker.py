@@ -488,6 +488,21 @@ class Worker(WorkerBase):
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
+    # dsv41 engram-warm: the mmap engram page-cache warmup runs from the
+    # worker, not from the model's post-load hook. The executor's collective
+    # RPC returns only once every rank has answered, so the first RPC after
+    # `load_model` (`determine_available_memory`) is the first point where
+    # every rank on the host has finished streaming its weight shards (and
+    # dropped their page cache, `WeightPageCacheDropper`); a warm run inside
+    # one rank's load was evicted by the other ranks' streams. The second
+    # pass at the end of `compile_or_warm_up_model` is cheap when the slices
+    # stayed resident (a resident file reads at memory speed) and repairs
+    # them when something evicted them meanwhile.
+    def _warm_engram_tables(self, final: bool = False) -> None:
+        warm = getattr(self.model_runner.get_model(), "warm_engram_tables", None)
+        if warm is not None:
+            warm(final=final)
+
     def reload_weights(self, *args, **kwargs) -> None:
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
@@ -505,6 +520,8 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        # dsv41 engram-warm: every rank has loaded its weights by now.
+        self._warm_engram_tables()
         maybe_apply_startup_plan(self)
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
@@ -915,6 +932,9 @@ class Worker(WorkerBase):
         # Startup is done; steady-state serving gets no benefit from torch
         # intra-op parallelism.
         set_torch_threads_for_runtime()
+
+        # dsv41 engram-warm: second pass over the mmap slices, see above.
+        self._warm_engram_tables(final=True)
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

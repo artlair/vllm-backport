@@ -53,12 +53,33 @@ class EngramConfig:
     the weights load: "none", "async" (background thread) or "sync" (block
     until cached). Only meaningful with `table_mode = "mmap"`."""
 
+    # dsv41 engram-warm: the weight stream leaves the shard pages it read in
+    # the page cache (~110 GiB per x299 host) although nothing reads them
+    # again (the weights are in VRAM); they compete with the mmap tables for
+    # the cache and evicted a freshly warmed table on x299 (45% resident
+    # after boot). When on, the safetensors loader drops the page cache of
+    # every shard it streamed (posix_fadvise DONTNEED) once the weights are
+    # loaded, never a shard holding an mmap engram slice. None follows the
+    # table mode: on for "mmap", off otherwise, so other models are untouched.
+    drop_weight_pages: bool | None = None
+    """Drop the page cache of the streamed weight shards after loading
+    (never the shards backing mmap engram slices): True, False, or None
+    (True with `table_mode = "mmap"`, False otherwise)."""
+
     @property
     def resolved_table_mode(self) -> str:
         """`table_mode` with "auto" folded into the `cpu_offload` choice."""
         if self.table_mode == "auto":
             return "pinned" if self.cpu_offload else "resident"
         return self.table_mode
+
+    @property
+    def resolved_drop_weight_pages(self) -> bool:
+        """dsv41 engram-warm: `drop_weight_pages` with None folded into the
+        table mode (drop with "mmap" tables, keep otherwise)."""
+        if self.drop_weight_pages is None:
+            return self.resolved_table_mode == "mmap"
+        return self.drop_weight_pages
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
         """Reject Engram configuration for models without n-gram embeddings."""
@@ -84,5 +105,6 @@ class EngramConfig:
 
     def compute_hash(self) -> str:
         """Hash settings that affect embedding execution and graph structure."""
-        # dsv41 engram-warm: the warmup changes no computation.
-        return hash_factors(get_hash_factors(self, {"mmap_warm"}))
+        # dsv41 engram-warm: the warmup and the page-cache drop change no
+        # computation.
+        return hash_factors(get_hash_factors(self, {"mmap_warm", "drop_weight_pages"}))

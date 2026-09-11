@@ -150,6 +150,12 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         self._engram_table_mmap = (
             engram_config is not None and engram_config.resolved_table_mode == "mmap"
         )
+        # dsv41 engram-warm: read by the default loader; drop the streamed
+        # weight shards from the page cache after loading (default: with
+        # mmap tables), see `WeightPageCacheDropper`.
+        self.drop_weight_pages = (
+            engram_config is not None and engram_config.resolved_drop_weight_pages
+        )
 
         # The tower is always built; _mark_tower_model stubs it out
         # (StageMissingLayer, weights skipped) when the image limit is 0.
@@ -358,6 +364,10 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
 
     def set_engram_full_graph_prefetch(self, enabled: bool) -> bool:
         return self.language_model.model.set_engram_full_graph_prefetch(enabled)
+
+    def warm_engram_tables(self, final: bool = False) -> None:
+        """dsv41 engram-warm: see `DeepseekV41LLMForCausalLM.warm_engram_tables`."""
+        self.language_model.warm_engram_tables(final)
 
     def lazy_mmap_weight_names(self, name: str) -> bool:
         """dsv41 engram-mmap: checkpoint tensors the safetensors iterator

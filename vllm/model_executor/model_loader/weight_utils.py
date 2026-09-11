@@ -877,6 +877,77 @@ class SafetensorsMmapRef:
         return self.data_end - self.data_begin
 
 
+class WeightPageCacheDropper:
+    """dsv41 engram-warm: drops the page cache of the safetensors shards the
+    iterator streamed once their tensors are consumed (`posix_fadvise
+    DONTNEED`: advisory, clean and unmapped pages only, so it can never
+    corrupt a read), so the weight pages a host streams at boot do not
+    evict the mmap engram tables. A shard a lazy `SafetensorsMmapRef` was
+    yielded from (it holds an mmap engram slice) is never dropped: this or
+    another rank on the host serves rows from it.
+
+    `file_done` runs one shard behind the stream: `safe_open` hands out
+    views of a private mapping of the whole shard and the consumer still
+    holds the previous yield when the iterator moves on, and DONTNEED skips
+    mapped pages. `finish` drops every recorded shard again once the
+    model's `load_weights` returned; that is the pass that matters when the
+    model materialises the whole stream before loading (the V4.1 VL
+    wrapper sorts the names first), and it logs the count.
+    """
+
+    def __init__(self) -> None:
+        self.files: dict[str, bool] = {}  # path -> holds an mmap engram slice
+        self._pending: str | None = None
+        self.dropped_files = 0
+        self.dropped_bytes = 0
+        self.kept_files = 0
+
+    @staticmethod
+    def drop(path: str) -> int:
+        """DONTNEED the whole file; returns its size, 0 when unsupported or
+        the file could not be opened."""
+        if not hasattr(os, "posix_fadvise"):
+            return 0
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return 0
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            return os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+
+    def file_done(self, path: str, keep: bool) -> None:
+        """The iterator finished `path` (`keep`: an mmap engram slice lives
+        in it). Drops the shard before it, whose tensors are consumed."""
+        self.files[path] = self.files.get(path, False) or keep
+        previous = self._pending
+        if previous is not None and previous != path and not self.files[previous]:
+            self.drop(previous)
+        self._pending = path
+
+    def finish(self) -> None:
+        """After the model consumed the stream: drop every shard once more
+        (cheap when already gone) and log what was dropped and kept."""
+        self._pending = None
+        self.dropped_files = self.dropped_bytes = self.kept_files = 0
+        for path, keep in self.files.items():
+            if keep:
+                self.kept_files += 1
+                continue
+            self.dropped_bytes += self.drop(path)
+            self.dropped_files += 1
+        logger.info(
+            "Dropped the page cache of %d safetensors shard(s) (%.2f GiB) "
+            "after loading the weights (POSIX_FADV_DONTNEED); kept %d "
+            "shard(s) backing mmap engram slices",
+            self.dropped_files,
+            self.dropped_bytes / 1024**3,
+            self.kept_files,
+        )
+
+
 def read_safetensors_header(path: str) -> tuple[dict[str, Any], int]:
     """dsv41 engram-mmap: parse a safetensors file header without safe_open.
 
@@ -917,6 +988,7 @@ def safetensors_weights_iterator(
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
     lazy_mmap_names: Callable[[str], bool] | None = None,
+    page_cache_drop: WeightPageCacheDropper | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -928,6 +1000,11 @@ def safetensors_weights_iterator(
     yielded as `SafetensorsMmapRef` (header metadata only, no bytes read);
     their weight loaders memory-map the slice they need. Only the default
     (non-prefetch, non-multithread, non-torchao) path honours it.
+
+    dsv41 engram-warm: *page_cache_drop*, when given, is told after each
+    file (same path only) whether an mmap ref was yielded from it, and
+    drops the page cache of the files that hold none; see
+    `WeightPageCacheDropper`.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -1043,16 +1120,22 @@ def safetensors_weights_iterator(
                 )
             yield from unflattened_state_dict.items()
         else:
+            holds_mmap_ref = False
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
                         continue
                     if lazy_mmap_names is not None and lazy_mmap_names(name):
                         # dsv41 engram-mmap: metadata only, never the bytes.
+                        holds_mmap_ref = True
                         yield name, safetensors_mmap_ref(st_file, name)
                         continue
                     param = f.get_tensor(name)
                     yield name, param
+            if page_cache_drop is not None:
+                # dsv41 engram-warm: the mapping is closed; the consumer may
+                # still hold the last yield, so the dropper lags one file.
+                page_cache_drop.file_done(st_file, keep=holds_mmap_ref)
 
 
 def multi_thread_safetensors_weights_iterator(

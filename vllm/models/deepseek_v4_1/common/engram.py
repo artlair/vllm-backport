@@ -851,6 +851,9 @@ class ParallelEngramEmbedding(nn.Module):
     mmap_warm: str = "none"
     mmap_warm_stats: dict[str, float] | None = None
     _mmap_warm_thread: threading.Thread | None = None
+    # dsv41 engram-warm: the second pass (`warm_mmap(final=True)`).
+    mmap_warm_final_stats: dict[str, float] | None = None
+    _mmap_warm_final_thread: threading.Thread | None = None
     # dsv41 engram-mmap: set by the V2 runner when it stages the rows itself
     # before every FULL cudagraph replay (`DeepseekV4Model.engram_prefetch`);
     # a lookup met inside a plain (non-breakable) capture is then a no-op
@@ -1002,31 +1005,40 @@ class ParallelEngramEmbedding(nn.Module):
             self.vocab_end_idx,
         )
 
-    def warm_mmap(self) -> threading.Thread | None:
+    def warm_mmap(self, final: bool = False) -> threading.Thread | None:
         """dsv41 engram-warm: read this rank's mapped slices of both tables
         into the page cache per `mmap_warm` ("sync" joins the thread here,
-        "async" returns it running). Called once the weights are loaded so
-        the reads do not compete with the weight stream; a second call is a
-        no-op. Returns None when there is nothing to do (mode "none", another
-        table mode, or anonymous dummy tables).
+        "async" returns it running). Called by the worker once every rank
+        has loaded its weights, so the reads do not compete with any weight
+        stream; a second call of the same pass is a no-op. `final=True`
+        is the second pass at the end of init: it waits for the first pass
+        and reads the slices again (at memory speed when they stayed
+        resident, from disk where they were evicted; the logged rate tells).
+        Returns None when there is nothing to do (mode "none", another table
+        mode, or anonymous dummy tables).
         """
         if self.mmap_warm == "none" or self.table_mode != "mmap":
             return None
-        if self._mmap_warm_thread is not None:
-            return self._mmap_warm_thread
         assert self.mmap_warm in ("async", "sync"), self.mmap_warm
+        if final and self._mmap_warm_final_thread is not None:
+            return self._mmap_warm_final_thread
+        if not final and self._mmap_warm_thread is not None:
+            return self._mmap_warm_thread
         tables = [self._mmap_tables.get(kind) for kind in ("weight", "scale")]
         if any(t is None or t.path is None for t in tables):
-            logger.info(
-                "Engram mmap warm (%s) skipped: tables not mapped from a file "
-                "(dummy load, anonymous tables)",
-                self.mmap_warm,
-            )
+            if not final:
+                logger.info(
+                    "Engram mmap warm (%s) skipped: tables not mapped from a "
+                    "file (dummy load, anonymous tables)",
+                    self.mmap_warm,
+                )
             return None
+        first = self._mmap_warm_thread if final else None
+        label = f"{self.mmap_warm}, final pass" if final else self.mmap_warm
         total = sum(t.mapped_bytes for t in tables)  # type: ignore[union-attr]
         logger.info(
             "Engram mmap warm (%s) started: %d bytes (%.2f GiB, rows %d..%d of %s)",
-            self.mmap_warm,
+            label,
             total,
             total / 1024**3,
             self.vocab_start_idx,
@@ -1035,6 +1047,8 @@ class ParallelEngramEmbedding(nn.Module):
         )
 
         def run() -> None:
+            if first is not None:
+                first.join()
             t0 = time.perf_counter()
             scratch = bytearray(_MMAP_WARM_CHUNK)
             done = 0
@@ -1046,17 +1060,29 @@ class ParallelEngramEmbedding(nn.Module):
                     "Engram mmap warm failed after %d of %d bytes", done, total
                 )
             elapsed = time.perf_counter() - t0
-            self.mmap_warm_stats = {"bytes": done, "seconds": elapsed}
+            stats = {"bytes": done, "seconds": elapsed}
+            if final:
+                self.mmap_warm_final_stats = stats
+            else:
+                self.mmap_warm_stats = stats
             logger.info(
-                "Engram mmap warm done: %d bytes (%.2f GiB) in %.1f s (%.2f GB/s)",
+                "Engram mmap warm%s done: %d bytes (%.2f GiB) in %.1f s (%.2f GB/s)",
+                " (final pass)" if final else "",
                 done,
                 done / 1024**3,
                 elapsed,
                 done / 1e9 / max(elapsed, 1e-9),
             )
 
-        thread = threading.Thread(target=run, name="engram-warm", daemon=True)
-        self._mmap_warm_thread = thread
+        thread = threading.Thread(
+            target=run,
+            name="engram-warm-final" if final else "engram-warm",
+            daemon=True,
+        )
+        if final:
+            self._mmap_warm_final_thread = thread
+        else:
+            self._mmap_warm_thread = thread
         thread.start()
         if self.mmap_warm == "sync":
             thread.join()

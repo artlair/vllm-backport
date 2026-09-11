@@ -104,21 +104,75 @@ at 270 tok/s. x299 now has 256 GB with the VMs stopped, so both tables
 with room to spare.
 
 `mmap_warm` (default `"none"`) reads each rank's mapped slices of *both*
-tables (weight and scales, sequentially) into the page cache once the
-weights are loaded (`DeepseekV4ForCausalLM.process_weights_after_loading`,
-i.e. after `load_weights`, so the reads do not compete with the weight
-stream): `ParallelEngramEmbedding.warm_mmap` starts one thread per engram
-layer on the rank, `EngramMmapTable.warm` walks the slice in 64 MiB steps
-with `madvise(MADV_WILLNEED)` one step ahead and `preadv` of the current
-step into a single scratch buffer (readahead-friendly, paced by the disk,
-`preadv` releases the GIL; `mmap.madvise` holds it, hence per step rather
-than over the whole slice). No copy of the table is kept: only the page
-cache fills. `"sync"` blocks until the slices are cached, `"async"`
-returns at once and logs completion later; each rank logs one line at
-start and one at the end with bytes and seconds. Only ranks holding an
-engram layer do anything; a dummy load (anonymous tables) skips with a
-log line. The cold-miss gather path is untouched. Harness: `ENGRAM_WARM`
-in `boot.sh` / `cluster-head.sh`.
+tables (weight and scales, sequentially) into the page cache once
+**every** rank has loaded its weights: `ParallelEngramEmbedding.warm_mmap`
+starts one thread per engram layer on the rank, `EngramMmapTable.warm`
+walks the slice in 64 MiB steps with `madvise(MADV_WILLNEED)` one step
+ahead and `preadv` of the current step into a single scratch buffer
+(readahead-friendly, paced by the disk, `preadv` releases the GIL;
+`mmap.madvise` holds it, hence per step rather than over the whole slice).
+No copy of the table is kept: only the page cache fills. `"sync"` blocks
+until the slices are cached, `"async"` returns at once and logs completion
+later; each rank logs one line at start and one at the end with bytes and
+seconds. Only ranks holding an engram layer do anything; a dummy load
+(anonymous tables) skips with a log line. The cold-miss gather path is
+untouched. Harness: `ENGRAM_WARM` in `boot.sh` / `cluster-head.sh`.
+
+### Where the warm runs (and why not in the model's post-load hook)
+
+The first version warmed from
+`DeepseekV41LLMForCausalLM.process_weights_after_loading`
+(right after this rank's `load_weights`). On x299 that reported "done" on
+every rank and left ~45% of each table resident: the other ranks on the
+host were still streaming ~110 GiB of weight shards through the page
+cache during and after the warm, and those pages (useless once the weights
+are in VRAM) evicted the warmed ones. Two changes fix it:
+
+* **The warm moved to the worker** (`Worker._warm_engram_tables` in
+  `v1/worker/gpu_worker.py`, calling `model.warm_engram_tables`). The
+  executor's collective RPC returns only when every rank has answered, so
+  the first RPC after `load_model`, `determine_available_memory`, is the
+  first point where every rank on the host is done streaming; the warm
+  starts there (before the profile run; `"sync"` blocks it, `"async"`
+  overlaps the profile run, KV allocation and graph capture). A **second
+  pass** runs at the end of `compile_or_warm_up_model` (`final=True`,
+  logged as `Engram mmap warm (<mode>, final pass)`, own thread and stats,
+  waits for the first): it reads the same bytes again, which costs a few
+  seconds at memory speed when the slices stayed resident and re-reads
+  from disk whatever got evicted meanwhile. The logged GB/s of the final
+  pass is the residency check (memory speed = resident).
+  `process_weights_after_loading` no longer warms.
+* **The weight shards are dropped from the page cache**
+  (`engram_config.drop_weight_pages`, `None` = on with `table_mode =
+  "mmap"`, off otherwise, so other models are untouched; `ENGRAM_DROP=0|1`
+  in the harness). `WeightPageCacheDropper` in
+  `model_loader/weight_utils.py`, wired by `DefaultModelLoader.load_weights`
+  when the model exposes `drop_weight_pages` (the V4.1 VL wrapper does):
+  the safetensors iterator tells it after each shard whether an mmap
+  `SafetensorsMmapRef` was yielded from it, and it `posix_fadvise(fd, 0,
+  0, POSIX_FADV_DONTNEED)`s every shard that holds none, one shard behind
+  the stream (`safe_open` hands out views of a private mapping of the
+  whole shard and the consumer still holds the previous yield when the
+  iterator moves on; DONTNEED skips mapped pages, so an early drop would
+  be a no-op), then once more over every shard after the model's
+  `load_weights` returned (`finish`). That last pass is the one that
+  counts for the VL wrapper, which sorts the whole stream before loading
+  (every shard stays mapped until then). Shards holding an mmap engram
+  slice (`model-0004{7,8}`) are never dropped, whether or not this rank
+  maps them: another rank on the host does. DONTNEED is advisory and only
+  discards clean, unmapped pages, so it cannot affect correctness; the
+  cost is that a sibling TP rank lagging on the same shard re-reads the
+  tail from disk. One log line per rank:
+  `Dropped the page cache of N safetensors shard(s) (X GiB) after loading
+  the weights (POSIX_FADV_DONTNEED); kept K shard(s) backing mmap engram
+  slices`.
+
+Expected picture on x299 after a boot (256 GB, both tables 2 x 94.6 GiB
+plus 2 x 2.9 GiB of scales): `fincore` on `model-00047` and `model-00048`
+shows both fully resident (every rank's quarter, warmed after the drops,
+re-read at memory speed by the final pass), the other 46 shards show ~0
+resident pages, and `buff/cache` sits at ~195 GiB plus the KV/CUDA host
+buffers instead of the weight shards competing for it.
 
 Expected time: a quarter of the weight table (23.6 GiB) plus its scales
 (0.74 GiB) is ~26 GB per rank, ~13 s at ~2 GB/s sequential; the four TP
@@ -182,13 +236,15 @@ spend anyway, not added latency, but the GPU idles during the gather.
 
 * **Page-cache pressure.** The hot rows must stay cached; the kernel
   evicts them like any file page. With 128 GB the two tables (2 x 97 GiB)
-  do not fit x299's page cache, one does barely; with 256 GB both fit and
-  `mmap_warm` preloads them. Weight loading streams the other 200 GB of
-  shards through the cache first, so without the warmup the tables start
-  cold after every boot. Real text hashes are Zipfian,
+  do not fit x299's page cache, one does barely; with 256 GB both fit only
+  if the weight shards' pages are gone: `drop_weight_pages` evicts them
+  after the load and `mmap_warm` (run once every rank has loaded, plus
+  the final pass) preloads the tables. Without both, the tables start
+  cold or half-evicted after every boot. Real text hashes are Zipfian,
   so the steady-state working set is far smaller than the table, but it
-  is unmeasured. Watch `buff/cache` and the `engram mmap gather` debug
-  stats (`VLLM_LOGGING_LEVEL=DEBUG`, every 500 calls).
+  is unmeasured. Watch `buff/cache`, `fincore` on the two table shards,
+  and the `engram mmap gather` debug stats (`VLLM_LOGGING_LEVEL=DEBUG`,
+  every 500 calls).
 * **First-request / cold latency.** A fully cold 4096-token prefill chunk
   costs ~1-1.4 s per engram layer on x299's NVMe (both layers on the same
   stage: double). A cold decode step is ~200 us per missing row on the

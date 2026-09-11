@@ -14,6 +14,9 @@
 # pinned (docs/dsv41-engram-mmap.md).
 # ENGRAM_WARM (unset | none | async | sync): engram_config.mmap_warm, the
 # boot-time page-cache warmup of the mmap slices (dsv41 engram-warm).
+# ENGRAM_DROP (unset | 0 | 1): engram_config.drop_weight_pages, drop the
+# streamed weight shards from the page cache after loading (unset = with
+# mmap tables only).
 # OVERLAY=1 mounts the repo (SRC_DIR, default the worktree containing this
 # script) at /src and runs the image's compiled ops with the worktree's python:
 # /src/vllm is copied to /work/vllm, every build-only file of the installed
@@ -66,13 +69,18 @@ usage() { sed -n '2,18p' "$0"; exit 1; }
 
 # dsv41 engram-mmap: ENGRAM_OFFLOAD picks pinned/resident; ENGRAM_MODE, when
 # set, adds table_mode (mmap needs the real checkpoint or a dummy load).
-# dsv41 engram-warm: ENGRAM_WARM, when set, adds mmap_warm.
+# dsv41 engram-warm: ENGRAM_WARM, when set, adds mmap_warm; ENGRAM_DROP
+# (0 | 1), when set, adds drop_weight_pages.
 engram_config_json() {
   local offload=false
   [ "$ENGRAM_OFFLOAD" = "1" ] && offload=true
   local json="{\"cpu_offload\": $offload"
   [ -n "$ENGRAM_MODE" ] && json="$json, \"table_mode\": \"$ENGRAM_MODE\""
   [ -n "$ENGRAM_WARM" ] && json="$json, \"mmap_warm\": \"$ENGRAM_WARM\""
+  case "${ENGRAM_DROP:-}" in
+    1) json="$json, \"drop_weight_pages\": true" ;;
+    0) json="$json, \"drop_weight_pages\": false" ;;
+  esac
   printf '%s}' "$json"
 }
 

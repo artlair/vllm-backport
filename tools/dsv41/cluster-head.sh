@@ -30,8 +30,11 @@
 #              (mmap = tables read from the page cache, nothing pinned;
 #              docs/dsv41-engram-mmap.md); unset keeps ENGRAM_OFFLOAD
 #   ENGRAM_WARM []  none | async | sync: --engram-config mmap_warm, reads
-#              each rank's mmap slices into the page cache after the
-#              weights load (sync blocks, async runs in the background)
+#              each rank's mmap slices into the page cache once every
+#              rank has loaded (sync blocks, async runs in the background)
+#   ENGRAM_DROP []  0 | 1: --engram-config drop_weight_pages, drop the
+#              streamed weight shards from the page cache after loading
+#              (unset = on with mmap tables)
 #   MEMLOCK [1]  --ulimit memlock=-1 (pinned tables need it)
 #   NCCLALGO / NCCLPROTO []  unset = NCCL auto
 #   LOADFORMAT [dummy]  dummy | auto (real weights)
