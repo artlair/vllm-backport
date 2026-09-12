@@ -614,6 +614,7 @@ class OffloadingSpec(ABC):
         )
 
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
+        self.group_offloaded = tuple(group.offloaded for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash
         self.blocks_per_chunk = config.cache.blocks_per_chunk
 

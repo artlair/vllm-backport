@@ -104,6 +104,11 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # False for a positional placeholder of a KV group that never takes part
+    # in prefix caching (OffloadingGroupConfig.offloaded). Every per-group
+    # store/load/lookup/touch path skips it but still emits its zero-sized
+    # slot so group_sizes/block_indices stay aligned with kv_cache_groups.
+    offloaded: bool = True
 
 
 def get_sliding_window_size_in_chunks(
@@ -190,7 +195,12 @@ class SchedulerOffloadConfig(NamedTuple):
         # each segment can never serve a load hit. Relevant for hybrid
         # architectures like DeepSeek V4 (MLA + SWA groups).
         full_attn_tokens_per_chunk: set[int] = set()
+        group_offloaded = getattr(
+            spec, "group_offloaded", (True,) * len(spec.tokens_per_block)
+        )
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
+            if not group_offloaded[idx]:
+                continue
             kv_spec = kv_cache_config.kv_cache_groups[idx].kv_cache_spec
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
@@ -242,6 +252,24 @@ class SchedulerOffloadConfig(NamedTuple):
         for idx, tokens_per_block in enumerate(spec.tokens_per_block):
             kv_cache_group = kv_cache_config.kv_cache_groups[idx]
             kv_spec = kv_cache_group.kv_cache_spec
+            if not group_offloaded[idx]:
+                kv_group_configs_list.append(
+                    GroupOffloadConfig(
+                        group_idx=idx,
+                        tokens_per_block=tokens_per_block,
+                        tokens_per_chunk=tokens_per_block * spec.blocks_per_chunk,
+                        hashes_per_chunk=(
+                            (tokens_per_block * spec.blocks_per_chunk)
+                            // spec.tokens_per_hash
+                        ),
+                        kv_event_group_spec=get_offloading_event_group_spec(
+                            kv_cache_group
+                        ),
+                        sliding_window_size_in_chunks=None,
+                        offloaded=False,
+                    )
+                )
+                continue
             sw = get_sliding_window_size_in_chunks(
                 kv_spec, tokens_per_block * spec.blocks_per_chunk
             )
@@ -267,7 +295,9 @@ class SchedulerOffloadConfig(NamedTuple):
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
-        group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
+        group_block_sizes = {
+            config.tokens_per_block for config in kv_group_configs if config.offloaded
+        }
         has_partial_recurrent_group = any(
             config.requires_cow_source
             and config.tokens_per_block > spec.tokens_per_hash
@@ -360,6 +390,8 @@ class RequestOffloadState:
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):
+            if not group_config.offloaded:
+                continue
             for req_block_hash in islice(
                 self.req.block_hashes,
                 group_config.hashes_per_chunk * len(group_state.offload_keys)
@@ -507,6 +539,8 @@ class OffloadingConnectorScheduler:
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
         for group_config in self.config.kv_group_configs:
+            if not group_config.offloaded:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 full_attention_groups.append(group_config.group_idx)
             else:
@@ -535,6 +569,12 @@ class OffloadingConnectorScheduler:
             config.group_idx
             for config in self.config.kv_group_configs
             if config.requires_cow_source
+        )
+        # Groups that actually take part in offloading (see
+        # GroupOffloadConfig.offloaded); group_idx stays the kv_cache_groups
+        # position for block-table and worker-slot indexing.
+        self._offloaded_group_configs: tuple[GroupOffloadConfig, ...] = tuple(
+            config for config in self.config.kv_group_configs if config.offloaded
         )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
@@ -677,6 +717,8 @@ class OffloadingConnectorScheduler:
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
+            if not group_config.offloaded:
+                continue
             if group_config.sliding_window_size_in_chunks is None:
                 self.manager.touch(group_state.offload_keys, req_status.req_context)
             else:
@@ -700,6 +742,7 @@ class OffloadingConnectorScheduler:
                         req_status.partial_tail_boundary,
                     )
                     for group in self.config.kv_group_configs
+                    if group.offloaded
                 ),
                 req_status.req_context,
             )
@@ -847,6 +890,8 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if not group_config.offloaded:
+                    continue
                 tokens_per_chunk = group_config.tokens_per_chunk
                 sliding_window_size_in_chunks = (
                     group_config.sliding_window_size_in_chunks
@@ -904,7 +949,7 @@ class OffloadingConnectorScheduler:
             boundary_pending = False
             boundary_missed = False
             boundary_keys = []
-            for group_config in self.config.kv_group_configs:
+            for group_config in self._offloaded_group_configs:
                 key = self._make_boundary_key(
                     req_status.req, group_config.group_idx, boundary
                 )
@@ -919,7 +964,7 @@ class OffloadingConnectorScheduler:
             pending |= boundary_pending
             if not boundary_missed and not boundary_pending:
                 for group_config, key in zip(
-                    self.config.kv_group_configs, boundary_keys
+                    self._offloaded_group_configs, boundary_keys
                 ):
                     self._events_tracker.record_partial_lookup(
                         req_status.req, group_config, boundary, key
@@ -1043,6 +1088,10 @@ class OffloadingConnectorScheduler:
             self._current_batch_allocated_block_ids.update(
                 block.block_id for block in group_blocks if block.block_id != 0
             )
+            if not group_config.offloaded:
+                group_sizes.append(0)
+                block_indices.append(0)
+                continue
 
             tokens_per_block = group_config.tokens_per_block
             tokens_per_chunk = group_config.tokens_per_chunk
@@ -1208,21 +1257,22 @@ class OffloadingConnectorScheduler:
 
             assert boundary % self._partial_tail_block_size != 0
             block_idx = boundary // self._partial_tail_block_size
+            active_groups = self._offloaded_group_configs
             if any(
                 group.group_idx not in self._cow_source_groups
                 and block_idx >= len(req_status.group_states[group.group_idx].block_ids)
-                for group in self.config.kv_group_configs
+                for group in active_groups
             ):
                 continue
             keys = [
                 self._make_boundary_key(req, group.group_idx, boundary)
-                for group in self.config.kv_group_configs
+                for group in active_groups
             ]
             block_ids = [
                 cow_blocks[group.group_idx]
                 if group.group_idx in self._cow_source_groups
                 else req_status.group_states[group.group_idx].block_ids[block_idx]
-                for group in self.config.kv_group_configs
+                for group in active_groups
             ]
             assert all(block_id != 0 for block_id in block_ids)
 
@@ -1235,20 +1285,22 @@ class OffloadingConnectorScheduler:
             if not store_output.keys_to_store:
                 continue
 
-            for group_config, key in zip(self.config.kv_group_configs, keys):
+            for group_config, key in zip(active_groups, keys):
                 if key in store_output.keys_to_store:
                     self._events_tracker.record_partial_store(
                         req, group_config, boundary, key
                     )
 
+            # Positions into `keys`/`block_ids` (active groups only); the
+            # worker slots below are indexed by the kv_cache_groups position.
             group_by_key = {key: idx for idx, key in enumerate(keys)}
-            accepted_groups = [group_by_key[key] for key in store_output.keys_to_store]
+            accepted = [group_by_key[key] for key in store_output.keys_to_store]
             group_sizes = [0] * len(self.config.kv_group_configs)
             block_indices = [0] * len(self.config.kv_group_configs)
-            for group_idx in accepted_groups:
-                group_sizes[group_idx] = 1
-                block_indices[group_idx] = block_idx
-            source_blocks = [block_ids[group_idx] for group_idx in accepted_groups]
+            for pos in accepted:
+                group_sizes[active_groups[pos].group_idx] = 1
+                block_indices[active_groups[pos].group_idx] = block_idx
+            source_blocks = [block_ids[pos] for pos in accepted]
 
             job_id = self._generate_job_id()
             req_status.transfer_jobs.add(job_id)
@@ -1306,6 +1358,8 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if not group_config.offloaded:
+                    continue
                 num_chunks = req_status.storable_chunks(
                     group_config, group_state, num_offloadable_tokens
                 )
@@ -1377,6 +1431,10 @@ class OffloadingConnectorScheduler:
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
+                if not group_config.offloaded:
+                    group_sizes.append(0)
+                    block_indices.append(0)
+                    continue
                 is_sliding_window = (
                     group_config.sliding_window_size_in_chunks is not None
                 )

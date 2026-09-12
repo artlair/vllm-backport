@@ -14,6 +14,13 @@ class OffloadingGroupConfig:
     tokens_per_block: int
     # Layer names belonging to this group.
     layer_names: tuple[str, ...]
+    # False for KV groups that never take part in prefix caching (e.g. the
+    # GLM-5.3 kpool indexer tail: one per-request circular scratch block that
+    # is neither hashed nor shareable). The group keeps its positional slot so
+    # per-group block lists stay aligned with kv_cache_groups, but the
+    # connector never stores, loads, touches or looks it up; the recomputed
+    # suffix after an aligned hit regenerates it, exactly as for a local hit.
+    offloaded: bool = True
 
 
 @dataclass(frozen=True)

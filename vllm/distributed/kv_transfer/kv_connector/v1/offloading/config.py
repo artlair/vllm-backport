@@ -58,6 +58,7 @@ def build_offloading_config(
     engine_id = kv_transfer_config.engine_id
 
     parallel_config = vllm_config.parallel_config
+    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
     groups = tuple(
         OffloadingGroupConfig(
             tokens_per_block=(
@@ -70,11 +71,20 @@ def build_offloading_config(
             ),
             layer_names=tuple(group.layer_names),
         )
+        if group.kv_cache_spec.participates_in_prefix_caching
+        # Inert positional placeholder (see OffloadingGroupConfig.offloaded):
+        # a hash-sized block so chunk arithmetic stays sane, no layers.
+        else OffloadingGroupConfig(
+            tokens_per_block=tokens_per_hash,
+            layer_names=(),
+            offloaded=False,
+        )
         for group in kv_cache_config.kv_cache_groups
     )
 
-    _, tokens_per_hash = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
     for group in groups:
+        if not group.offloaded:
+            continue
         assert group.tokens_per_block % tokens_per_hash == 0, (
             f"tokens_per_block={group.tokens_per_block} not divisible by "
             f"tokens_per_hash={tokens_per_hash}. "
@@ -101,7 +111,9 @@ def build_offloading_config(
     elif tokens_per_chunk is not None:
         tokens_per_chunk_int = int(tokens_per_chunk)
 
-        unique_tokens_per_block = {group.tokens_per_block for group in groups}
+        unique_tokens_per_block = {
+            group.tokens_per_block for group in groups if group.offloaded
+        }
 
         assert len(unique_tokens_per_block) == 1, (
             "If 'block_size' is specified in kv_connector_extra_config, "
