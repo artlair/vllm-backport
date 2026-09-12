@@ -260,9 +260,16 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
         if is_quantized_kv_cache(self.kv_cache_dtype):
             raise NotImplementedError("FP8 kv is not supported with XPU MLA Sparse yet")
 
-        # Concatenate q if it's a tuple (ql_nope, q_pe)
+        # Concatenate q if it's a tuple (ql_nope, q_pe). A NoPE model
+        # (qk_rope_head_dim == 0, GLM-5.3-Flash) hands a zero-width q_pe;
+        # torch.cat with it still takes the slow CatArrayBatchedCopy path, so
+        # use the token-major ql_nope directly (upstream #55736).
         if isinstance(q, tuple):
-            q = torch.cat(q, dim=-1)
+            ql_nope, q_pe = q
+            if q_pe.shape[-1] == 0 and ql_nope.is_contiguous():
+                q = ql_nope
+            else:
+                q = torch.cat(q, dim=-1)
 
         num_actual_toks = q.shape[0]
 

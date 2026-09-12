@@ -116,8 +116,19 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
+            # The divisor is the MAMBA group's block size, not the attention /
+            # CLI block size: on hybrids they can differ, and a resume over a
+            # cached prefix would then seed an out-of-range block_table column
+            # (wtdcode/vllm-backport#63, vllm#53142). ``_mamba_spec`` is
+            # populated by the first batch's preprocess; fresh requests seed
+            # from num_computed_tokens=0 either way, so the fallback is safe.
+            mamba_bs = (
+                self._mamba_spec.block_size
+                if self._mamba_spec is not None
+                else self.cache_config.block_size
+            )
             self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self.cache_config.block_size
+                (new_req_data.num_computed_tokens - 1) // mamba_bs
             )
 
     def _get_mamba_group_info(
