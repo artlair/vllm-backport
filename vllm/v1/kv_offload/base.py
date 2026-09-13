@@ -235,6 +235,21 @@ class OffloadingManager(ABC):
         """Release pins taken by reserve_hits()."""
         return
 
+    def observe_request(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """
+        Called once per request with every offload key of its prompt, before
+        any lookup. Lets a manager track reuse across requests independently
+        of lookup(), whose prefix scan stops at the first miss and so never
+        sees the keys behind it.
+
+        Args:
+            keys: all offloadable keys of the request (all groups).
+            req_context: per-request context.
+        """
+        return
+
     @abstractmethod
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         """

@@ -922,7 +922,8 @@ class TestARCPolicy:
 
 def test_filter_reused_manager():
     """
-    Tests CPUOffloadingManager reuse filtering (store_threshold=2).
+    Tests CPUOffloadingManager reuse filtering (store_threshold=2): keys are
+    counted per observed request, never by lookup().
     """
     manager = make_cpu_manager(
         num_blocks=4,
@@ -932,32 +933,35 @@ def test_filter_reused_manager():
         max_tracker_size=3,
     )
 
-    # Lookup [1, 2] -> 1st time, added to tracker but not eligible for store yet
+    # Request with [1, 2] -> 1st time, added to tracker but not eligible yet
+    manager.observe_request(to_keys([1, 2]), _EMPTY_REQ_CTX)
     assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.MISS
-    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.MISS
 
     # prepare store [1, 2] -> should be filtered
     prepare_store_output = manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
     assert prepare_store_output is not None
     assert prepare_store_output.keys_to_store == []
 
-    # Lookup [1] -> 2nd time, eligible now
+    # lookups do not count: [1] stays at 1
     assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert manager.counts.get(to_key(1)) == 1
+
+    # Request with [1] -> 2nd time, eligible now
+    manager.observe_request(to_keys([1]), _EMPTY_REQ_CTX)
 
     # prepare store [1, 2] -> [1] should be eligible, [2] should be filtered
     prepare_store_output = manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
     assert prepare_store_output is not None
     assert prepare_store_output.keys_to_store == to_keys([1])
 
-    # Lookup [3, 4] -> 1st time
+    # Request with [3, 4] -> 1st time
     # (evicts [2] from tracker since max_size is 3 and tracker has [1])
-    assert manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
-    assert manager.lookup(to_key(4), _EMPTY_REQ_CTX) is LookupResult.MISS
+    manager.observe_request(to_keys([3, 4]), _EMPTY_REQ_CTX)
     # Verify [2] was evicted from the tracker (tracker now has: [1], [3], [4])
     assert to_keys([2])[0] not in manager.counts
 
-    # Lookup [2] again -> (this adds [2] back to the tracker as 1st time)
-    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.MISS
+    # Request with [2] again -> (this adds [2] back to the tracker as 1st time)
+    manager.observe_request(to_keys([2]), _EMPTY_REQ_CTX)
     # Verify [2] was re-added with count=1 (not eligible yet)
     assert manager.counts.get(to_keys([2])[0]) == 1
 
@@ -967,6 +971,20 @@ def test_filter_reused_manager():
     assert prepare_store_output.keys_to_store == []
 
     manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+
+
+def test_observe_request_counts_every_key_of_a_prefix():
+    """The prefix lookup stops at the first miss; the threshold must still be
+    reached by every chunk of a prompt seen twice."""
+    manager = make_cpu_manager(num_blocks=8, cache_policy="lru", store_threshold=2)
+    prompt = to_keys([1, 2, 3, 4])
+    manager.observe_request(prompt, _EMPTY_REQ_CTX)
+    assert manager.lookup(prompt[0], _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert manager.prepare_store(prompt, _EMPTY_REQ_CTX).keys_to_store == []
+
+    manager.observe_request(prompt, _EMPTY_REQ_CTX)
+    assert manager.lookup(prompt[0], _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert manager.prepare_store(prompt, _EMPTY_REQ_CTX).keys_to_store == prompt
 
 
 def test_evictable_cache_block_count():

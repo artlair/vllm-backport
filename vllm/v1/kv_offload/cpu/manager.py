@@ -110,8 +110,17 @@ class CPUOffloadingManager(OffloadingManager):
         return RequestOffloadingContext()
 
     @override
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        if self.counts is not None:
+    def observe_request(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        # Reuse tracking for store_threshold. Counted here, once per request
+        # over every prompt key, rather than in lookup(): the scheduler's
+        # maximal-prefix lookup stops at the first MISS, so lookup() only
+        # ever sees the first chunk of a prefix that is not in the tier and
+        # nothing behind it would ever reach the threshold.
+        if self.counts is None:
+            return
+        for key in keys:
             if key in self.counts:
                 self.counts.move_to_end(key)
                 self.counts[key] += 1
@@ -119,6 +128,9 @@ class CPUOffloadingManager(OffloadingManager):
                 if len(self.counts) >= self.max_tracker_size:
                     self.counts.popitem(last=False)
                 self.counts[key] = 1
+
+    @override
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         block = self._policy.get(key)
         if block is None:
             return LookupResult.MISS

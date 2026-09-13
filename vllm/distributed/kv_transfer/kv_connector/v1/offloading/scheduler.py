@@ -354,6 +354,8 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    # Prompt keys reported to OffloadingManager.observe_request() (once).
+    observed: bool = False
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
@@ -1023,6 +1025,17 @@ class OffloadingConnectorScheduler:
 
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
+
+        if not req_status.observed:
+            req_status.observed = True
+            self.manager.observe_request(
+                [
+                    key
+                    for group_state in req_status.group_states
+                    for key in group_state.offload_keys
+                ],
+                req_status.req_context,
+            )
 
         num_hit_tokens: int | None
         if request.skip_reading_prefix_cache:
