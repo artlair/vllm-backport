@@ -88,12 +88,18 @@ def _is_masked_mha_available(
     """Check if masked MHA can ever fire for this model configuration."""
     if not current_platform.is_device_capability_family(100):
         return False
-    if (
-        num_heads_total != 128
-        or kv_lora_rank != 512
-        or qk_nope_head_dim != 128
-        or qk_rope_head_dim != 64
-        or v_head_dim != 128
+    model_dims = (
+        num_heads_total,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+    )
+    if model_dims not in (
+        (128, 512, 128, 64, 128),
+        (64, 512, 192, 64, 256),
+        # GLM-5.3-Flash: NoPE, qk_head_dim 256 == the (192, 64, 256) kernel.
+        (64, 512, 256, 0, 256),
     ):
         return False
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
