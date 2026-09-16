@@ -45,6 +45,13 @@ ARG_KEY_END = "</arg_key>"
 ARG_VALUE_START = "<arg_value>"
 ARG_VALUE_END = "</arg_value>"
 
+# Special tokens that delimit conversation turns in a rendered GLM prompt.
+# Reasoning markers belonging to earlier turns must not be mistaken for the
+# state of the turn currently being generated.
+GLM_TURN_BOUNDARIES = frozenset(
+    ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
+)
+
 _ARG_RE = re.compile(
     r"<arg_key>(?P<key>.*?)</arg_key>\s*"
     r"<arg_value>(?P<value>.*?)</arg_value>",
@@ -174,7 +181,6 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
     return ParserEngineConfig(
         name="glm47_moe",
         initial_state=ParserState.REASONING if thinking else ParserState.CONTENT,
-        wait_for_reasoning=thinking,
         terminals={
             **reasoning_terminals,
             "TOOL_START": TOOL_CALL_START,
@@ -217,6 +223,7 @@ def glm47_moe_config(thinking: bool = True) -> ParserEngineConfig:
             ),
             **arg_tag_transitions,
         },
+        turn_boundary_tokens=GLM_TURN_BOUNDARIES,
         arg_converter=_glm47_arg_converter,
         arg_value_extender=_glm47_arg_value_extender,
         stream_arg_deltas=True,
@@ -268,11 +275,6 @@ class Glm47MoeParser(ParserEngine):
         if 0 <= idx < len(self._tool_slots):
             self._tool_slots[idx].name = self._tool_slots[idx].name.strip()
         super()._handle_tool_end(event, deltas)
-
-    def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        if not self.thinking_enabled:
-            return input_ids
-        return super().extract_content_ids(input_ids)
 
     def extract_reasoning(
         self,
