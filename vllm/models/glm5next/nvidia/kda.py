@@ -584,14 +584,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # --- merge spec / non-spec outputs back into token order ---
         if use_spec and core_attn_out_non_spec is not None:
             assert core_attn_out_spec is not None
-            merged = torch.empty(
-                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
-                dtype=core_attn_out_non_spec.dtype,
-                device=core_attn_out_non_spec.device,
-            )
-            merged.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
-            core_attn_out[0, :num_actual_tokens] = merged.squeeze(0)
+            core_attn_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
+            core_attn_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
         elif use_spec:
             assert core_attn_out_spec is not None
             if spec_out is None:
