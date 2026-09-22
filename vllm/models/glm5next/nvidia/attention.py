@@ -261,7 +261,7 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
-        self._wp_fp32: torch.Tensor | None = None
+        self._wp_t: torch.Tensor | None = None
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -315,18 +315,25 @@ class Indexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        # Compute the head gate in fp32; bf16 error can change near-tie pool
-        # rankings on long-context tasks. Cache it after weights are loaded.
+        # Accumulate the head gate in fp32; bf16 accumulation error can
+        # change near-tie pool rankings on long-context tasks. Keep the
+        # operands in their native bf16 and let the GEMM accumulate in
+        # fp32 via out_dtype, instead of materialising an fp32 copy of
+        # both: the .float() on hidden_states was a full-tensor cast
+        # kernel per indexer layer per step, and the cached fp32 weight
+        # held VRAM the KV pool could use. bf16 x bf16 products are
+        # exactly representable in fp32, so only accumulation order
+        # changes. Cache the transpose after weights are loaded.
         kw, _ = self.wk_weights_proj(hidden_states)
         k = kw[:, : self.head_dim]
-        if self._wp_fp32 is None:
-            self._wp_fp32 = (
+        if self._wp_t is None:
+            self._wp_t = (
                 self.wk_weights_proj.weight.data[self.head_dim :, :]
                 .t()
                 .contiguous()
-                .float()
+                .to(hidden_states.dtype)
             )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+        weights = torch.mm(hidden_states, self._wp_t, out_dtype=torch.float32)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
