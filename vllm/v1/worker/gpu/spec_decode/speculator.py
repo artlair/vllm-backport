@@ -305,10 +305,6 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
-            # KpoolTailMetadataBuilder needs real positions to rebuild its
-            # circular tail mapping between fused draft steps; without
-            # them it falls back to deriving them from seq_lens.
-            positions=self.input_buffers.positions[:num_tokens_padded],
         )
         return attn_metadata
 

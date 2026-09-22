@@ -746,13 +746,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.decode_cudagraph_manager is not None
             self.decode_cudagraph_manager.run_fullgraph(batch_desc)
-            # Mirror the vllm#40756 per-step fence from _multi_step_decode.
-            # Upstream #57443 returns here with no fence at all; this fork
-            # runs a shared-expert aux stream (3c379a7b2), so the replay's
-            # buffer writes must still be ordered against later side-stream
-            # work. The whole unrolled loop replays as one graph, so this is
-            # ONE fence per target step instead of one per draft step.
-            self._fence()
             return
 
         self._generate_fused_drafts(

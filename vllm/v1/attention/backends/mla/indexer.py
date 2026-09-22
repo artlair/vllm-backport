@@ -701,9 +701,6 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
-    # Kept so update_draft_decode_metadata can recompute the circular
-    # tail mapping in place across fused draft steps.
-    positions: torch.Tensor | None = None
 
 
 # Only meaningful with VLLM_KPOOL_TAIL_GENERIC_EXCLUDE=0 (otherwise the
@@ -783,7 +780,6 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
 
     _cudagraph_support = AttentionCGSupport.ALWAYS
     supports_update_block_table = False
-    supports_draft_decode_metadata_update = True
     reorder_batch_threshold = None
 
     def __init__(
@@ -848,24 +844,6 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
-            positions=positions,
-        )
-
-    def update_draft_decode_metadata(
-        self,
-        metadata: DeepseekV32IndexerMetadata,
-    ) -> None:
-        # Recompute the circular one-block-per-request tail mapping for the
-        # next fused draft step, in place. PAD lanes are negative and
-        # floor-div keeps them negative, so the tail stash kernels still
-        # early-out on them (the 2a576a6b2 PAD rule is preserved).
-        assert metadata.positions is not None
-        block_size = self.kv_cache_spec.block_size
-        slot_mapping = metadata.slot_mapping[: metadata.num_decode_tokens]
-        slot_mapping.div_(block_size, rounding_mode="floor")
-        slot_mapping.mul_(block_size)
-        slot_mapping.add_(
-            metadata.positions[: metadata.num_decode_tokens].remainder(block_size)
         )
 
 
@@ -1124,10 +1102,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
         self.indexer_decode_block_table_buffer: torch.Tensor | None = None
         self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
-        # Fused multi-step draft decode rewrites this metadata in place
-        # between draft steps instead of rebuilding it. DCP is not
-        # supported yet (the localized seq_lens would go stale).
-        self.supports_draft_decode_metadata_update = self.dcp_world_size == 1
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -1657,56 +1631,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
-
-    def update_draft_decode_metadata(
-        self,
-        metadata: DeepseekV32IndexerMetadata,
-    ) -> None:
-        """Advance decode metadata one draft step in place.
-
-        The fused multi-step path builds metadata once and mutates it
-        between draft steps, so this must reproduce exactly what build()
-        would have produced for the next step: recompressed slot mapping,
-        advanced seq_lens, and (on DeepGEMM boxes) a refreshed schedule.
-        """
-        decode = metadata.decode
-        if decode is None or metadata.num_decode_tokens == 0:
-            return
-
-        assert metadata.num_prefills == 0
-        assert metadata.num_decodes == metadata.num_decode_tokens
-        assert decode.seq_lens.numel() == metadata.num_decode_tokens
-        assert self.dcp_world_size == 1
-
-        if self.compress_ratio > 1:
-            get_compressed_slot_mapping(
-                metadata.num_decode_tokens,
-                self.arange_buffer[: metadata.num_decode_tokens + 1],
-                metadata.seq_lens,
-                decode.block_table,
-                self.kv_cache_spec.num_states,
-                self.compress_ratio,
-                out=metadata.slot_mapping,
-            )
-            torch.div(
-                metadata.seq_lens,
-                self.compress_ratio,
-                rounding_mode="floor",
-                out=decode.seq_lens.view(-1),
-            )
-        else:
-            decode.seq_lens.view(-1).copy_(metadata.seq_lens)
-        decode.decode_lens.fill_(1)
-
-        if current_platform.is_cuda() and has_deep_gemm():
-            schedule_metadata = get_paged_mqa_logits_metadata(
-                decode.seq_lens,
-                self.kv_cache_spec.num_states,
-                self.num_sms,
-                indices=decode.indices,
-            )
-            assert schedule_metadata.shape == decode.schedule_metadata.shape
-            decode.schedule_metadata.copy_(schedule_metadata)
 
 
 def build_prefill_chunk_metadata(
