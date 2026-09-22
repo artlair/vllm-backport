@@ -1670,32 +1670,57 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         advanced seq_lens, and (on DeepGEMM boxes) a refreshed schedule.
         """
         decode = metadata.decode
-        if decode is None or metadata.num_decode_tokens == 0:
+        num_tokens = metadata.num_decode_tokens
+        if decode is None or num_tokens == 0:
             return
 
         assert metadata.num_prefills == 0
-        assert metadata.num_decodes == metadata.num_decode_tokens
-        assert decode.seq_lens.numel() == metadata.num_decode_tokens
         assert self.dcp_world_size == 1
+        # Upstream asserts num_decodes == num_decode_tokens. That does NOT hold
+        # here: this fork captures cudagraph-padded draft batches, whose padding
+        # requests carry zero-length queries, so num_decodes can EXCEED
+        # num_decode_tokens. Padding rows are appended after the real requests
+        # and each real draft request contributes exactly one token, so token i
+        # belongs to request i for the first num_decode_tokens rows. Mirror what
+        # build() does: slice by the source length and zero the tail.
+        import os as _dbg_os
+        if _dbg_os.environ.get("VLLM_DRAFT_UPDATE_DEBUG") == "1":
+            logger.info(
+                "DRAFTUPD num_decodes=%s num_decode_tokens=%s "
+                "meta_seq_lens=%s decode_seq_lens=%s decode_lens=%s "
+                "slot_mapping=%s block_table=%s",
+                metadata.num_decodes,
+                metadata.num_decode_tokens,
+                tuple(metadata.seq_lens.shape),
+                tuple(decode.seq_lens.shape),
+                tuple(decode.decode_lens.shape),
+                tuple(metadata.slot_mapping.shape),
+                tuple(decode.block_table.shape),
+            )
+        seq_lens = metadata.seq_lens[:num_tokens]
+        dst = decode.seq_lens.view(-1)
+        assert dst.numel() >= num_tokens
 
         if self.compress_ratio > 1:
             get_compressed_slot_mapping(
-                metadata.num_decode_tokens,
-                self.arange_buffer[: metadata.num_decode_tokens + 1],
-                metadata.seq_lens,
+                num_tokens,
+                self.arange_buffer[: num_tokens + 1],
+                seq_lens,
                 decode.block_table,
                 self.kv_cache_spec.num_states,
                 self.compress_ratio,
                 out=metadata.slot_mapping,
             )
             torch.div(
-                metadata.seq_lens,
+                seq_lens,
                 self.compress_ratio,
                 rounding_mode="floor",
-                out=decode.seq_lens.view(-1),
+                out=dst[:num_tokens],
             )
         else:
-            decode.seq_lens.view(-1).copy_(metadata.seq_lens)
+            dst[:num_tokens].copy_(seq_lens)
+        if dst.numel() > num_tokens:
+            dst[num_tokens:] = 0
         decode.decode_lens.fill_(1)
 
         if current_platform.is_cuda() and has_deep_gemm():
