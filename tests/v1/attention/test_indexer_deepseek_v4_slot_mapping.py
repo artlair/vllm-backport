@@ -137,7 +137,11 @@ def test_indexer_prefill_budget_matches_compressed_workspace(compress_ratio):
         dtype=torch.bfloat16,
         tokens_per_state=compress_ratio,
     )
-    vllm_config = create_vllm_config(max_model_len=max_model_len)
+    # Non-gated model: create_vllm_config defaults to Meta-Llama-3-8B,
+    # which needs HF auth. Only the scheduler/cache config matters here.
+    vllm_config = create_vllm_config(
+        model_name="Qwen/Qwen3.5-0.8B", max_model_len=max_model_len
+    )
     max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, max_model_len)
     block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
     builder = DeepseekV32IndexerMetadataBuilder(
