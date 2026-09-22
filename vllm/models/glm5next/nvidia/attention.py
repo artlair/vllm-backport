@@ -288,7 +288,13 @@ class Indexer(nn.Module):
         self.prefix = prefix
         from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
 
-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
+        # The consumer K-gather workspace is indexed in POOL rows, not
+        # token rows: the kpool indexer compresses index_kpool tokens into
+        # one pooled entry. Sizing it in token units over-reserved by
+        # index_kpool x (1.29 GiB/GPU at max_model_len 262144, kpool 4).
+        self.max_total_seq_len = (
+            get_max_prefill_buffer_size(vllm_config) // self.index_kpool
+        )
         self.indexer_op = SparseAttnIndexerKpool(
             self.k_cache,
             self.quant_block_size,
