@@ -276,3 +276,67 @@ def test_dummy_request_slot_mapping_is_pad():
         num_tokens_padded=3,
     )
     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
+
+
+def test_slot_mapping_read_is_bounded_to_the_row():
+    """A position whose block index is past its row must not read the next row.
+
+    The kpool tail group's row is far narrower than position // block_size on
+    any long prompt. The unbounded read walked into later rows (silent
+    garbage) and, past the tensor, into unmapped memory (IMA). Out-of-row
+    lanes now read block 0 instead.
+    """
+    device = torch.device("cuda")
+    block_tables = BlockTables(
+        block_sizes=[4],
+        max_num_reqs=2,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[4],
+        device=device,
+        kernel_block_sizes=[4],
+    )
+    block_tables.append_block_ids(req_index=0, new_block_ids=([7, 8],), overwrite=True)
+    block_tables.append_block_ids(
+        req_index=1, new_block_ids=([9, 9, 9, 9],), overwrite=True
+    )
+    block_tables.apply_staged_writes()
+    query_start_loc = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    # Position 5 is in row 0's block 1 (id 8); position 17 is block index 4,
+    # one past row 0's 4-wide row, where row 1's block 9 starts.
+    positions = torch.tensor([5, 17], dtype=torch.int64, device=device)
+
+    slots = block_tables.compute_slot_mappings(
+        torch.tensor([0], dtype=torch.int32, device=device),
+        query_start_loc,
+        positions,
+        num_tokens_padded=2,
+    )
+    assert slots[0].tolist() == [8 * 4 + 1, 0 * 4 + 1]
+
+
+def test_kpool_tail_group_is_detected_through_the_uniform_wrapper():
+    from vllm.v1.kv_cache_interface import (
+        KpoolTailSpec,
+        SlidingWindowSpec,
+        UniformTypeKVCacheSpecs,
+    )
+    from vllm.v1.worker.gpu.model_runner import _is_kpool_tail_group
+
+    args = dict(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+    )
+    tail = KpoolTailSpec(**args)
+    wrapped = UniformTypeKVCacheSpecs(
+        block_size=4, kv_cache_specs={"layer_0": tail, "layer_1": tail}
+    )
+    other = UniformTypeKVCacheSpecs(
+        block_size=4, kv_cache_specs={"layer_0": SlidingWindowSpec(**args)}
+    )
+
+    assert _is_kpool_tail_group(tail)
+    assert _is_kpool_tail_group(wrapped)
+    assert not _is_kpool_tail_group(other)
