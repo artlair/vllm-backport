@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pure-Triton sparse MLA backend for SM80 (A100) / SM121 (GB10)."""
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -23,11 +23,42 @@ from vllm.v1.attention.ops.triton_mla_sparse_kernel import (
     triton_mla_sparse_attention,
 )
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
 
 class TritonMLASparseMetadataBuilder(XPUMLASparseMetadataBuilder):
     # XPU base keeps NEVER (not validated under cudagraph); this subclass
     # claims UNIFORM_BATCH for the CUDA/Triton path.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    def __init__(
+        self,
+        kv_cache_spec: "AttentionSpec",
+        layer_names: list[str],
+        vllm_config: "VllmConfig",
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # Opt in to fused multi-step draft decode. Upstream #57443 only
+        # wires the SM90+ sparse backends; this lane runs the Triton
+        # sparse path on sm_86, so without this the whole fused path
+        # stays disabled (one unsupported backend disables it globally).
+        self.supports_draft_decode_metadata_update = (
+            vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
+
+    def update_draft_decode_metadata(self, metadata: XPUMLASparseMetadata) -> None:
+        # Nothing in XPUMLASparseMetadata is step-dependent:
+        #   - req_id_per_token derives only from query_start_loc, which is
+        #     identical on every draft step (one token per request);
+        #   - slot_mapping is the persistent buffer the fused loop already
+        #     rewrites in place via compute_slot_mappings;
+        #   - block_table and the decode/prefill counts are constant;
+        #   - max_seq_len / max_query_len are stored but never read on this
+        #     backend (all tokens route through the top-k MQA path).
+        pass
 
 
 class TritonMLASparseImpl(XPUMLASparseImpl):
