@@ -11,6 +11,8 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     BuildPrefillChunkMetadataKernel,
     DeepseekV32IndexerMetadataBuilder,
+    get_max_prefill_buffer_size,
+    split_indexer_prefill_chunks,
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
@@ -116,3 +118,50 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_num_states():
         device=device,
     )
     torch.testing.assert_close(valid_slots, expected)
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_prefill_budget_matches_compressed_workspace(compress_ratio):
+    """The chunker admits COMPRESSED rows against max_prefill_buffer_size and
+    the consumer K-gather workspace holds get_max_prefill_buffer_size() //
+    compress_ratio rows, so the budget has to be in the same units.
+
+    An undivided budget lets one step admit up to compress_ratio x more rows
+    than the workspace holds, which is the IMA upstream #55222 reproduced.
+    """
+    max_model_len = 1024
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=compress_ratio,
+    )
+    vllm_config = create_vllm_config(max_model_len=max_model_len)
+    max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, max_model_len)
+    block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["dummy"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        block_table_width=block_table_width,
+    )
+
+    workspace_rows = get_max_prefill_buffer_size(vllm_config) // compress_ratio
+    assert builder.max_prefill_buffer_size == workspace_rows
+
+    # Enough requests at max length that their compressed rows overflow the
+    # workspace unless the chunker splits them.
+    num_reqs = 3 * (workspace_rows // (max_model_len // compress_ratio)) + 1
+    compressed_seq_lens = torch.full((num_reqs,), max_model_len // compress_ratio)
+    query_lens = torch.ones(num_reqs, dtype=torch.int64)
+    chunks = split_indexer_prefill_chunks(
+        compressed_seq_lens,
+        query_lens,
+        builder.max_prefill_buffer_size,
+        max_logits_bytes=10**15,
+    )
+    assert len(chunks) > 1
+    for req_slice, _ in chunks:
+        assert int(compressed_seq_lens[req_slice].sum()) <= workspace_rows
