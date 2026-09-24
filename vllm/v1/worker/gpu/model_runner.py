@@ -66,7 +66,12 @@ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KpoolTailSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KpoolTailSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -168,6 +173,18 @@ logger = init_logger(__name__)
 _KPOOL_TAIL_GENERIC_EXCLUDE = (
     os.environ.get("VLLM_KPOOL_TAIL_GENERIC_EXCLUDE", "1") != "0"
 )
+
+
+def _is_kpool_tail_group(spec) -> bool:
+    # The KV cache grouper wraps a group's per-layer specs in
+    # UniformTypeKVCacheSpecs, so a kpool-tail group's spec is that wrapper,
+    # never a bare KpoolTailSpec. Checking isinstance on the wrapper alone
+    # never matches, which silently disabled the generic-kernel exclusion.
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return bool(spec.kv_cache_specs) and all(
+            isinstance(s, KpoolTailSpec) for s in spec.kv_cache_specs.values()
+        )
+    return isinstance(spec, KpoolTailSpec)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -628,7 +645,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # VLLM_KPOOL_TAIL_GENERIC_EXCLUDE=0 restores the old behavior for
             # the VLLM_KPOOL_TAIL_CHECK diagnostic only.
             slot_mapping_enabled.append(
-                not (isinstance(spec, KpoolTailSpec) and _KPOOL_TAIL_GENERIC_EXCLUDE)
+                not (_is_kpool_tail_group(spec) and _KPOOL_TAIL_GENERIC_EXCLUDE)
             )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.

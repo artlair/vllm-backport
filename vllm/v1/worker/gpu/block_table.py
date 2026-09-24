@@ -340,9 +340,14 @@ def _compute_slot_mappings_kernel(
             mapping_enabled, local_positions // kernel_block_size, 0
         )
         block_offsets = local_positions % kernel_block_size
+        # Bound the read to this request's row (stride == row width). A group
+        # whose row is narrower than position // kernel_block_size (e.g. the
+        # 32-wide kpool tail ring) would otherwise read far past the tensor on
+        # long prompts: silent garbage, or an IMA when it crosses into
+        # unmapped memory.
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local,
+            mask=(block_indices < block_table_stride) & is_local,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
