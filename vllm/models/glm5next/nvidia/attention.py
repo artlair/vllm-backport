@@ -33,6 +33,7 @@ from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
@@ -178,13 +179,24 @@ class Glm5NextTailCache(DeepseekV32IndexerCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig):
         # The two head slots form [K, gate score] in the generic
         # [block, head, state, content] cache view.
+        # Drafts are stashed before acceptance. With a one-pool ring, the
+        # drafts behind a rejected pool-completing draft overwrite the keys
+        # read by its redo (upstream #58454).
+        span = self._index_kpool + vllm_config.num_speculative_tokens
+        ring = self._index_kpool * next_power_of_2(cdiv(span, self._index_kpool))
+        # ring must divide the attention block size.
+        assert self.cache_config.block_size % ring == 0, (
+            f"Glm5NextTailCache: cache_config.block_size "
+            f"({self.cache_config.block_size}) must be a multiple of the "
+            f"tail ring ({ring})"
+        )
         return KpoolTailSpec(
-            block_size=self._index_kpool,
+            block_size=ring,
             num_kv_heads=2,
             head_size=self.head_dim,
             head_size_v=0,
             dtype=torch.bfloat16,
-            sliding_window=self._index_kpool,
+            sliding_window=ring,
         )
 
     def get_attn_backend(self):
