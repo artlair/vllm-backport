@@ -476,6 +476,15 @@ class Scheduler(SchedulerInterface):
             # nothing proves the prompt's own last hash boundary: materialize
             # the state one unit lower, where the hit can actually land.
             tail_boundary = max(tail_boundary - self.hash_block_size, 0)
+        # An identical resend caps its lookup at num_prompt - 1, which under the
+        # eagle drop lands one block below ``last_cache_position`` on a
+        # block-aligned prompt (see ``get_replay_boundaries``); stop there too
+        # so its state exists.
+        resend_boundary = (
+            (request.num_prompt_tokens - 1) // block_size * block_size - block_size
+            if self.use_eagle
+            else 0
+        )
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
@@ -487,6 +496,7 @@ class Scheduler(SchedulerInterface):
             tail_boundary
             if last_cache_position < tail_boundary < request.num_prompt_tokens
             else 0,
+            resend_boundary,
             # Marconi shared-prefix junction, block-floored (a sub-block
             # junction's state is not separately cacheable): cache its state
             # so sibling requests sharing the prefix can reuse it.

@@ -3630,7 +3630,7 @@ def _prefill_with_mamba_align_split(manager, request, block_size, max_tokens):
     return ends
 
 
-@pytest.mark.parametrize("prompt_len", [5 * 32 + 7, 5 * 32 + 1])
+@pytest.mark.parametrize("prompt_len", [5 * 32 + 7, 5 * 32, 5 * 32 + 1])
 def test_hybrid_mamba_retention_mtp_eagle_on_attention_group_only(prompt_len):
     """GLM-5.3-Flash shape: MTP, with ONLY the attention group annotated EAGLE.
 
