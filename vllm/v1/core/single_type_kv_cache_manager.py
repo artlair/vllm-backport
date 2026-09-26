@@ -434,6 +434,8 @@ class SingleTypeKVCacheManager(ABC):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
         """
         Cache the blocks for the request.
@@ -446,6 +448,8 @@ class SingleTypeKVCacheManager(ABC):
                 keeps dense checkpointing; ``0`` keeps only the latest replay
                 boundary; a positive multiple of ``scheduler_block_size`` keeps
                 a tail once per that-sized segment. Only SWA acts on it.
+            replay_boundaries: Positions a later request replaying this prompt
+                can resume at, from ``get_replay_boundaries``.
         """
         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
         num_full_blocks = num_tokens // self.block_size
@@ -454,22 +458,11 @@ class SingleTypeKVCacheManager(ABC):
             return
 
         # Token boundaries whose reachable tail must be retained under sparse
-        # retention: the replay boundary (``num_prompt - 1``, capped by
-        # ``get_computed_blocks``) and any detected shared-prefix junction.
-        reachable_boundaries = [request.num_prompt_tokens - 1]
+        # retention: every position a replaying sibling can resume at (see
+        # ``get_replay_boundaries``) and any detected shared-prefix junction.
+        reachable_boundaries = [*replay_boundaries]
         if request.shared_prefix_boundary:
             reachable_boundaries.append(request.shared_prefix_boundary)
-        if self.use_eagle:
-            # Eagle/MTP prunes the last matching block on the full-attention
-            # side (``find_longest_cache_hit``'s shift), so the longest prefix a
-            # later request can be offered ends one block below the replay
-            # boundary. Retaining only the replay boundary leaves the two sides
-            # exactly one block apart and the hit degrades to zero until a
-            # shared-prefix junction is observed -- i.e. the first repeat of a
-            # prompt never hits. Retain the shifted boundary as well.
-            reachable_boundaries.append(
-                max(request.num_prompt_tokens - 1 - self.block_size, 0)
-            )
 
         block_mask = self.reachable_block_mask(
             start_block=num_cached_blocks,
@@ -802,8 +795,15 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
@@ -1169,6 +1169,8 @@ class KpoolTailManager(FullAttentionManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
         # Never hash tail blocks into the prefix cache.
         return
@@ -1424,6 +1426,9 @@ class MambaManager(SingleTypeKVCacheManager):
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        # Set by the coordinator when any group takes the EAGLE drop: the hit
+        # then resumes one hash unit below the prompt's last hash boundary.
+        self.drop_eagle_checkpoint_block = False
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1915,9 +1920,16 @@ class MambaManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
-        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
+        super().cache_blocks(
+            request,
+            num_tokens,
+            retention_interval=retention_interval,
+            replay_boundaries=replay_boundaries,
+        )
         num_cached_blocks_after = self.num_cached_block.get(request.request_id, 0)
         if self.mamba_cache_mode == "align":
             partial_hash = self._cache_partial_tail_block(request, num_tokens)
@@ -1953,6 +1965,12 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
+        if self.drop_eagle_checkpoint_block:
+            # Eagle groups match one hash unit past the candidate and drop it,
+            # so register the tail one unit lower.
+            latest_prompt_hash_boundary = max(
+                latest_prompt_hash_boundary - hash_block_size, 0
+            )
         if num_tokens != latest_prompt_hash_boundary:
             return None
 
@@ -2010,6 +2028,8 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request: Request,
         num_tokens: int,
         retention_interval: int | None = None,
+        *,
+        replay_boundaries: Sequence[int],
     ) -> None:
         # We do not cache blocks for cross-attention to be shared between
         # requests, so this method is not relevant.
