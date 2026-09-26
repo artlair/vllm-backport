@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
+    VLLM_CUSTOM_AR_PCIE: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
@@ -1214,6 +1215,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so that vLLM can verify if p2p is actually working.
     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+    # Treat a same-node group of more than two PCIe GPUs as fully connected
+    # for custom allreduce when NVML reports P2P reads and writes between
+    # every pair (e.g. a patched open driver on GeForce cards). Stock vLLM
+    # only counts NVLink, so TP>2 over PCIe always falls back to NCCL. A
+    # group with any non-P2P pair keeps NCCL.
+    "VLLM_CUSTOM_AR_PCIE": lambda: os.getenv("VLLM_CUSTOM_AR_PCIE", "0") == "1",
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection

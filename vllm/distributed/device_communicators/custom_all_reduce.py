@@ -163,6 +163,7 @@ class CustomAllreduce:
                 )
         # device.index is a visible ordinal, not a logical local ID.
         fully_connected = False
+        pcie_p2p = False
         if same_node:
             physical_device_id = (
                 current_platform.visible_device_id_to_physical_device_id(device.index)
@@ -176,6 +177,17 @@ class CustomAllreduce:
             physical_device_ids = [t.item() for t in gather_list]
             assert current_platform.is_cuda_alike()
             fully_connected = current_platform.is_fully_connected(physical_device_ids)
+            if not fully_connected and envs.VLLM_CUSTOM_AR_PCIE:
+                # Every rank checks every pair of the SAME gathered physical
+                # ids, so the whole group agrees; a group with any non-P2P
+                # pair stays on NCCL via the >2 PCIe check below.
+                pcie_p2p = current_platform.is_pcie_p2p_connected(physical_device_ids)
+                logger.info(
+                    "VLLM_CUSTOM_AR_PCIE: PCIe P2P between all of %s: %s",
+                    physical_device_ids,
+                    pcie_p2p,
+                )
+                fully_connected = pcie_p2p
         if same_node and world_size > 2 and not fully_connected:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
@@ -190,6 +202,7 @@ class CustomAllreduce:
         if (
             same_node
             and not current_platform.is_rocm()
+            and not pcie_p2p
             and not _can_p2p(rank, world_size)
         ):
             logger.warning(

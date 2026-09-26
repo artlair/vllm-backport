@@ -841,6 +841,29 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
     @classmethod
     @with_nvml_context
+    def is_pcie_p2p_connected(cls, physical_device_ids: list[int]) -> bool:
+        """
+        query if every pair of gpus reports PCIe P2P reads and writes
+        """
+        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+        # nvmlGpuP2PCapsIndex_t READ=0, WRITE=1. Not the pynvml constants:
+        # NVML_P2P_CAPS_INDEX_READ carries a stray trailing comma (a tuple).
+        caps = (0, 1)
+        for i, handle in enumerate(handles):
+            for j, peer_handle in enumerate(handles):
+                if i == j:
+                    continue
+                for cap in caps:
+                    try:
+                        status = pynvml.nvmlDeviceGetP2PStatus(handle, peer_handle, cap)
+                    except pynvml.NVMLError:
+                        return False
+                    if status != pynvml.NVML_P2P_STATUS_OK:
+                        return False
+        return True
+
+    @classmethod
+    @with_nvml_context
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
         """
         query if the set of gpus are fully connected by nvlink (1 hop)
@@ -1053,6 +1076,10 @@ class NonNvmlCudaPlatform(CudaPlatformBase):
             "NVLink detection not possible, as context support was"
             " not found. Assuming no NVLink available."
         )
+        return False
+
+    @classmethod
+    def is_pcie_p2p_connected(cls, physical_device_ids: list[int]) -> bool:
         return False
 
     @classmethod
