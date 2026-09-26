@@ -307,9 +307,15 @@ class PPHandler:
             # No request needs sampled outputs next step; `broadcast` skipped too,
             # so skip here to keep the per-step broadcast count matched.
             return
-        draft_tokens = draft_tokens.to(torch.int64).contiguous()
+        # Snapshot on the main stream. The input is a view of the speculator's
+        # persistent draft buffer, which the next step's propose() overwrites on
+        # the main stream with no wait on this side stream, while the NCCL send
+        # only reads its buffer once the peers' progress lets the kernel run.
+        draft_tokens = draft_tokens.to(
+            torch.int64, memory_format=torch.contiguous_format, copy=True
+        )
         with torch.cuda.stream(self.broadcast_stream):
-            # wait_stream so the side-stream broadcast sees propose()'s output.
+            # wait_stream so the side-stream broadcast sees the snapshot.
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(
                 draft_tokens, src=self.last_rank, group=self.broadcast_group

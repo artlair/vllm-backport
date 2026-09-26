@@ -186,6 +186,39 @@ def test_both_ranks_skip_when_no_request_needs_sampling(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@requires_cuda
+def test_draft_relay_reads_snapshot_not_persistent_buffer(monkeypatch):
+    """broadcast_draft receives a view of the speculator's persistent draft
+    buffer, and the next step's propose() rewrites that buffer on the main
+    stream without waiting on the side-stream send. An NCCL send whose kernel
+    is held back by peer progress must still relay this step's drafts."""
+    pp_group = SimpleNamespace(
+        is_last_rank=True,
+        last_rank=1,
+        world_size=2,
+        make_sibling_device_group=lambda group_desc: object(),
+    )
+    monkeypatch.setattr(pp_utils, "get_pp_group", lambda: pp_group)
+    handler = PPHandler(
+        max_num_reqs=8, num_speculative_steps=3, device=torch.device("cuda")
+    )
+    sent: list[torch.Tensor] = []
+
+    def delayed_broadcast(tensor, src, group):
+        torch.cuda._sleep(100_000_000)
+        sent.append(tensor.clone())
+
+    monkeypatch.setattr(torch.distributed, "broadcast", delayed_broadcast)
+    persistent = torch.full((8, 3), 7, dtype=torch.int64, device="cuda")
+
+    handler.broadcast_draft(persistent[:3], make_input_batch())
+    persistent.fill_(-1)
+    torch.cuda.synchronize()
+
+    assert len(sent) == 1
+    assert (sent[0] == 7).all()
+
+
 # ---------------------------------------------------------------------------
 # DeepSeekMTP under pipeline parallelism
 # ---------------------------------------------------------------------------
