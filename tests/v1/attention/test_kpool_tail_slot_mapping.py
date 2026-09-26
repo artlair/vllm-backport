@@ -472,3 +472,88 @@ def test_rejected_completing_draft_needs_ring_slots(ring_pools):
         assert not torch.allclose(redo, expected)
     else:
         torch.testing.assert_close(redo, expected)
+
+
+def _random_tail_batch(gen, kpool, device):
+    """A randomized tail-mapping input shaped like the model runner's: mixed
+    prefill / MTP verify (q=4) / draft (q=1) rows, zero-length padding
+    requests after the real ones (num_reqs < batch rows), cudagraph padding
+    lanes past query_start_loc[num_reqs] that num_actual_tokens may count,
+    positions straddling ring / block / large-context boundaries, and a
+    persistent buffer longer than the mapping holding junk."""
+
+    def rint(lo, hi):
+        return int(torch.randint(lo, hi + 1, (1,), generator=gen))
+
+    num_reqs = rint(1, 16)
+    shape = rint(0, 2)
+    lens = []
+    for _ in range(num_reqs):
+        if shape == 0:
+            lens.append(1)
+        elif shape == 1:
+            lens.append(4)
+        else:
+            lens.append(rint(0, 1) and rint(1, 300) or rint(1, 4))
+    starts = []
+    for _ in range(num_reqs):
+        base = kpool * rint(0, 1 << rint(1, 17)) + rint(-2, 2)
+        starts.append(max(0, base))
+    positions = torch.cat(
+        [torch.arange(s, s + q, dtype=torch.int64) for s, q in zip(starts, lens)]
+    )
+    qsl = [0]
+    for q in lens:
+        qsl.append(qsl[-1] + q)
+    real_tokens = qsl[-1]
+    pad_reqs = rint(0, 3)
+    qsl += [real_tokens] * pad_reqs
+    pad_tokens = rint(0, 40)
+    n = real_tokens + pad_tokens
+    # num_actual_tokens sometimes counts the cudagraph padding lanes.
+    num_actual = rint(real_tokens, n) if rint(0, 1) else real_tokens
+    positions = torch.cat(
+        [positions, torch.randint(0, 1 << 20, (pad_tokens,), generator=gen)]
+    )
+    rows = num_reqs + pad_reqs + rint(0, 2)
+    bt = torch.randint(0, 5000, (rows, 32), dtype=torch.int32, generator=gen)
+    slot_mapping = torch.randint(-(2**40), 2**40, (n,), generator=gen)
+    buf_len = n + rint(0, 64)
+    qsl_dtype = torch.int32 if rint(0, 1) else torch.int64
+    return dict(
+        slot_mapping=slot_mapping.to(device),
+        block_table=bt.to(device),
+        query_start_loc=torch.tensor(qsl, dtype=qsl_dtype, device=device),
+        positions=positions.to(device),
+        num_actual_tokens=num_actual,
+        num_reqs=num_reqs,
+        kpool=kpool,
+    ), buf_len
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("kpool", [4, 8])
+def test_fused_tail_mapping_matches_torch_reference(kpool):
+    """The fused Triton kernel is bit-identical to the torch reference on the
+    whole persistent buffer, including PAD for padding lanes and the reset
+    of the buffer past the mapping."""
+    from vllm.v1.attention.backends.mla.indexer import (
+        _compute_kpool_tail_slot_mapping_torch,
+    )
+
+    gen = torch.Generator().manual_seed(1234 + kpool)
+    for _ in range(300):
+        args, buf_len = _random_tail_batch(gen, kpool, "cuda")
+        junk = torch.randint(-5, 1 << 30, (buf_len,), generator=gen).cuda()
+        ref_buf, new_buf = junk.clone(), junk.clone()
+        ref = _compute_kpool_tail_slot_mapping_torch(**args, out=ref_buf)
+        new = compute_kpool_tail_slot_mapping(**args, out=new_buf)
+        assert new.data_ptr() == new_buf.data_ptr()
+        assert torch.equal(new, ref)
+        assert torch.equal(new_buf, ref_buf)
+        real_end = min(args["num_actual_tokens"], int(args["query_start_loc"][-1]))
+        assert bool((new_buf[real_end:] == -1).all())
+        assert torch.equal(
+            compute_kpool_tail_slot_mapping(**args),
+            _compute_kpool_tail_slot_mapping_torch(**args),
+        )

@@ -711,6 +711,48 @@ _KPOOL_TAIL_CHECK = (
 )
 
 
+@triton.jit(
+    do_not_specialize=["num_reqs", "num_actual_tokens", "out_len", "search_iters"]
+)
+def _kpool_tail_slot_mapping_kernel(
+    block_table_ptr,
+    block_table_stride,
+    query_start_loc_ptr,
+    positions_ptr,
+    out_ptr,
+    num_reqs,
+    num_actual_tokens,
+    out_len,
+    search_iters,
+    kpool,
+    BLOCK: tl.constexpr,
+):
+    """Fused compute_kpool_tail_slot_mapping over the WHOLE ``out`` buffer:
+    lanes below ``min(num_actual_tokens, qsl[num_reqs])`` get their
+    request's tail slot, every other lane (padding, stale capture length) PAD.
+    The request is ``searchsorted(qsl, t, right=True) - 1`` clamped to
+    ``[0, num_reqs - 1]``, found by a branch-free binary search."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    qsl_end = tl.load(query_start_loc_ptr + num_reqs)
+    real = (offs < num_actual_tokens) & (offs < qsl_end)
+    lo = tl.zeros([BLOCK], dtype=tl.int32)
+    hi = tl.zeros([BLOCK], dtype=tl.int32) + num_reqs
+    for _ in range(search_iters):
+        active = lo < hi
+        mid = (lo + hi) // 2
+        start = tl.load(query_start_loc_ptr + mid, mask=real & active, other=0)
+        go_right = active & (start <= offs)
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(active & ~go_right, mid, hi)
+    req = tl.minimum(tl.maximum(lo - 1, 0), num_reqs - 1).to(tl.int64)
+    own_block = tl.load(block_table_ptr + req * block_table_stride, mask=real, other=0)
+    pos = tl.load(positions_ptr + offs, mask=real, other=0).to(tl.int64)
+    rem = pos % kpool
+    rem = tl.where(rem < 0, rem + kpool, rem)
+    slot = own_block.to(tl.int64) * kpool + rem
+    tl.store(out_ptr + offs, tl.where(real, slot, -1), mask=offs < out_len)
+
+
 def compute_kpool_tail_slot_mapping(
     slot_mapping: torch.Tensor,
     block_table: torch.Tensor,
@@ -740,6 +782,59 @@ def compute_kpool_tail_slot_mapping(
     early-out instead of scribbling raw K + gate into another request's
     in-progress pool.
     """
+    n = slot_mapping.shape[0]
+    if (
+        slot_mapping.is_cuda
+        and positions is not None
+        and num_reqs > 0
+        and (out if out is not None else slot_mapping).dtype == torch.int64
+        and not _KPOOL_TAIL_CHECK
+    ):
+        if out is None:
+            out = torch.empty_like(slot_mapping)
+        assert out.is_contiguous() and out.shape[0] >= n
+        # One launch for the reset + mapping; bit-identical to the torch path.
+        block = 1024
+        out_len = out.shape[0]
+        _kpool_tail_slot_mapping_kernel[(triton.cdiv(out_len, block),)](
+            block_table,
+            block_table.stride(0),
+            query_start_loc,
+            positions,
+            out,
+            num_reqs,
+            num_actual_tokens,
+            out_len,
+            max(1, num_reqs.bit_length()),
+            kpool,
+            BLOCK=block,
+            num_warps=4,
+        )
+        return out[:n]
+    return _compute_kpool_tail_slot_mapping_torch(
+        slot_mapping,
+        block_table,
+        query_start_loc,
+        positions,
+        num_actual_tokens,
+        num_reqs,
+        kpool,
+        out,
+    )
+
+
+def _compute_kpool_tail_slot_mapping_torch(
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    num_actual_tokens: int,
+    num_reqs: int,
+    kpool: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference implementation (CPU, and the VLLM_KPOOL_TAIL_CHECK
+    diagnostic); the Triton kernel must stay bit-identical to it."""
     n = slot_mapping.shape[0]
     if out is None:
         out = torch.full((n,), -1, dtype=slot_mapping.dtype, device=slot_mapping.device)
