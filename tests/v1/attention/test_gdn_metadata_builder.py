@@ -304,3 +304,42 @@ def test_cudagraph_capture_batch_stays_decode_only():
     assert staged is not None
     assert staged.data_ptr() == builder.non_spec_state_indices_tensor.data_ptr()
     torch.testing.assert_close(staged, common_attn_metadata.block_table_tensor[:, 0])
+
+
+@pytest.mark.parametrize(
+    ("query_lens", "num_decode_draft_tokens", "expected_starts"),
+    [
+        pytest.param([3, 3, 40], [2, 2, -1], (0, 6), id="spec-first"),
+        pytest.param([40, 3, 3], [-1, 2, 2], (40, 0), id="prefill-first"),
+        pytest.param([3, 1, 40, 0], [2, -1, -1, -1], (0, 3), id="padded-tail"),
+        pytest.param([3, 40, 3], [2, -1, 2], (None, None), id="interleaved"),
+        pytest.param([3, 3], [2, 2], (None, None), id="pure-spec"),
+    ],
+)
+def test_mixed_spec_token_runs(
+    query_lens: list[int],
+    num_decode_draft_tokens: list[int],
+    expected_starts: tuple[int | None, int | None],
+):
+    """Run starts are set only when spec and non-spec tokens are two
+    contiguous runs, and then name exactly the tokens the gather indices
+    select."""
+    batch = BatchSpec(seq_lens=[q + 50 for q in query_lens], query_lens=query_lens)
+    meta = _build(_create_gdn_builder(2), batch, num_decode_draft_tokens)
+
+    assert (meta.spec_token_start, meta.non_spec_token_start) == expected_starts
+    if meta.spec_token_start is None:
+        return
+    assert meta.non_spec_token_start is not None
+    assert meta.spec_token_indx is not None
+    assert meta.non_spec_token_indx is not None
+    num_non_spec = meta.num_prefill_tokens + meta.num_decode_tokens
+    assert meta.spec_token_indx.tolist() == list(
+        range(
+            meta.spec_token_start,
+            meta.spec_token_start + meta.num_spec_decode_tokens,
+        )
+    )
+    assert meta.non_spec_token_indx.tolist() == list(
+        range(meta.non_spec_token_start, meta.non_spec_token_start + num_non_spec)
+    )

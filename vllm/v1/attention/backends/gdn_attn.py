@@ -62,6 +62,11 @@ class GDNAttentionMetadata:
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
+    # Mixed spec/non-spec batches whose spec tokens and non-spec tokens each
+    # form one contiguous run: the first token of each run. Consumers can
+    # then slice instead of gathering via spec_token_indx/non_spec_token_indx.
+    spec_token_start: int | None = None
+    non_spec_token_start: int | None = None
 
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
 
@@ -228,6 +233,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         spec_sequence_masks_cpu: torch.Tensor | None = None
+        spec_token_start: int | None = None
+        non_spec_token_start: int | None = None
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
@@ -349,6 +356,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
+
+                active_spec_mask_cpu = spec_sequence_masks_cpu[query_lens_cpu > 0]
+                if (
+                    int((active_spec_mask_cpu[1:] != active_spec_mask_cpu[:-1]).sum())
+                    == 1
+                ):
+                    spec_first = bool(active_spec_mask_cpu[0])
+                    spec_token_start = 0 if spec_first else num_non_spec_tokens
+                    non_spec_token_start = num_spec_decode_tokens if spec_first else 0
 
                 spec_state_indices_tensor = block_table_tensor[
                     spec_sequence_masks_cpu, : self.num_spec + 1
@@ -540,6 +556,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
+            spec_token_start=spec_token_start,
+            non_spec_token_start=non_spec_token_start,
             num_accepted_tokens=num_accepted_tokens,
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,

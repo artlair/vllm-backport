@@ -398,6 +398,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # num_accepted_tokens for rejection-sampling rollback; non-spec tokens
         # are one-per-request. Mirrors olmo_gdn_linear_attn.py. Projections are
         # [n, *] (token dim 0); g1/beta are [1, n, h, d] (token dim 1).
+        spec_slice = non_spec_slice = None
+        if use_spec and attn_metadata_narrowed.spec_token_start is not None:
+            spec_start = attn_metadata_narrowed.spec_token_start
+            non_spec_start = attn_metadata_narrowed.non_spec_token_start
+            assert non_spec_start is not None
+            spec_slice = slice(
+                spec_start, spec_start + attn_metadata_narrowed.num_spec_decode_tokens
+            )
+            non_spec_slice = slice(
+                non_spec_start,
+                non_spec_start
+                + attn_metadata_narrowed.num_prefill_tokens
+                + attn_metadata_narrowed.num_decode_tokens,
+            )
         if use_spec:
             # In a pure spec-verify step (no non-spec tokens) the metadata
             # builder sets spec_token_indx = arange(num_actual_tokens), making
@@ -409,16 +423,24 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 qkv_spec = qkv_proj_states
                 g1_spec = g1
                 beta_spec = beta
+                qkv_ns = g1_ns = beta_ns = None
+            elif spec_slice is not None:
+                # Mixed step whose spec and non-spec tokens are two contiguous
+                # runs (the runner orders drafted requests first): slice
+                # instead of gathering.
+                qkv_spec = qkv_proj_states[spec_slice]
+                g1_spec = g1[:, spec_slice]
+                beta_spec = beta[:, spec_slice]
+                qkv_ns = qkv_proj_states[non_spec_slice]
+                g1_ns = g1[:, non_spec_slice]
+                beta_ns = beta[:, non_spec_slice]
             else:
                 qkv_spec = qkv_proj_states.index_select(0, spec_token_indx)
                 g1_spec = g1.index_select(1, spec_token_indx)
                 beta_spec = beta.index_select(1, spec_token_indx)
-            if non_spec_token_indx is not None and non_spec_token_indx.numel() > 0:
                 qkv_ns = qkv_proj_states.index_select(0, non_spec_token_indx)
                 g1_ns = g1.index_select(1, non_spec_token_indx)
                 beta_ns = beta.index_select(1, non_spec_token_indx)
-            else:
-                qkv_ns = g1_ns = beta_ns = None
         else:
             qkv_spec = g1_spec = beta_spec = None
             qkv_ns, g1_ns, beta_ns = qkv_proj_states, g1, beta
@@ -478,15 +500,16 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
 
         # --- core attention: spec (draft-verify) path ---
         core_attn_out_spec = None
-        # In a pure spec-verify step (no non-spec tokens) the recurrent kernel
-        # can write straight into the layer output buffer, skipping the
-        # fresh allocation + copy below. Mixed steps must scatter via
-        # spec_token_indx, so they keep the kernel-managed output.
-        spec_out = (
-            core_attn_out[0, :num_actual_tokens].unsqueeze(0)
-            if non_spec_token_indx is None or non_spec_token_indx.numel() == 0
-            else None
-        )
+        # In a pure spec-verify step (no non-spec tokens) or a contiguous
+        # mixed step the recurrent kernel writes straight into the layer
+        # output buffer. Other mixed steps scatter via spec_token_indx, so
+        # they keep the kernel-managed output.
+        if non_spec_token_indx is None or non_spec_token_indx.numel() == 0:
+            spec_out = core_attn_out[0, :num_actual_tokens].unsqueeze(0)
+        elif spec_slice is not None:
+            spec_out = core_attn_out[:, spec_slice]
+        else:
+            spec_out = None
         if use_spec:
             assert spec_state_indices_tensor is not None
             assert num_accepted_tokens is not None
@@ -545,6 +568,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 cu_seqlens=non_spec_query_start_loc,
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
+                out=(
+                    None if non_spec_slice is None else core_attn_out[:, non_spec_slice]
+                ),
             )
             # Init cache
             scatter_states(
@@ -584,8 +610,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # --- merge spec / non-spec outputs back into token order ---
         if use_spec and core_attn_out_non_spec is not None:
             assert core_attn_out_spec is not None
-            core_attn_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            core_attn_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            if spec_slice is None:
+                core_attn_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
+                core_attn_out.index_copy_(
+                    1, non_spec_token_indx, core_attn_out_non_spec
+                )
         elif use_spec:
             assert core_attn_out_spec is not None
             if spec_out is None:
