@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional
 
-import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -13,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import (
     get_mla_dims,
 )
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -108,6 +108,31 @@ class XPUMLASparseMetadata(AttentionMetadata):
     num_decode_tokens: int = 0
 
 
+@triton.jit(do_not_specialize=["num_reqs", "num_tokens", "search_iters"])
+def _req_id_per_token_kernel(
+    query_start_loc_ptr,
+    out_ptr,
+    num_reqs,
+    num_tokens,
+    search_iters,
+    BLOCK: tl.constexpr,
+):
+    """out[t] = the request owning token t (the last r with qsl[r] <= t, so
+    zero-length requests own nothing), 0 for tokens past qsl[num_reqs]."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    real = offs < tl.load(query_start_loc_ptr + num_reqs)
+    lo = tl.zeros([BLOCK], dtype=tl.int32)
+    hi = tl.zeros([BLOCK], dtype=tl.int32) + num_reqs
+    for _ in range(search_iters):
+        active = lo < hi
+        mid = (lo + hi) // 2
+        start = tl.load(query_start_loc_ptr + mid, mask=real & active, other=0)
+        go_right = active & (start <= offs)
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(active & ~go_right, mid, hi)
+    tl.store(out_ptr + offs, tl.where(real, lo - 1, 0), mask=offs < num_tokens)
+
+
 @dataclass
 class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
@@ -152,18 +177,21 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         fast_build: bool = False,
     ) -> XPUMLASparseMetadata:
         num_tokens = common_attn_metadata.num_actual_tokens
-        starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
-        seg_lengths = np.diff(starts)
-        req_id_per_token = np.repeat(
-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
-        )
-        # Zero-fill for cudagraphs
-        self.req_id_per_token_buffer.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
-
+        # One launch from the device query_start_loc instead of a host repeat,
+        # a fill and an H2D copy; padding tokens get request 0 as before.
+        qsl = common_attn_metadata.query_start_loc
+        num_reqs = qsl.shape[0] - 1
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        if num_tokens > 0:
+            _req_id_per_token_kernel[(triton.cdiv(num_tokens, 1024),)](
+                qsl,
+                req_id_per_token,
+                num_reqs,
+                num_tokens,
+                max(1, num_reqs.bit_length()),
+                BLOCK=1024,
+                num_warps=4,
+            )
 
         metadata = XPUMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,

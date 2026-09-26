@@ -168,3 +168,53 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_builder_req_id_per_token_matches_host_repeat():
+    """The builder's device req_id_per_token equals the host repeat of the
+    query lengths it replaced, with 0 for padding tokens past the last query
+    and zero-length (padding) requests owning no token."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+    from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
+        XPUMLASparseMetadataBuilder,
+    )
+
+    builder = object.__new__(XPUMLASparseMetadataBuilder)
+    builder.kv_cache_spec = SimpleNamespace(block_size=64)
+    builder.topk_tokens = 2048
+    builder.req_id_per_token_buffer = torch.empty(
+        8192, dtype=torch.int32, device="cuda"
+    )
+    gen = torch.Generator().manual_seed(0)
+    for it in range(300):
+        num_reqs = int(torch.randint(1, 33, (1,), generator=gen))
+        max_q = (300, 5, 2)[it % 3]
+        query_lens = torch.randint(0, max_q, (num_reqs,), generator=gen)
+        query_lens[0] += 1
+        pad_reqs = int(torch.randint(0, 4, (1,), generator=gen))
+        query_lens = torch.cat([query_lens, torch.zeros(pad_reqs, dtype=torch.long)])
+        qsl = torch.zeros(query_lens.numel() + 1, dtype=torch.int32)
+        qsl[1:] = torch.cumsum(query_lens, 0)
+        num_tokens = int(qsl[-1]) + int(torch.randint(0, 20, (1,), generator=gen))
+        builder.req_id_per_token_buffer.fill_(-7)
+        cam = CommonAttentionMetadata(
+            query_start_loc=qsl.cuda(),
+            query_start_loc_cpu=qsl,
+            seq_lens=torch.ones(qsl.numel() - 1, dtype=torch.int32, device="cuda"),
+            num_reqs=qsl.numel() - 1,
+            num_actual_tokens=num_tokens,
+            max_query_len=int(query_lens.max()),
+            max_seq_len=1,
+            block_table_tensor=torch.zeros(1, 1, dtype=torch.int32, device="cuda"),
+            slot_mapping=torch.zeros(num_tokens, dtype=torch.int64, device="cuda"),
+        )
+        got = builder.build(0, cam).req_id_per_token
+        expected = torch.zeros(num_tokens, dtype=torch.int32)
+        mapped = torch.repeat_interleave(
+            torch.arange(query_lens.numel(), dtype=torch.int32), query_lens
+        )
+        expected[: mapped.numel()] = mapped[:num_tokens]
+        assert torch.equal(got.cpu(), expected)
