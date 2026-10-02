@@ -2,9 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM-native multimodal processor for GLM-5.3-Flash."""
 
-import json
 import math
-import os
 
 import numpy as np
 import torch
@@ -822,22 +820,16 @@ class Glm5NextProcessor(ProcessorMixin):
             **{k: v for k, v in ip_cfg.items() if k != "image_processor_type"}
         )
 
-        if os.path.isdir(model_path):
-            processor_config_path = os.path.join(model_path, "processor_config.json")
-        else:
-            from vllm.transformers_utils.repo_utils import (
-                _try_download_from_hf_hub,
-            )
+        from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 
-            processor_config_path = _try_download_from_hf_hub(
-                model_path, "processor_config.json", None
-            )
-            if processor_config_path is None:
-                raise FileNotFoundError(
-                    f"processor_config.json not found for {model_path}"
-                )
-        with open(processor_config_path) as f:
-            vp_cfg = _cap_cfg(dict(json.load(f)["video_processor"]), is_video=True)
+        processor_config = get_hf_file_to_dict(
+            "processor_config.json",
+            model_path,
+            revision=kwargs.get("revision", "main"),
+        )
+        if processor_config is None:
+            raise FileNotFoundError(f"processor_config.json not found for {model_path}")
+        vp_cfg = _cap_cfg(dict(processor_config["video_processor"]), is_video=True)
         video_processor = Glm5NextVideoProcessor(
             **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
         )
