@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 """Video placeholder accounting for GLM-5.3-Flash.
 
 ``Glm4vProcessingInfo._construct_video_placeholder`` emits one frame of
@@ -190,7 +189,7 @@ def test_mm_device_do_normalize():
         Image.new("RGB", (310, 470), color=(17, 89, 231)),
         Image.new("RGB", (480, 320), color=(201, 13, 127)),
     ]
-    prompt = " IMAGE_PLACEHOLDER" * len(images)
+    prompt = "<|begin_of_image|><|image|><|end_of_image|>" * len(images)
     mm_items = processor.info.parse_mm_data({"image": images})
 
     normalized_inputs = processor(prompt, mm_items=mm_items)
