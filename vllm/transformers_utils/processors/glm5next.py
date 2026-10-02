@@ -822,7 +822,21 @@ class Glm5NextProcessor(ProcessorMixin):
             **{k: v for k, v in ip_cfg.items() if k != "image_processor_type"}
         )
 
-        with open(os.path.join(model_path, "processor_config.json")) as f:
+        if os.path.isdir(model_path):
+            processor_config_path = os.path.join(model_path, "processor_config.json")
+        else:
+            from vllm.transformers_utils.repo_utils import (
+                _try_download_from_hf_hub,
+            )
+
+            processor_config_path = _try_download_from_hf_hub(
+                model_path, "processor_config.json", None
+            )
+            if processor_config_path is None:
+                raise FileNotFoundError(
+                    f"processor_config.json not found for {model_path}"
+                )
+        with open(processor_config_path) as f:
             vp_cfg = _cap_cfg(dict(json.load(f)["video_processor"]), is_video=True)
         video_processor = Glm5NextVideoProcessor(
             **{k: v for k, v in vp_cfg.items() if k != "video_processor_type"}
