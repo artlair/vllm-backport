@@ -272,9 +272,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
         if spec_sequence_masks is None:
-            # V2 already excludes prefills from full decode graphs via
-            # has_prefill. Classify first chunks as prefills to mask recycled
-            # state; resumed one-token chunks can still use the decode kernels.
+            # FULL decode graphs admit one-token prompt tails that have
+            # prior state, and those rows are classified as decodes here.
+            # First chunks without prior state are prefills, masking any
+            # recycled state; resumed one-token chunks can still use the
+            # decode kernels.
             assert m.seq_lens_cpu_upper_bound is not None
             query_lens_cpu = query_start_loc_cpu.diff()
             no_prior_state = (query_lens_cpu > 0) & (
