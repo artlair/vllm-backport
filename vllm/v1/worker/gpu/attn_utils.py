@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -269,6 +270,10 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    # Mamba groups with the same spec and builder differ only in their state
+    # indices, so later groups re-gather those from the first group's metadata.
+    # Also at capture, so FULL graphs share the batch-level buffers.
+    cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
@@ -310,7 +315,16 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
-            if for_cudagraph_capture:
+            reuse_key = None
+            if attn_metadata_builder.supports_update_block_table and isinstance(
+                attn_group.kv_cache_spec, MambaSpec
+            ):
+                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+            if reuse_key in cached_metadata:
+                metadata = attn_metadata_builder.update_block_table(
+                    cached_metadata[reuse_key], block_table, slot_mapping
+                )
+            elif for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
@@ -328,6 +342,8 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+            if reuse_key is not None and reuse_key not in cached_metadata:
+                cached_metadata[reuse_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
