@@ -51,6 +51,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import QuickGELU
 from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv3dLayer
+from vllm.model_executor.layers.fusion.mm_input_norm import (
+    build_mm_input_norm,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -103,7 +106,6 @@ from .utils import (
     maybe_prefix,
 )
 from .vision import (
-    FusedInputNorm,
     get_vit_attn_backend,
     is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
@@ -1299,7 +1301,7 @@ class Qwen2VLForConditionalGeneration(
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
-            self.input_norm = FusedInputNorm.from_model_config(self.model_config)
+            self.input_norm = build_mm_input_norm(self.model_config)
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(

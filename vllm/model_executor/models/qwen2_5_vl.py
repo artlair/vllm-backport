@@ -53,6 +53,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv3dLayer
+from vllm.model_executor.layers.fusion.mm_input_norm import (
+    build_mm_input_norm,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -113,7 +116,6 @@ from .utils import (
     maybe_prefix,
 )
 from .vision import (
-    FusedInputNorm,
     get_fp8_padded_hidden_size,
     get_vit_attn_backend,
     is_vit_use_data_parallel,
@@ -1356,7 +1358,7 @@ class Qwen2_5_VLForConditionalGeneration(
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
-            self.input_norm = FusedInputNorm.from_model_config(self.model_config)
+            self.input_norm = build_mm_input_norm(self.model_config)
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
