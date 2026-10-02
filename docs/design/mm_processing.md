@@ -75,6 +75,9 @@ This GPU‑side fusion is controlled by a config flag called **`mm_device_do_nor
 |--------------|--------------------------------------|-------------------------------------|
 | `qwen2-vl`   | `Qwen2VLForConditionalGeneration`    | `Qwen/Qwen2-VL-2B-Instruct`, etc.   |
 | `qwen2.5-vl` | `Qwen2_5_VLForConditionalGeneration` | `Qwen/Qwen2.5-VL-3B-Instruct`, etc. |
+| `glm-4v`     | `Glm4vForConditionalGeneration`      | `zai-org/GLM-4.1V-9B-Thinking`, etc. |
+| `glm-5-next` | `Glm5NextForConditionalGeneration`   | `zai-org/GLM-5.3-Flash`             |
+| `glm-ocr`    | `GlmOcrForConditionalGeneration`     | `zai-org/GLM-OCR`                   |
 
 #### Key Properties and Gains
 
