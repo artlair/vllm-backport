@@ -534,6 +534,7 @@ class PCPManager:
         local_is_prefilling_np = (
             local_num_computed_prefill_tokens_np < local_prefill_len_np
         )
+        local_has_prefill = bool(local_is_prefilling_np.any())
         seq_lens_cpu_upper_bound_np = np.zeros(num_local_reqs, dtype=np.int32)
         seq_lens_cpu_upper_bound_np[:] = local_start_pos_np + local_num_scheduled_tokens
 
@@ -574,7 +575,9 @@ class PCPManager:
             prefill_len_np=local_prefill_len_np,
             num_computed_prefill_tokens_np=local_num_computed_prefill_tokens_np,
             is_prefilling_np=local_is_prefilling_np,
-            has_prefill=bool(local_is_prefilling_np.any()),
+            has_prefill=local_has_prefill,
+            decode_graph_eligible=not local_has_prefill,
+            prefill_runs_as_decode_np=None,
             max_seq_len_np=global_batch.max_seq_len_np[local_to_global_batch_req_idx_np]
             if global_batch.max_seq_len_np is not None
             else None,

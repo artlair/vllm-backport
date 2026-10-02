@@ -380,7 +380,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             # the target model during FULL cudagraph.
             num_tokens,
             max_query_len,
-            input_batch.has_prefill,
+            input_batch.decode_graph_eligible,
         )
         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,
