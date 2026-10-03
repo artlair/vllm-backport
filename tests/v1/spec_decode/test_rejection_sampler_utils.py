@@ -553,6 +553,7 @@ def test_verify_rejects_unproposed_drafts():
             None,
             inputs["expanded_idx_mapping"],
             inputs["expanded_local_pos"],
+            draft_sampled,
         )
         return sampled, num_sampled
 

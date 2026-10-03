@@ -159,7 +159,10 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
-from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+from vllm.v1.worker.gpu.structured_outputs import (
+    StructuredOutputsWorker,
+    grammar_invalid_drafts,
+)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
@@ -1557,6 +1560,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.structured_output_request_ids,
                 grammar_output.grammar_bitmask,
             )
+            invalid_drafts = grammar_invalid_drafts(
+                input_batch,
+                grammar_output.structured_output_request_ids,
+                grammar_output.num_acceptable_drafts,
+            )
+        else:
+            invalid_drafts = None
 
         sampler_output: SamplerOutput | None
         if input_batch.num_reqs == 0:
@@ -1575,6 +1585,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
+                invalid_drafts,
             )
 
         if shard_metadata is not None:
