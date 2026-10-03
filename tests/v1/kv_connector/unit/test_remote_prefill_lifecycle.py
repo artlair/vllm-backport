@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import itertools
 from unittest.mock import patch
 
 import pytest
@@ -25,7 +26,7 @@ pytestmark = pytest.mark.cpu_test
 
 
 def _num_waiting_requests(scheduler) -> int:
-    return len(scheduler.waiting) + len(scheduler.skipped_waiting)
+    return len(scheduler.waiting) + len(scheduler.kv_holding_waiting)
 
 
 def test_basic_lifecycle():
@@ -65,7 +66,7 @@ def test_basic_lifecycle():
 
     # Req waiting for KVs with no computed/scheduled toks ...
     assert _num_waiting_requests(scheduler) == 1
-    assert request in scheduler.skipped_waiting
+    assert request in scheduler.kv_holding_waiting
     assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     assert request.num_computed_tokens == NUM_TOKENS
 
@@ -805,8 +806,8 @@ def test_async_load_reserves_blocks_for_promotion_margin():
 def test_async_load_not_admitted_behind_blockless_request():
     """No async load may take KV blocks while a request ahead of it holds none.
 
-    A connector can defer a lookup, which parks the request in
-    ``skipped_waiting`` holding no blocks and with nothing reserved for it. If an
+    A connector can defer a lookup, which parks the request in ``waiting``
+    holding no blocks and with nothing reserved for it. If an
     async load behind it then takes the pool below what the parked request needs,
     the scan stops at the parked request every step. The load is never promoted,
     so it never runs and never frees its blocks: a permanent deadlock.
@@ -837,7 +838,9 @@ def test_async_load_not_admitted_behind_blockless_request():
     def schedule():
         output = scheduler.schedule()
         blockless_seen = False
-        for request in scheduler.skipped_waiting:
+        for request in itertools.chain(
+            scheduler.kv_holding_waiting, scheduler.waiting
+        ):
             holds_blocks = scheduler._holds_kv_blocks(request)
             assert not (blockless_seen and holds_blocks)
             blockless_seen |= not holds_blocks
@@ -848,7 +851,9 @@ def test_async_load_not_admitted_behind_blockless_request():
     ):
         # The lookup is deferred. The load fits (5 of 7) but must not be admitted.
         schedule()
-        assert list(scheduler.skipped_waiting) == [parked, load]
+        assert list(scheduler.waiting) == [parked, load]
+        assert not scheduler.kv_holding_waiting
+        assert scheduler.deferred_waiting == {parked, load}
         assert load.status == RequestStatus.WAITING
 
         # The lookup resolves and the parked request gets its 4 blocks first.
