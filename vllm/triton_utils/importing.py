@@ -65,7 +65,12 @@ if HAS_TRITON:
             HAS_TRITON = False
 
         # Check Triton CPU
-        if "cpu" in version("vllm"):
+        try:
+            vllm_version = version("vllm")
+        except Exception:
+            # Dev checkouts may lack package metadata.
+            vllm_version = ""
+        if "cpu" in vllm_version:
             if "cpu" in backends:
                 HAS_TRITON = True
             else:

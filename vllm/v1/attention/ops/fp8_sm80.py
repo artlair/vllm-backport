@@ -39,10 +39,15 @@ def native_fp8_cast_supported() -> bool:
 # convert and SM80 transparently gets the software path with no launcher
 # plumbing. Defaults to the software path: it is bit-exact everywhere, just
 # slower, so a failed probe degrades performance rather than compilation.
-try:
-    _NATIVE_FP8_CAST = tl.constexpr(native_fp8_cast_supported())
-except Exception:
-    _NATIVE_FP8_CAST = tl.constexpr(False)
+if callable(getattr(tl, "constexpr", None)):
+    try:
+        _NATIVE_FP8_CAST = tl.constexpr(native_fp8_cast_supported())
+    except Exception:
+        _NATIVE_FP8_CAST = tl.constexpr(False)
+else:
+    # Triton unavailable (placeholder module): keep importable for
+    # CPU-only test collection; never used to compile kernels there.
+    _NATIVE_FP8_CAST = False
 
 
 _E4M3FN_BF16_LUT_CACHE: dict[tuple[torch.device, float | None], torch.Tensor] = {}
