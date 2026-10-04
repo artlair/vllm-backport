@@ -1,0 +1,57 @@
+# Build the fork's vLLM image and push it to the homelab zot registry
+# (zot.lan / zot.apps.lan, the in-cluster registry on k8s-w-5).
+#
+# Runs on the ARC `vllm-build` runner (privileged DinD pod on k8s-w-5, 16
+# vCPU). A cold build is on the order of two hours; buildx layer cache lives
+# in the registry (buildcache tag) so subsequent builds are incremental.
+#
+# Manual by design: a 20 GB image per push is too heavy for branch automation.
+#   gh workflow run publish.yml -R artlair/vllm-backport -f name=glm53
+# Repo-gated so a PR run on a fork of the fork can never touch the registry.
+name: publish
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "image name under zot.lan/vllm-backport/ (branch/model lane)"
+        default: glm53
+        type: string
+jobs:
+  build-and-push:
+    if: github.repository == 'artlair/vllm-backport'
+    runs-on: vllm-build
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build + push
+        env:
+          NAME: ${{ inputs.name }}
+        run: |
+          set -euo pipefail
+          SHA=$(echo "${GITHUB_SHA}" | cut -c1-9)
+          IMG="zot.lan/vllm-backport/${NAME}:${SHA}-serve"
+          CACHE="zot.lan/vllm-backport/buildcache-${NAME}"
+
+          # sm86 only: the fleet's GPUs (RTX 3090, A6000) are all SM86. The
+          # upstream matrix also builds sm80/sm89, tripling build time for
+          # hardware nobody here runs.
+          docker buildx build \
+            --file docker/Dockerfile \
+            --target vllm-openai \
+            --build-arg torch_cuda_arch_list="8.6" \
+            --build-arg max_jobs="$(nproc)" \
+            --build-arg nvcc_threads=1 \
+            --cache-from "type=registry,ref=${CACHE}" \
+            --cache-to "type=registry,ref=${CACHE},mode=max,ignore-error=true" \
+            --tag "${IMG}" \
+            --push \
+            .
+
+          echo "pushed ${IMG}"
+
+      - name: smoke check
+        run: |
+          set -euo pipefail
+          SHA=$(echo "${GITHUB_SHA}" | cut -c1-9)
+          curl -sk "https://zot.lan/v2/vllm-backport/${{ inputs.name }}/tags/list" | grep -o "${SHA}-serve"
