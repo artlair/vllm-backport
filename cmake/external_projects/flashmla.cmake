@@ -18,12 +18,13 @@ if(FLASH_MLA_SRC_DIR)
 else()
   FetchContent_Declare(
         flashmla
-        # PR #17 (rope dim / qk_rope=0) head lives on the JaredforReal fork's
-        # rope_dim branch; it's unreachable from a plain clone of
-        # vllm-project/FlashMLA (only via refs/pull/*), so point at the fork.
-        # https://github.com/vllm-project/FlashMLA/pull/17
-        GIT_REPOSITORY https://github.com/JaredforReal/FlashMLA.git
-        GIT_TAG 8447acbcb558db892bf7c1197d225be1c95b168c
+        # PR #17 (rope dim / qk_rope=0) head. It lived on the JaredforReal
+        # fork's rope_dim branch, but that commit is now unreachable there
+        # (force-pushed away; a plain clone can't fetch it), so this mirror
+        # carries the exact tree (verified: tree sha 69d20e0a713a3b4291...)
+        # as a root commit. https://github.com/vllm-project/FlashMLA/pull/17
+        GIT_REPOSITORY https://github.com/artlair/FlashMLA-mirror.git
+        GIT_TAG 3f64bbc641fc8d1cdeb59ccfbd38d01684655efc
         GIT_PROGRESS TRUE
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""
