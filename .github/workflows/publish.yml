@@ -30,8 +30,21 @@ jobs:
         run: |
           set -euo pipefail
           SHA=$(echo "${GITHUB_SHA}" | cut -c1-9)
-          IMG="zot.lan/vllm-backport/${NAME}:${SHA}-serve"
-          CACHE="zot.lan/vllm-backport/buildcache-${NAME}"
+          CACHE="zot.apps.lan/vllm-backport/buildcache-${NAME}"
+          IMG="zot.apps.lan/vllm-backport/${NAME}:${SHA}-serve"
+
+          # Registry cache needs a buildx driver that can export it (the
+          # default docker driver cannot). Run a buildkitd container on the
+          # DinD daemon; zot.apps.lan over plain HTTP skips the self-signed
+          # TLS problem (Traefik ingress -> zot; same registry data as the
+          # zot.lan name consumers pull).
+          cat > /tmp/buildkitd.toml <<'EOF'
+          [registry."zot.apps.lan"]
+            http = true
+          EOF
+          docker buildx rm zotbuilder 2>/dev/null || true
+          docker buildx create --use --name zotbuilder \
+            --driver-opt network=host --config /tmp/buildkitd.toml
 
           # sm86 only: the fleet's GPUs (RTX 3090, A6000) are all SM86. The
           # upstream matrix also builds sm80/sm89, tripling build time for
