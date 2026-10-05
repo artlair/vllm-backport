@@ -41,10 +41,12 @@ jobs:
           [registry."zot.apps.lan"]
             http = true
 
-          # Bound the persistent build scratch (hostPath on the node disk).
+          # Bound the persistent build scratch (hostPath on the node disk;
+          # 148 GB shared with the OS + containerd, kubelet evicts at <15%
+          # free, so keep the cache at 40 GiB and prune images post-push).
           [worker.oci]
             [[worker.oci.gcpolicy]]
-              keepBytes = 64424509440
+              keepBytes = 42949672960
               all = true
           EOF
           # Reuse the builder across runs: the DinD daemon's storage (and the
