@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           SHA=$(echo "${GITHUB_SHA}" | cut -c1-9)
-          IMG="zot.apps.lan/vllm-backport/${NAME}:${SHA}-serve"
+          IMG="k8s-w-5.lan:5000/vllm-backport/${NAME}:${SHA}-serve"
 
           # Registry cache needs a buildx driver that can export it (the
           # default docker driver cannot). Run a buildkitd container on the
@@ -96,7 +96,7 @@ jobs:
           fi
           [ "${push_ok}" = "1" ]
 
-          echo "pushed ${IMG}"
+          echo "pushed ${IMG} (reachable as zot.lan/${NAME#*:}/${NAME##*:} via the front doors)"
 
       - name: smoke check
         run: |
