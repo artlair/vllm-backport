@@ -71,9 +71,14 @@ jobs:
           # image into the DinD dockerd and docker push (the plain client
           # every fleet host uses). The rebuild after a failed push comes
           # from the local buildkit cache, so retries cost minutes, not hours.
+          # --provenance/--sbom off: buildx's default attestation manifests
+          # make the pushed image an OCI index that zot rejects with 415
+          # ("manifest invalid"), and the docker-push fallback inherits it
+          # when the built image is loaded. Plain image manifests only.
           push_ok=0
           for i in 1 2 3; do
             if docker buildx build \
+              --provenance=false --sbom=false \
               --file docker/Dockerfile \
               --target vllm-openai-ray \
               --build-arg torch_cuda_arch_list="8.6" \
@@ -87,7 +92,8 @@ jobs:
           done
           if [ "${push_ok}" != "1" ]; then
             echo "falling back to docker push via the DinD daemon"
-            docker buildx build --file docker/Dockerfile --target vllm-openai-ray \
+            docker buildx build --provenance=false --sbom=false \
+              --file docker/Dockerfile --target vllm-openai-ray \
               --build-arg torch_cuda_arch_list="8.6" \
               --build-arg max_jobs="$(nproc)" --build-arg nvcc_threads=1 \
               --load --tag "${IMG}" .
