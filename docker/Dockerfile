@@ -1097,3 +1097,13 @@ USER vllm
 WORKDIR /home/vllm
 ENTRYPOINT ["/usr/local/bin/vllm-nonroot-entrypoint.sh"]
 #################### OPENAI API SERVER (NON-ROOT, OPT-IN) ####################
+
+#################### OPENAI API SERVER + RAY (FORK) ####################
+# Multi-node lanes (rome + rome2) run vLLM over a Ray cluster, and upstream
+# dropped ray from the CUDA requirements (#36170). ray[default] matches the
+# legacy glm53 -serve images; pin the version they ran.
+FROM vllm-openai AS vllm-openai-ray
+ARG RAY_VERSION=2.58.0
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system "ray[default]==${RAY_VERSION}"
+#################### OPENAI API SERVER + RAY (FORK) ####################

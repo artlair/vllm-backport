@@ -60,7 +60,7 @@ jobs:
           for i in 1 2 3; do
             if docker buildx build \
               --file docker/Dockerfile \
-              --target vllm-openai \
+              --target vllm-openai-ray \
               --build-arg torch_cuda_arch_list="8.6" \
               --build-arg max_jobs="$(nproc)" \
               --build-arg nvcc_threads=1 \
@@ -74,7 +74,7 @@ jobs:
           done
           if [ "${push_ok}" != "1" ]; then
             echo "falling back to docker push via the DinD daemon"
-            docker buildx build --file docker/Dockerfile --target vllm-openai \
+            docker buildx build --file docker/Dockerfile --target vllm-openai-ray \
               --build-arg torch_cuda_arch_list="8.6" \
               --build-arg max_jobs="$(nproc)" --build-arg nvcc_threads=1 \
               --load --tag "${IMG}" .
