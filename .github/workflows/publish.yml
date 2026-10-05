@@ -30,7 +30,6 @@ jobs:
         run: |
           set -euo pipefail
           SHA=$(echo "${GITHUB_SHA}" | cut -c1-9)
-          CACHE="zot.apps.lan/vllm-backport/buildcache-${NAME}"
           IMG="zot.apps.lan/vllm-backport/${NAME}:${SHA}-serve"
 
           # Registry cache needs a buildx driver that can export it (the
@@ -41,10 +40,24 @@ jobs:
           cat > /tmp/buildkitd.toml <<'EOF'
           [registry."zot.apps.lan"]
             http = true
+
+          # Bound the persistent build scratch (hostPath on the node disk).
+          [worker.oci]
+            [[worker.oci.gcpolicy]]
+              keepBytes = 64424509440
+              all = true
           EOF
-          docker buildx rm zotbuilder 2>/dev/null || true
-          docker buildx create --use --name zotbuilder \
-            --driver-opt network=host --config /tmp/buildkitd.toml
+          # Reuse the builder across runs: the DinD daemon's storage (and the
+          # buildkit state volume in it) persists on the node, so base images
+          # and the build cache survive and rebuilds are incremental. NOTE:
+          # changes to this buildkitd.toml need `docker buildx rm zotbuilder`
+          # once (the config is baked in at create time).
+          if docker buildx inspect --bootstrap zotbuilder >/dev/null 2>&1; then
+            docker buildx use zotbuilder
+          else
+            docker buildx create --use --name zotbuilder \
+              --driver-opt network=host --config /tmp/buildkitd.toml
+          fi
 
           # sm86 only: the fleet's GPUs (RTX 3090, A6000) are all SM86. The
           # upstream matrix also builds sm80/sm89, tripling build time for
@@ -64,8 +77,6 @@ jobs:
               --build-arg torch_cuda_arch_list="8.6" \
               --build-arg max_jobs="$(nproc)" \
               --build-arg nvcc_threads=1 \
-              --cache-from "type=registry,ref=${CACHE}" \
-              --cache-to "type=registry,ref=${CACHE},mode=max,ignore-error=true" \
               --tag "${IMG}" \
               --push \
               .
