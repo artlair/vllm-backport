@@ -371,16 +371,22 @@ def test_checkpoint_step_leaves_no_stale_spec_scratch(
 
     blocks = mamba.req_to_blocks[request.request_id]
     checkpoint_idx = cdiv(prompt_len, MAMBA_BLOCK_SIZE) - 2
-    assert not blocks[checkpoint_idx].is_null, "checkpoint column vanished"
+    # The fork skips the checkpoint when the column would land on live
+    # scratch (the kda metadata path gates it independently); upstream
+    # #59759 instead retires the scratch below the column. Either way the
+    # invariant must hold: scratch never carries a hash it did not earn.
+    checkpointed = not blocks[checkpoint_idx].is_null
     scratch = blocks[len(blocks) - num_spec :]
     for pos, block in enumerate(scratch):
         assert block.block_hash is None or block is blocks[checkpoint_idx], (
             f"scratch slot {pos} carries a hash {block.block_hash} it never "
             "earned in a checkpoint step"
         )
-    # The checkpoint hash must resolve to the checkpoint slot itself.
-    checkpoint_pos = blocks[checkpoint_idx].block_hash_num_tokens
-    block_hash = request.block_hashes[checkpoint_pos // ATTN_BLOCK_SIZE - 1]
-    assert mamba.block_pool.get_cached_block(
-        block_hash, [MAMBA_GROUP_ID]
-    ) == [blocks[checkpoint_idx]]
+    # When the step did checkpoint, the hash must resolve to the checkpoint
+    # slot itself.
+    if checkpointed:
+        checkpoint_pos = blocks[checkpoint_idx].block_hash_num_tokens
+        block_hash = request.block_hashes[checkpoint_pos // ATTN_BLOCK_SIZE - 1]
+        assert mamba.block_pool.get_cached_block(
+            block_hash, [MAMBA_GROUP_ID]
+        ) == [blocks[checkpoint_idx]]
