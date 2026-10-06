@@ -126,6 +126,13 @@ class SimpleCPUOffloadScheduler:
 
         spec_config = vllm_config.speculative_config
         use_eagle = spec_config is not None and spec_config.use_eagle()
+        # Multi-module MTP re-prefills the tokens its modules looked ahead at,
+        # so the coordinator must exclude them from the cacheable prefix.
+        num_prefill_lookahead = (
+            spec_config.num_speculative_tokens
+            if spec_config is not None and spec_config.use_multi_module_mtp()
+            else 1
+        )
         self.cpu_coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
             kv_cache_config=self.cpu_kv_cache_config,
             max_model_len=vllm_config.model_config.max_model_len,
@@ -137,6 +144,7 @@ class SimpleCPUOffloadScheduler:
             pcp_world_size=1,
             scheduler_block_size=self.block_size,
             hash_block_size=self.hash_block_size,
+            num_prefill_lookahead=num_prefill_lookahead,
         )
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
@@ -581,8 +589,6 @@ class SimpleCPUOffloadScheduler:
             # Confirmed tokens: KV data written and visible to all streams.
             req = state.request
             confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
-            # Cap to blocks with confirmed KV data.
-            aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 
             for g in range(num_groups):
                 # FIXME (yifan): handle CPU cache eviction, where
@@ -594,7 +600,15 @@ class SimpleCPUOffloadScheduler:
                 g_block_size = (
                     kv_cache_groups[g].kv_cache_spec.block_size * self.cp_world_size
                 )
-                ready_blocks_g = aligned_tokens // g_block_size
+                # Mimic the GPU KV cache manager's cacheable prefix: blocks
+                # whose tokens a multi-module MTP run may re-prefill, and the
+                # eagle lookahead extension, must match what the GPU side
+                # would hash, or the CPU cache serves prefixes the GPU would
+                # never hit (or misses ones it would).
+                cacheable_tokens = self.cpu_coordinator.get_num_cacheable_tokens(
+                    confirmed_tokens, g
+                )
+                ready_blocks_g = cacheable_tokens // g_block_size
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
                 for gpu_block_id in scannable:

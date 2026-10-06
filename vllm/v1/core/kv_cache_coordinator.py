@@ -333,6 +333,14 @@ class KVCacheCoordinator(ABC):
         extension = request.num_prompt_tokens // block * block
         return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
 
+    def get_num_cacheable_tokens(
+        self, num_computed_tokens: int, kv_cache_group_id: int
+    ) -> int:
+        """Return the prefix eligible for hashing in this group."""
+        # Only cache tokens with finalized KV. The last num_reprefillable_tokens
+        # tokens can be re-prefilled during multi-module MTP.
+        return max(0, num_computed_tokens - self.num_reprefillable_tokens)
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
         Cache the blocks for the request.
@@ -344,15 +352,10 @@ class KVCacheCoordinator(ABC):
                 (including tokens that are already cached).
         """
         boundaries = self.get_replay_boundaries(request)
-        for manager in self.single_type_managers:
-            # Only cache tokens with finalized KV. The last num_reprefillable_tokens
-            # tokens can be re-prefilled during multi-module MTP.
-            num_tokens_to_cache = max(
-                0, num_computed_tokens - self.num_reprefillable_tokens
-            )
+        for group_id, manager in enumerate(self.single_type_managers):
             manager.cache_blocks(
                 request,
-                num_tokens_to_cache,
+                self.get_num_cacheable_tokens(num_computed_tokens, group_id),
                 retention_interval=self.retention_interval,
                 replay_boundaries=boundaries,
             )
@@ -773,37 +776,22 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             return num_tokens
         return round_down(num_tokens, self.scheduler_block_size)
 
-    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+    def get_num_cacheable_tokens(
+        self, num_computed_tokens: int, kv_cache_group_id: int
+    ) -> int:
         cached_num_computed_tokens = self._align_cacheable(num_computed_tokens)
-        boundaries = self.get_replay_boundaries(request)
-        for manager in self.single_type_managers:
-            num_tokens_to_cache = cached_num_computed_tokens
-            # EAGLE groups match one block past each aligned boundary and drop
-            # it, so make that lookahead block eligible to be cached.
-            if manager.use_eagle and cached_num_computed_tokens > 0:
-                # Only cache tokens with finalized KV. The last
-                # num_reprefillable_tokens tokens can be re-prefilled during
-                # multi-module MTP.
-                num_finalized_computed_tokens = max(
-                    0, num_computed_tokens - self.num_reprefillable_tokens
-                )
-                cached_num_finalized_computed_tokens = self._align_cacheable(
-                    num_finalized_computed_tokens
-                )
-                num_tokens_to_cache = min(
-                    num_finalized_computed_tokens,
-                    cached_num_finalized_computed_tokens + manager.block_size,
-                )
-            # The manager already knows the fine hit granularity
-            # (``scheduler_block_size``); retention is passed separately so it
-            # can keep both the coarse segment tails and the fine replay
-            # boundary (which needs the fine value).
-            manager.cache_blocks(
-                request,
-                num_tokens_to_cache,
-                retention_interval=self.retention_interval,
-                replay_boundaries=boundaries,
+        manager = self.single_type_managers[kv_cache_group_id]
+        # EAGLE matches one block past the aligned boundary, then drops it.
+        if manager.use_eagle and cached_num_computed_tokens > 0:
+            num_finalized_computed_tokens = max(
+                0, num_computed_tokens - self.num_reprefillable_tokens
             )
+            return min(
+                num_finalized_computed_tokens,
+                self._align_cacheable(num_finalized_computed_tokens)
+                + manager.block_size,
+            )
+        return cached_num_computed_tokens
 
     def find_longest_cache_hit(
         self,

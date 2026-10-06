@@ -40,6 +40,10 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
+from unittest.mock import Mock
+
+from vllm.config import SpeculativeConfig
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.simple_kv_offload.manager import SimpleCPUOffloadScheduler
@@ -1833,3 +1837,128 @@ def test_cp_lazy_target_blocks_scaling(cp_world_size: int) -> None:
             f"cp_world_size={cp_world_size}: target_cp={target_cp} should be "
             f"less than target_base={target_base}"
         )
+
+
+@pytest.mark.parametrize("retention_interval", [None, 0])
+@pytest.mark.parametrize("chunk_size,prefill_lookahead", [(64, 1), (1024, 1), (1, 3)])
+def test_eager_store_matches_gpu_cacheable_prefix(
+    retention_interval: int | None,
+    chunk_size: int,
+    prefill_lookahead: int,
+) -> None:
+    """The eager CPU store must offload exactly the prefix the GPU manager
+    would hash (upstream #60071).
+
+    A multi-module MTP run re-prefills the tokens its modules looked ahead
+    at, so the store path must exclude them, and an eagle draft group's
+    one-block lookahead extension must be stored too. Before the fix the
+    store path capped at a flat scheduler-block alignment, which stored
+    blocks holding unfinalized KV (or skipped the eagle extension), so the
+    CPU hit and the GPU hit for a replayed prompt disagreed.
+    """
+    block_size = 64
+    scheduler_block_size = 8 * block_size
+    # Distinct specs per group: the fork's hybrid coordinator merges groups
+    # with identical specs into one hit-lookup group.
+    draft_block_size = scheduler_block_size
+    prompt_len = 16 * scheduler_block_size + draft_block_size + prefill_lookahead
+    kv_cache_config = _make_kv_cache_config(256, num_groups=2)
+    for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+        group.kv_cache_spec = FullAttentionSpec(
+            block_size=draft_block_size if group_id else block_size,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            dtype=DTYPE,
+        )
+    for tensor in kv_cache_config.kv_cache_tensors:
+        tensor.size *= block_size // BLOCK_SIZE
+        tensor.layer_stride *= block_size // BLOCK_SIZE
+        tensor.block_stride *= block_size // BLOCK_SIZE
+    # Group 1 is the eagle draft group.
+    kv_cache_config.kv_cache_groups[1].is_eagle_group = True
+    kv_cache_config.prefix_cache_retention_interval = retention_interval
+    vllm_config = _make_cp_vllm_config(dcp_world_size=1)
+    vllm_config.model_config.max_model_len = 16384
+    speculative_config = Mock(spec=SpeculativeConfig)
+    speculative_config.num_speculative_tokens = 3
+    speculative_config.use_eagle.return_value = True
+    speculative_config.use_multi_module_mtp.return_value = prefill_lookahead > 1
+    vllm_config.speculative_config = speculative_config
+    scheduler = SimpleCPUOffloadScheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        cpu_capacity_bytes=kv_cache_config.kv_cache_tensors[0].size,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=block_size,
+    )
+    gpu_manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=16384,
+        max_in_flight_tokens=chunk_size,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=block_size,
+        use_eagle=True,
+        num_prefill_lookahead=prefill_lookahead,
+    )
+    scheduler.bind_gpu_block_pool(gpu_manager.block_pool)
+    request = Request(
+        request_id="dcp-draft-source",
+        prompt_token_ids=list(range(prompt_len)),
+        sampling_params=SamplingParams(max_tokens=2),
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=get_request_block_hasher(block_size, sha256),
+    )
+    # Follow allocate -> connector metadata -> compute completion, including
+    # one decode step so the final prefill blocks can be offloaded.
+    while request.num_computed_tokens <= prompt_len:
+        if request.num_computed_tokens == prompt_len:
+            request.append_output_token_ids([prompt_len])
+        num_new_tokens = min(
+            chunk_size, request.num_tokens - request.num_computed_tokens
+        )
+        new_blocks = gpu_manager.allocate_slots(
+            request, num_new_tokens, num_lookahead_tokens=3
+        )
+        assert new_blocks is not None
+        if request.num_computed_tokens == 0:
+            scheduler.update_state_after_alloc(
+                request, gpu_manager.get_blocks(request.request_id), 0
+            )
+            output = make_scheduler_output(
+                {request.request_id: num_new_tokens},
+                new_reqs={request.request_id: new_blocks.get_block_ids()},
+            )
+        else:
+            output = make_scheduler_output(
+                {request.request_id: num_new_tokens},
+                cached_req_new_blocks={
+                    request.request_id: new_blocks.get_block_ids()
+                },
+            )
+        store_meta = scheduler.build_connector_meta(output)
+        request.num_computed_tokens += num_new_tokens
+        if store_meta.store_event >= 0:
+            simulate_store_completion(scheduler, store_meta.store_event)
+
+    matching_request = Request(
+        request_id="dcp-draft-load",
+        prompt_token_ids=request.prompt_token_ids,
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=request._block_hasher,
+    )
+    gpu_hit = gpu_manager.get_computed_blocks(matching_request)[1]
+    assert gpu_hit > 0, "expected the GPU side to serve a prefix hit"
+    scheduler.request_finished(request, [])
+    gpu_manager.free(request)
+    assert gpu_manager.block_pool.reset_prefix_cache()
+
+    hit_tokens, is_async = scheduler.get_num_new_matched_tokens(
+        matching_request, num_computed_tokens=0
+    )
+    assert hit_tokens is not None
+    assert (hit_tokens, is_async) == (gpu_hit, True), (
+        "CPU store prefix diverged from the GPU cacheable prefix"
+    )
