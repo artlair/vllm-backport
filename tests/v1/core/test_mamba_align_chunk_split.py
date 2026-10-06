@@ -299,3 +299,88 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail stop ({tail_stop})"
         )
+
+
+def _make_checkpoint_manager(num_spec: int) -> KVCacheManager:
+    """Hybrid manager with one internal checkpoint slot and spec scratch."""
+    config = KVCacheConfig(
+        num_blocks=10000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full_layer"],
+                FullAttentionSpec(
+                    block_size=ATTN_BLOCK_SIZE,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["mamba_layer"],
+                MambaSpec(
+                    block_size=MAMBA_BLOCK_SIZE,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_speculative_blocks=num_spec,
+                    num_prefill_checkpoint_blocks=1,
+                ),
+            ),
+        ],
+    )
+    return KVCacheManager(
+        config,
+        max_model_len=262144,
+        scheduler_block_size=MAMBA_BLOCK_SIZE,
+        hash_block_size=ATTN_BLOCK_SIZE,
+        enable_caching=True,
+        use_eagle=True,
+    )
+
+
+@pytest.mark.parametrize("num_spec", [1, 2, 3])
+@pytest.mark.parametrize("first_chunk_blocks", [2, 4])
+def test_checkpoint_step_leaves_no_stale_spec_scratch(
+    num_spec: int, first_chunk_blocks: int
+) -> None:
+    """A checkpoint step must retire the speculative scratch blocks it leaves
+    behind, keeping only the checkpoint column for the worker's export
+    (upstream #59759): a never-written scratch block must not end up
+    hash-cached, and the checkpoint hash must map to the checkpoint slot."""
+    manager = _make_checkpoint_manager(num_spec)
+    prompt_len = 6 * MAMBA_BLOCK_SIZE + 50
+    (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+
+    # Step 1: an aligned chunk, so the request owns spec scratch afterwards.
+    first_end = first_chunk_blocks * MAMBA_BLOCK_SIZE
+    assert manager.allocate_slots(
+        request, first_end, num_lookahead_tokens=num_spec
+    ) is not None
+    request.num_computed_tokens = first_end
+    assert len(mamba.req_to_blocks[request.request_id]) > first_chunk_blocks
+    manager.new_step_starts()
+
+    # Step 2: run to the unaligned prompt end, which makes this a checkpoint
+    # step (computed aligned, chunk end not).
+    assert manager.allocate_slots(
+        request, prompt_len - first_end, num_lookahead_tokens=num_spec
+    ) is not None
+    request.num_computed_tokens = prompt_len
+
+    blocks = mamba.req_to_blocks[request.request_id]
+    checkpoint_idx = cdiv(prompt_len, MAMBA_BLOCK_SIZE) - 2
+    assert not blocks[checkpoint_idx].is_null, "checkpoint column vanished"
+    scratch = blocks[len(blocks) - num_spec :]
+    for pos, block in enumerate(scratch):
+        assert block.block_hash is None or block is blocks[checkpoint_idx], (
+            f"scratch slot {pos} carries a hash {block.block_hash} it never "
+            "earned in a checkpoint step"
+        )
+    # The checkpoint hash must resolve to the checkpoint slot itself.
+    checkpoint_pos = blocks[checkpoint_idx].block_hash_num_tokens
+    block_hash = request.block_hashes[checkpoint_pos // ATTN_BLOCK_SIZE - 1]
+    assert mamba.block_pool.get_cached_block(
+        block_hash, [MAMBA_GROUP_ID]
+    ) == [blocks[checkpoint_idx]]
