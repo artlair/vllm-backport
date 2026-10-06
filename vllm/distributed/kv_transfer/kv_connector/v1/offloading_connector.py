@@ -133,6 +133,18 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
+    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+        # A hash-addressed store only holds the prefix-cacheable groups; the
+        # others (e.g. mamba states, the kpool tail) are never restored by a
+        # load, so their external-token blocks must still be zeroed.
+        return tuple(
+            group_id
+            for group_id, group in enumerate(
+                self._kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.participates_in_prefix_caching
+        )
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:

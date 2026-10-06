@@ -328,6 +328,7 @@ def test_async_recompute_blocks_not_cached_when_invalid(
 
     # mock connector indicating async load
     recompute_scheduler.connector = Mock()
+    recompute_scheduler.connector.get_loaded_kv_cache_group_ids.return_value = (0,)
     recompute_scheduler.connector.get_num_new_matched_tokens.side_effect = (
         _make_get_num_new_matched_tokens(req_num_new_matched_tokens, True)
     )

@@ -446,6 +446,19 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+        """KV cache groups restored by this connector's load for ``request``.
+
+        Called after ``get_num_new_matched_tokens`` returned a positive count
+        with async loading, so the scheduler can leave those groups' newly
+        allocated external-token blocks unzeroed: zeroing would race the
+        out-of-band write. Defaults to every group, which a connector
+        transferring the request's own blocks restores; a hash-addressed
+        store restores only the prefix-cacheable subset and should narrow
+        this.
+        """
+        return tuple(range(len(self._kv_cache_config.kv_cache_groups)))
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,

@@ -298,6 +298,7 @@ class SingleTypeKVCacheManager(ABC):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         """
         Allocate new blocks for external (KV-connector) computed tokens.
@@ -310,6 +311,8 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
+            record_for_zeroing: Whether the new blocks need zeroing. False when
+                the load writes them after this step, which zeroing would race.
         """
         num_total_computed_tokens = (
             num_local_computed_tokens + num_external_computed_tokens
@@ -329,7 +332,7 @@ class SingleTypeKVCacheManager(ABC):
             cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
         )
         req_blocks.extend(allocated_blocks)
-        if self._record_new_block_ids:
+        if self._record_new_block_ids and record_for_zeroing:
             self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
@@ -1237,6 +1240,7 @@ class KpoolTailManager(FullAttentionManager):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         # The tail is a fixed 1-block circular buffer; PD-transferred
         # (external) tokens do not grow it -- the kernel reuses the single
@@ -1250,7 +1254,7 @@ class KpoolTailManager(FullAttentionManager):
             return
         new_blocks = self.block_pool.get_new_blocks(1)
         req_blocks.extend(new_blocks)
-        if self._record_new_block_ids:
+        if self._record_new_block_ids and record_for_zeroing:
             self.new_block_ids.extend(b.block_id for b in new_blocks)
 
 
@@ -2019,6 +2023,7 @@ class CrossAttentionManager(SingleTypeKVCacheManager):
         request_id: str,
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
+        record_for_zeroing: bool = True,
     ) -> None:
         # Cross-attention does not use prefix caching / external KV loads.
         return

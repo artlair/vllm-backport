@@ -950,31 +950,59 @@ def _make_fake_kv_cache_manager():
 
 
 @pytest.mark.cpu_test
-def test_zeroing_block_ids_cover_only_loaded_attention_blocks():
-    """Only zero-recorded (attention) groups contribute, sliced to the
-    externally-loaded token range; Mamba state blocks are never zeroed."""
-    manager = _make_fake_kv_cache_manager()
+def test_loaded_group_ids_default_and_offloading_narrowing():
+    """The base default exempts every group (a request-owned transfer
+    restores all of them); the hash-addressed OffloadingConnector restores
+    only the prefix-cacheable subset, so the other groups' external-token
+    blocks still get zeroed."""
+    from types import SimpleNamespace
 
-    # Tokens [0, 16) are locally cached; the load covers tokens [16, 56).
-    assert manager.get_zeroing_block_ids_in_range("req-1", 16, 56) == [11, 12, 13]
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorBase_V1,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
 
+    groups = [
+        SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(participates_in_prefix_caching=True)
+        ),
+        SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(participates_in_prefix_caching=False)
+        ),
+    ]
+    kv_cache_config = SimpleNamespace(kv_cache_groups=groups)
 
-@pytest.mark.cpu_test
-def test_scheduler_filters_connector_loaded_blocks_from_zeroing():
-    """Blocks that will be loaded by the connector must not be zeroed."""
-    from vllm.v1.core.sched.scheduler import Scheduler
+    class _BareConnector(KVConnectorBase_V1):
+        def build_connector_meta(self, *a, **k):
+            return None
 
-    class FakeKVCacheManager:
-        def take_new_block_ids(self):
-            return [9, 10, 11, 12]
+        def get_num_new_matched_tokens(self, *a, **k):
+            return (0, False)
 
-    scheduler = object.__new__(Scheduler)
-    scheduler.needs_kv_cache_zeroing = True
-    scheduler.kv_cache_manager = FakeKVCacheManager()
-    scheduler._skip_zero_block_ids = {10, 12}
+        def save_kv_layer(self, *a, **k):
+            return
 
-    assert scheduler._get_new_block_ids_to_zero() == [9, 11]
-    assert not scheduler._skip_zero_block_ids
+        def start_load_kv(self, *a, **k):
+            return
+
+        def update_state_after_alloc(self, *a, **k):
+            return
+
+        def wait_for_layer_load(self, *a, **k):
+            return
+
+        def wait_for_save(self, *a, **k):
+            return
+
+    base = object.__new__(_BareConnector)
+    base._kv_cache_config = kv_cache_config
+    assert base.get_loaded_kv_cache_group_ids(None) == (0, 1)
+
+    offloading = object.__new__(OffloadingConnector)
+    offloading._kv_cache_config = kv_cache_config
+    assert offloading.get_loaded_kv_cache_group_ids(None) == (0,)
 
 
 @pytest.mark.cpu_test
@@ -1001,8 +1029,7 @@ def test_failed_load_rezeroes_unwritten_skipped_blocks():
 
     # Attention blocks covering tokens >= 48 are re-recorded for zeroing
     # and flow into the next step's zero list; Mamba blocks are not.
-    scheduler._skip_zero_block_ids = set()
-    assert scheduler._get_new_block_ids_to_zero() == [13, 14, 15]
+    assert scheduler._get_new_block_ids_to_zero() == [[13, 14, 15], []]
 
 
 # ── Mamba N-1 prefill tests ──────────────────────────────────────────────
