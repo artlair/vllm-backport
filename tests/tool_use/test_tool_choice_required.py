@@ -8,6 +8,7 @@ import regex as re
 from openai.types.responses import FunctionTool, WebSearchTool
 from pydantic import TypeAdapter
 
+from vllm.exceptions import VLLMValidationError
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
 )
