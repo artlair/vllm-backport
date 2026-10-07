@@ -21,6 +21,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -396,3 +397,19 @@ class DraftModelSpeculator(BaseSpeculator):
         else:
             self.idx_mapping[:num_reqs].copy_(idx_mapping)
             self.idx_mapping[num_reqs:].fill_(-1)
+
+    def _update_draft_decode_metadata(
+        self, attn_metadata: dict[str, Any], num_reqs: int
+    ) -> None:
+        if self.block_tables.cp_size > 1:
+            prepare_dcp_local_seq_lens(
+                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.seq_lens,
+                num_reqs,
+                self.block_tables.cp_size,
+                self.block_tables.cp_rank,
+                self.block_tables.cp_interleave,
+            )
+        for groups in self.attn_groups:
+            for group in groups:
+                group.update_draft_decode_metadata(attn_metadata)

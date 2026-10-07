@@ -168,10 +168,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.use_fused_multi_step_decode = False
             return
 
-        if not self.advance_draft_positions:
-            self.use_fused_multi_step_decode = True
-            return
-
         unsupported_backends = sorted(
             {
                 attn_group.backend.get_name()
@@ -722,6 +718,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
 
+        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            assert self.decode_cudagraph_manager is not None
+            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
+            return
+
         attn_metadata = None
         slot_mappings_by_layer = None
         if not skip_attn:
@@ -731,10 +732,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 positions,
                 batch_desc.num_tokens,
             )
-            if batch_desc.cg_mode != CUDAGraphMode.FULL:
-                slot_mappings_by_layer = build_slot_mappings_by_layer(
-                    slot_mappings, self.kv_cache_config
-                )
+            slot_mappings_by_layer = build_slot_mappings_by_layer(
+                slot_mappings, self.kv_cache_config
+            )
             attn_metadata = self._build_draft_attn_metadata(
                 num_reqs=num_reqs,
                 num_reqs_padded=batch_desc.num_reqs or num_reqs,
@@ -742,11 +742,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
                 step=1,
             )
-
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            assert self.decode_cudagraph_manager is not None
-            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
-            return
 
         self._generate_fused_drafts(
             num_reqs,
@@ -769,13 +764,19 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         idx_mapping = self.idx_mapping[:num_reqs]
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
-        attn_groups = (
-            [group for groups in self.attn_groups for group in groups]
-            if attn_metadata is not None
-            else []
-        )
 
         for step in range(1, self.num_speculative_steps):
+            if attn_metadata is not None and (
+                self.advance_draft_positions or step == 1
+            ):
+                self.block_tables.compute_slot_mappings(
+                    idx_mapping,
+                    query_start_loc,
+                    positions,
+                    num_tokens_padded,
+                )
+                self._update_draft_decode_metadata(attn_metadata, num_reqs)
+
             self.current_draft_step.fill_(step)
             self._generate_draft(
                 num_reqs,
@@ -785,19 +786,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp,
                 cudagraph_runtime_mode,
             )
-            if (
-                step < self.num_speculative_steps - 1
-                and attn_metadata is not None
-                and self.advance_draft_positions
-            ):
-                self.block_tables.compute_slot_mappings(
-                    idx_mapping,
-                    query_start_loc,
-                    positions,
-                    num_tokens_padded,
-                )
-                for attn_group in attn_groups:
-                    attn_group.update_draft_decode_metadata(attn_metadata)
 
     def _generate_draft(
         self,
