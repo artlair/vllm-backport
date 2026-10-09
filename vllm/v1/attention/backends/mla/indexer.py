@@ -730,8 +730,9 @@ def _kpool_tail_slot_mapping_kernel(
 ):
     """Fused compute_kpool_tail_slot_mapping over the WHOLE ``out`` buffer:
     lanes below ``min(num_actual_tokens, qsl[num_reqs])`` get their
-    request's tail slot, every other lane (padding, stale capture length) PAD.
-    The request is ``searchsorted(qsl, t, right=True) - 1`` clamped to
+    request's tail slot (PAD when the request sits on the null block), every
+    other lane (padding, stale capture length) PAD. The request is
+    ``searchsorted(qsl, t, right=True) - 1`` clamped to
     ``[0, num_reqs - 1]``, found by a branch-free binary search."""
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     qsl_end = tl.load(query_start_loc_ptr + num_reqs)
@@ -751,7 +752,10 @@ def _kpool_tail_slot_mapping_kernel(
     rem = pos % kpool
     rem = tl.where(rem < 0, rem + kpool, rem)
     slot = own_block.to(tl.int64) * kpool + rem
-    tl.store(out_ptr + offs, tl.where(real, slot, -1), mask=offs < out_len)
+    # Every scheduled request owns a tail block; the runners give dummy and
+    # padding requests the null block, which must never be written.
+    has_block = own_block != 0
+    tl.store(out_ptr + offs, tl.where(real & has_block, slot, -1), mask=offs < out_len)
 
 
 def compute_kpool_tail_slot_mapping(
@@ -781,7 +785,9 @@ def compute_kpool_tail_slot_mapping(
     padding lanes past the real batch, whose ``req`` would clamp to a live
     request's stale block-table row -- is PAD so the tail stash kernels
     early-out instead of scribbling raw K + gate into another request's
-    in-progress pool.
+    in-progress pool. A real token whose request's block-table row 0 is the
+    null block (dummy and padding requests own no tail block) is PAD for the
+    same reason.
     """
     n = slot_mapping.shape[0]
     if (
@@ -852,9 +858,10 @@ def _compute_kpool_tail_slot_mapping_torch(
     own_block = block_table[:num_reqs, 0].index_select(0, req).to(torch.int64)
     pos = positions[:num_actual_tokens].to(torch.int64)
     real = tokens < query_start_loc[num_reqs]
-    out[:num_actual_tokens] = torch.where(
-        real, own_block * kpool + torch.remainder(pos, kpool), -1
-    )
+    slots = own_block * kpool + torch.remainder(pos, kpool)
+    # Dummy and padding requests sit on the null block, which must never be
+    # written.
+    out[:num_actual_tokens] = torch.where(real & (own_block != 0), slots, -1)
     if _KPOOL_TAIL_CHECK:
         # Diagnostic: how many REAL lanes the generic mapping would have
         # marked PAD (the pre-fix sign test dropped their tail K).
