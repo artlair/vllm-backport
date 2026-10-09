@@ -10,6 +10,7 @@ import torch
 
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -146,8 +147,36 @@ class PPHandler:
             group_desc="pp_broadcast"
         )
 
+        # Keys of the aux hidden states this rank must forward to the next
+        # stage, set by `configure_aux_hidden_state_relay` at load time when
+        # eagle3/dflash drafting relays taps across stages. Empty elsewhere.
+        self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
+
+    def configure_aux_hidden_state_relay(self, model: torch.nn.Module) -> None:
+        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+            aux_hidden_state_relay_keys,
+        )
+
+        self.aux_hidden_state_relay_keys = aux_hidden_state_relay_keys(model)
+
+    def relay_aux_hidden_states(
+        self,
+        intermediate_tensors: IntermediateTensors | None,
+        output_intermediate_tensors: IntermediateTensors,
+    ) -> IntermediateTensors:
+        if not self.aux_hidden_state_relay_keys:
+            return output_intermediate_tensors
+        assert intermediate_tensors is not None
+        return IntermediateTensors(
+            output_intermediate_tensors.tensors
+            | {
+                key: intermediate_tensors[key]
+                for key in self.aux_hidden_state_relay_keys
+            }
+        )
 
     def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,

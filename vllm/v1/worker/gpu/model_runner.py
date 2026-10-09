@@ -151,6 +151,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
+    verify_supports_aux_hidden_states_over_pp,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
@@ -292,15 +293,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    # The drafter itself is already PP-safe: it is only built on
-                    # the last stage (above) and execute_model returns early on
-                    # every other rank, so propose() never runs off-stage. The
-                    # real constraint is that the aux hidden states it consumes
-                    # are appended inside the target's layer loop, so they only
-                    # exist on the rank owning those layers -- that rank must be
-                    # the last one. Methods that cannot state which layers they
-                    # need stay unsupported.
+                if self.use_pp and self.speculative_config.method == "dspark":
+                    # DSpark declares its aux layers up front, and its
+                    # target models do not relay aux states across
+                    # stages, so every tap must live on the last stage.
+                    # eagle3, dflash and extract_hidden_states instead
+                    # configure their taps at load time and relay
+                    # off-stage taps through the PPHandler (verified in
+                    # load_model).
                     aux_layers = self._pp_aux_hidden_state_layers()
                     if aux_layers is None:
                         raise ValueError(
@@ -404,11 +404,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _pp_aux_hidden_state_layers(self) -> list[int] | None:
         """Target layers whose hidden states the drafter consumes, or None.
 
-        Returning None means "cannot tell", which keeps pipeline parallelism
-        rejected for that method rather than letting it run against hidden
-        states that may not exist on this stage. Only DSpark declares its
-        layers up front (``dspark_target_layer_ids``); eagle3/dflash pick theirs
-        elsewhere, so they stay unsupported until they can answer this too.
+        Returning None means "cannot tell". Only DSpark declares its layers up
+        front (``dspark_target_layer_ids``); eagle3/dflash pick theirs at load
+        time and relay off-stage taps through the PPHandler, so their PP
+        support is verified against the loaded target model instead.
         """
         if self.speculative_config is None:
             return None
@@ -467,6 +466,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if self.use_pp:
+                    assert self.speculative_config.method is not None
+                    if self.speculative_config.method != "dspark":
+                        # DSpark keeps the init-time last-stage restriction
+                        # above; everything else relays aux states across
+                        # stages, which only works for targets that opt in.
+                        verify_supports_aux_hidden_states_over_pp(
+                            self.model, self.speculative_config.method
+                        )
+                        assert self.pp_handler is not None
+                        self.pp_handler.configure_aux_hidden_state_relay(self.model)
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)
@@ -1351,7 +1361,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             )
 
-
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
@@ -1944,7 +1953,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
-            return output_intermediate_tensors
+            assert output_intermediate_tensors is not None
+            assert self.pp_handler is not None
+            return self.pp_handler.relay_aux_hidden_states(
+                model_inputs["intermediate_tensors"], output_intermediate_tensors
+            )
         return None
 
     @torch.inference_mode()

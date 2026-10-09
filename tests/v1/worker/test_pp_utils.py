@@ -21,7 +21,6 @@ def make_handler(
     *,
     is_last_rank: bool,
     num_speculative_steps: int,
-    relay_draft_tokens: bool,
     world_size: int = 2,
 ) -> PPHandler:
     """Build a real PPHandler with the PP group stubbed out."""
@@ -36,7 +35,6 @@ def make_handler(
         max_num_reqs=8,
         num_speculative_steps=num_speculative_steps,
         device=torch.device("cuda"),
-        relay_draft_tokens=relay_draft_tokens,
     )
 
 
@@ -51,13 +49,14 @@ def record_broadcasts(monkeypatch) -> list[torch.Tensor]:
 
 def make_input_batch(num_reqs: int = 3, *, needs_sample: bool = True):
     # compute_need_sampled_mask only reads these fields. With needs_sample=False
-    # every request is already at max_seq_len, so no sample is needed next step.
+    # the scheduled chunk is a non-final prefill chunk, so no sample is needed
+    # next step.
     return SimpleNamespace(
         num_reqs=num_reqs,
         num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
-        prefill_len_np=np.full(num_reqs, 4, dtype=np.int32),
+        prefill_len_np=np.full(num_reqs, 4 if needs_sample else 100, dtype=np.int32),
         num_scheduled_tokens=np.full(num_reqs, 4, dtype=np.int32),
-        max_seq_len_np=np.full(num_reqs, 100 if needs_sample else 1, dtype=np.int32),
+        max_seq_len_np=np.full(num_reqs, 100, dtype=np.int32),
         idx_mapping=torch.arange(num_reqs, device="cuda"),
         idx_mapping_np=np.arange(num_reqs, dtype=np.int32),
     )
@@ -90,7 +89,6 @@ def test_broadcast_pads_sampled_tokens_to_max_sample_len(monkeypatch, width, num
         monkeypatch,
         is_last_rank=True,
         num_speculative_steps=num_spec,
-        relay_draft_tokens=True,
     )
     calls = record_broadcasts(monkeypatch)
     input_batch = make_input_batch()
@@ -113,19 +111,12 @@ def test_broadcast_pads_sampled_tokens_to_max_sample_len(monkeypatch, width, num
 @requires_cuda
 def test_send_and_recv_op_counts_match_with_speculator(monkeypatch):
     """With a speculator the step is three broadcasts: sampled, combined, draft."""
-    sender = make_handler(
-        monkeypatch, is_last_rank=True, num_speculative_steps=3, relay_draft_tokens=True
-    )
+    sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(), width=1, with_draft=True)
     assert len(calls) == 3
 
-    receiver = make_handler(
-        monkeypatch,
-        is_last_rank=False,
-        num_speculative_steps=3,
-        relay_draft_tokens=True,
-    )
+    receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=3)
     calls.clear()
     assert receiver.receive(make_input_batch())
     assert len(calls) == 3
@@ -133,27 +124,17 @@ def test_send_and_recv_op_counts_match_with_speculator(monkeypatch):
 
 
 @requires_cuda
-def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
-    """Diffusion LLMs set num_speculative_steps > 0 but have no speculator, so
-    the last rank never relays draft tokens. Gating the receiver's third recv on
-    num_speculative_steps instead of on the speculator hangs the non-last ranks
-    waiting for a broadcast that is never issued."""
-    sender = make_handler(
-        monkeypatch,
-        is_last_rank=True,
-        num_speculative_steps=3,
-        relay_draft_tokens=False,
-    )
+def test_send_and_recv_op_counts_match_without_spec_decode(monkeypatch):
+    """With num_speculative_steps == 0 the step is two broadcasts: sampled and
+    combined. The draft relay is gated on max_sample_len on BOTH sides, so a
+    run without draft tokens never posts the third collective the other rank
+    would wait for."""
+    sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=0)
     calls = record_broadcasts(monkeypatch)
-    send_step(sender, make_input_batch(), width=1, with_draft=False)
+    send_step(sender, make_input_batch(), width=1, with_draft=True)
     assert len(calls) == 2
 
-    receiver = make_handler(
-        monkeypatch,
-        is_last_rank=False,
-        num_speculative_steps=3,
-        relay_draft_tokens=False,
-    )
+    receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=0)
     calls.clear()
     assert receiver.receive(make_input_batch())
     assert len(calls) == 2
@@ -163,19 +144,12 @@ def test_send_and_recv_op_counts_match_without_speculator(monkeypatch):
 @requires_cuda
 def test_both_ranks_skip_when_no_request_needs_sampling(monkeypatch):
     """The skip gate must be symmetric, or the ranks desynchronize."""
-    sender = make_handler(
-        monkeypatch, is_last_rank=True, num_speculative_steps=3, relay_draft_tokens=True
-    )
+    sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
     calls = record_broadcasts(monkeypatch)
     send_step(sender, make_input_batch(needs_sample=False), width=1, with_draft=True)
     assert calls == []
 
-    receiver = make_handler(
-        monkeypatch,
-        is_last_rank=False,
-        num_speculative_steps=3,
-        relay_draft_tokens=True,
-    )
+    receiver = make_handler(monkeypatch, is_last_rank=False, num_speculative_steps=3)
     calls.clear()
     assert not receiver.receive(make_input_batch(needs_sample=False))
     assert calls == []

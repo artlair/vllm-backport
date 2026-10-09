@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from bisect import bisect_left
 from collections.abc import Iterable
 from typing import ClassVar, Literal
 
@@ -580,6 +581,30 @@ class Glm5NextDecoderLayer(nn.Module):
 
 
 class Glm5NextModel(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
+    def _cache_aux_pp_layout(self) -> None:
+        # GLM captures each tap at layer ENTRY, so a tap at this stage's
+        # start_layer is produced locally, not relayed from upstream: the
+        # upstream tap count is bisect_left, not the capture-after
+        # bisect_right the mixin defaults to.
+        from vllm.distributed.parallel_state import (
+            get_pp_group,
+            model_parallel_is_initialized,
+        )
+
+        if not model_parallel_is_initialized():
+            return
+        pp = get_pp_group()
+        if pp.world_size < 2:
+            return
+        if not pp.is_first_rank:
+            self._aux_slot_base_cached = bisect_left(
+                self.aux_hidden_state_layers, self.start_layer
+            )
+        if pp.is_last_rank:
+            self._aux_upstream_total_cached = self._aux_slot_base_cached
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -688,6 +713,33 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         completed = self._aux_post_op(hidden_states, residual, post, comb)
         return hc_contract(completed, self.config.mhc_num_residual_streams)
 
+    def _entry_aux_state(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        post: torch.Tensor | None,
+        comb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Capture-safe aux state for the stream entering ``layer_idx``.
+
+        In-loop taps (deferred hc_post pending) complete and contract the
+        widened stream via ``_aux_hidden_state``. At a PP entry boundary
+        (``post is None``) the raw stream is captured instead: on a non-first
+        rank it is the widened mHC state the sender shipped, so it is
+        contracted here; otherwise it is cloned so the layer's in-place
+        residual update cannot mutate the tap after capture.
+        """
+        if post is not None:
+            return self._aux_hidden_state(hidden_states, residual, post, comb)
+        if (
+            layer_idx == self.start_layer
+            and not get_pp_group().is_first_rank
+            and getattr(self.config, "mhc", False)
+        ):
+            return hc_contract(hidden_states, self.config.mhc_num_residual_streams)
+        return hidden_states.clone()
+
     def make_empty_intermediate_tensors(
         self,
         batch_size: int,
@@ -739,6 +791,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             post = None
             comb = None
 
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         full_num_tokens = positions.shape[0]
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
@@ -764,8 +817,8 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         aux_hidden_states: list[torch.Tensor] = []
         for idx, layer in enumerate(self._active_layers, start=self.start_layer):
             if idx in self.aux_hidden_state_layers:
-                aux_hidden_state = self._aux_hidden_state(
-                    hidden_states, residual, post, comb
+                aux_hidden_state = self._entry_aux_state(
+                    idx, hidden_states, residual, post, comb
                 )
                 if self.is_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
@@ -793,7 +846,12 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
                 hidden_states = self._active_layers[-1].hc_post(
                     hidden_states, residual, post, comb
                 )
-            return IntermediateTensors({"hidden_states": hidden_states})
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
+            )
 
         if self.end_layer in self.aux_hidden_state_layers:
             final_aux = self._aux_hidden_state(hidden_states, residual, post, comb)
@@ -805,6 +863,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
