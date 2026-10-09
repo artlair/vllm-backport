@@ -2601,6 +2601,179 @@ def test_get_kv_cache_config_mamba_hybrid_sharing_beats_cross_layers_flag():
     assert {t.size for t in kv_cache_config.kv_cache_tensors} == {bytes_per_block * 100}
 
 
+_GLM53_PP_PARTITION = (10, 8, 8, 7, 7, 5)
+
+
+def _glm53_dflash2_tp4_worker_specs() -> list[dict[str, KVCacheSpec]]:
+    """Per-PP-stage KV specs of the production GLM-5.3-Flash DFlash2 lane.
+
+    TP4 x PP6 (``VLLM_PP_LAYER_PARTITION=10,8,8,7,7,5``), bf16 KV, 7 draft
+    tokens. Attention blocks are forced to 1152 tokens so the 1.18 MB MLA page
+    (kv_lora 512, no rope dims) holds the KDA state (bf16 conv (6144, 10) plus
+    fp32 recurrent (16, 128, 128), padded 0.70% up). The kpool=4 indexer page
+    is 288 * 132 B and the tail ring is 16 tokens. The DFlash2 draft is 5
+    sliding-window (2048) layers with 2 KV heads of 128 per rank, all on the
+    last stage, which has a single MLA layer (43).
+    """
+    mla = MLAAttentionSpec(
+        block_size=1152, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
+    )
+    indexer = MLAAttentionSpec(
+        block_size=1152,
+        num_kv_heads=1,
+        head_size=132,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+    )
+    tail = KpoolTailSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.bfloat16,
+        sliding_window=16,
+    )
+    mamba = MambaSpec(
+        block_size=1152,
+        shapes=((6144, 10), (16, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+        page_size_padded=mla.page_size_bytes,
+        mamba_cache_mode="align",
+        num_speculative_blocks=7,
+    )
+    draft = SlidingWindowSpec(
+        block_size=1152,
+        num_kv_heads=2,
+        head_size=128,
+        dtype=torch.bfloat16,
+        sliding_window=2048,
+    )
+    worker_specs: list[dict[str, KVCacheSpec]] = []
+    start = 0
+    for num_layers in _GLM53_PP_PARTITION:
+        spec: dict[str, KVCacheSpec] = {}
+        for i in range(start, start + num_layers):
+            prefix = f"language_model.model.layers.{i}"
+            if i % 4 == 3:
+                spec[f"{prefix}.self_attn.attn"] = mla
+                spec[f"{prefix}.self_attn.indexer.k_cache"] = indexer
+                spec[f"{prefix}.self_attn.indexer.tail"] = tail
+            else:
+                spec[f"{prefix}.linear_attn"] = mamba
+        start += num_layers
+        worker_specs.append(spec)
+    for j in range(5):
+        worker_specs[-1][f"model.layers.{5 + j}.self_attn.attn"] = draft
+    return worker_specs
+
+
+def _glm53_dflash2_vllm_config(monkeypatch) -> VllmConfig:
+    monkeypatch.setattr(ModelConfig, "get_total_num_hidden_layers", lambda self: 45)
+    monkeypatch.setenv(
+        "VLLM_PP_LAYER_PARTITION", ",".join(map(str, _GLM53_PP_PARTITION))
+    )
+    # PP6 with async scheduling on the V2 runner keeps pp + 1 batches in flight.
+    monkeypatch.setattr(VllmConfig, "max_concurrent_batches", property(lambda _: 7))
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=8192))
+    # A 6-stage ParallelConfig fails validation on a single-GPU host.
+    vllm_config.parallel_config.pipeline_parallel_size = 6
+    vllm_config.speculative_config = SimpleNamespace(
+        method="dflash",
+        num_speculative_tokens=7,
+        use_eagle=lambda: True,
+        use_multi_module_mtp=lambda: False,
+    )
+    return vllm_config
+
+
+def test_glm53_dflash2_draft_packs_into_last_stage_mla_slot(monkeypatch):
+    """DFlash2's plain sliding-window draft next to the GLM-5.3-Flash target
+    (real TP4/PP6 geometry) must keep the MLA/Mamba slot sharing.
+
+    The general path tried to unify the drafter's page with the MLA and kpool
+    indexer pages and raised NotImplementedError (MLA pages cannot be padded),
+    crash-looping the lane. The draft now gets its own EAGLE group whose pages
+    are packed into the last stage's single MLA slot, so it costs no bytes per
+    block, every stage keeps the same block count, and each draft page of block
+    b lies inside the bytes block b owns in the MLA group.
+    """
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    vllm_config = _glm53_dflash2_vllm_config(monkeypatch)
+    worker_specs = _glm53_dflash2_tp4_worker_specs()
+    mla_page = worker_specs[0]["language_model.model.layers.3.self_attn.attn"]
+    mla_page_bytes = mla_page.page_size_bytes
+    idx_page_bytes = worker_specs[0][
+        "language_model.model.layers.3.self_attn.indexer.k_cache"
+    ].page_size_bytes
+    stage0_bytes_per_block = 2 * (mla_page_bytes + idx_page_bytes)
+    num_blocks = 128
+
+    configs = get_kv_cache_configs(
+        vllm_config,
+        worker_specs,
+        [stage0_bytes_per_block * num_blocks] * len(worker_specs),
+    )
+
+    groups = configs[-1].kv_cache_groups
+    draft_groups = [g for g in groups if type(g.kv_cache_spec) is SlidingWindowSpec]
+    assert len(draft_groups) == 1
+    draft_group = draft_groups[0]
+    draft_spec = cast(SlidingWindowSpec, draft_group.kv_cache_spec)
+    # 5 pages of 192 tokens * 1 KiB fit one 1152-token MLA page; 288 would not.
+    assert draft_spec.block_size == 192
+    assert draft_spec.page_size_bytes == mla_page_bytes
+    assert 5 * draft_spec.unpadded_page_size_bytes <= mla_page_bytes
+    assert [g.is_eagle_group for g in groups] == [g is draft_group for g in groups]
+
+    assert {cfg.num_blocks for cfg in configs} == {num_blocks}
+    last = configs[-1]
+    assert kv_cache_utils._pool_bytes_per_block(last.kv_cache_groups) == (
+        mla_page_bytes + idx_page_bytes
+    )
+    assert {t.size for t in last.kv_cache_tensors} == {
+        num_blocks * (mla_page_bytes + idx_page_bytes)
+    }
+
+    caches = allocate_kv_cache(last, torch.device("cpu"), KVCacheLayout.LBHNC)
+    mla_cache = caches["language_model.model.layers.43.self_attn.attn"]
+    draft_caches = [caches[name] for name in draft_group.layer_names]
+    for block in range(num_blocks):
+        mla_start = mla_cache[block].data_ptr()
+        spans = sorted(
+            (cache[block].data_ptr(), cache[block].data_ptr() + cache[block].nbytes)
+            for cache in draft_caches
+        )
+        assert all(cache[block].is_contiguous() for cache in draft_caches)
+        assert spans[0][0] >= mla_start
+        assert spans[-1][1] <= mla_start + mla_page_bytes
+        assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:]))
+
+
+def test_glm53_dflash2_scheduler_config_keeps_draft_eagle_group(monkeypatch):
+    """The scheduler config is built from stage 0, where the PP-projected draft
+    group is empty and unflagged. Without the global flag no group is an EAGLE
+    group, so the coordinator flags them all and the Mamba groups lose prefix
+    reuse (vllm#52047)."""
+    vllm_config = _glm53_dflash2_vllm_config(monkeypatch)
+    worker_specs = _glm53_dflash2_tp4_worker_specs()
+    stage0_bytes_per_block = 2 * (1152 * 1024 + 288 * 132)
+    configs = get_kv_cache_configs(
+        vllm_config,
+        worker_specs,
+        [stage0_bytes_per_block * 128] * len(worker_specs),
+    )
+    assert not any(g.is_eagle_group for g in configs[0].kv_cache_groups)
+
+    scheduler_config = generate_scheduler_kv_cache_config(configs)
+    assert [g.is_eagle_group for g in scheduler_config.kv_cache_groups] == [
+        type(g.kv_cache_spec) is SlidingWindowSpec
+        for g in scheduler_config.kv_cache_groups
+    ]
+    assert sum(g.is_eagle_group for g in scheduler_config.kv_cache_groups) == 1
+
+
 def test_get_kv_cache_config_mamba_hybrid_sharing_no_indexer():
     """Kimi-Linear-like: MLA without indexer layers, idx_stride == 0."""
     model_config = ModelConfig(max_model_len=8192)
