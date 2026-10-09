@@ -35,6 +35,59 @@ from vllm.v1.kv_offload.base import (
 logger = init_logger(__name__)
 
 
+def _find_packed_layers(
+    tensors_per_block: dict[str, tuple[torch.Tensor, ...]],
+    unpadded_page_size_bytes: dict[str, int],
+) -> dict[str, tuple[str, int]]:
+    """Map each layer packed inside another layer's page to (host, offset).
+
+    GLM-5.3-Flash packs several draft pages into one MLA page per block (same
+    block stride, later start inside the MLA page). Such a layer has no
+    transfer region of its own.
+    """
+    views = sorted(
+        (
+            (tensors[0].data_ptr(), tensors[0].stride(0), tensors[0].shape[1], name)
+            for name, tensors in tensors_per_block.items()
+            if len(tensors) == 1
+        ),
+    )
+    hosts: list[tuple[int, int, int, str]] = []
+    packed: dict[str, tuple[str, int]] = {}
+    for ptr, stride, page, name in views:
+        end = ptr + unpadded_page_size_bytes[name]
+        host = next(
+            (
+                host
+                for host in hosts
+                if host[1] == stride and host[0] < ptr and end <= host[0] + host[2]
+            ),
+            None,
+        )
+        if host is None:
+            hosts.append((ptr, stride, page, name))
+        else:
+            packed[name] = (host[3], ptr - host[0])
+    return packed
+
+
+def _merge_refs_per_tensor(
+    refs: list[CanonicalKVCacheRef],
+) -> list[CanonicalKVCacheRef]:
+    """Copy each tensor once per group block, covering every ref's bytes."""
+    merged: dict[int, CanonicalKVCacheRef] = {}
+    for ref in refs:
+        prev = merged.get(ref.tensor_idx)
+        if prev is None:
+            merged[ref.tensor_idx] = ref
+        elif prev != ref:
+            merged[ref.tensor_idx] = CanonicalKVCacheRef(
+                tensor_idx=ref.tensor_idx,
+                page_size_bytes=max(prev.page_size_bytes, ref.page_size_bytes),
+            )
+    return list(merged.values())
+
+
 class OffloadingConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -152,10 +205,13 @@ class OffloadingConnectorWorker:
 
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
+        packed_in = _find_packed_layers(tensors_per_block, unpadded_page_size_bytes)
         # Layers that alias the same bytes (cache groups overlay each other) share
         # one transfer region: exactly the views with equal address and strides.
         aliased_layers: dict[tuple[int, tuple[int, ...]], list[str]] = defaultdict(list)
         for layer_name, layer_tensors in tensors_per_block.items():
+            if layer_name in packed_in:
+                continue
             view = layer_tensors[0]
             aliased_layers[(view.data_ptr(), view.stride())].append(layer_name)
 
@@ -191,12 +247,23 @@ class OffloadingConnectorWorker:
                         )
                     )
 
+        # A packed layer rides its host's transfer region, copying the host page
+        # from its start through the end of the packed layer's bytes.
+        for layer_name, (host_name, offset) in packed_in.items():
+            (host_ref,) = block_data_refs[host_name]
+            block_data_refs[layer_name].append(
+                CanonicalKVCacheRef(
+                    tensor_idx=host_ref.tensor_idx,
+                    page_size_bytes=offset + unpadded_page_size_bytes[layer_name],
+                )
+            )
+
         group_data_refs: list[list[CanonicalKVCacheRef]] = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             group_refs: list[CanonicalKVCacheRef] = []
             for layer_name in kv_cache_group.layer_names:
                 group_refs += block_data_refs[layer_name]
-            group_data_refs.append(group_refs)
+            group_data_refs.append(_merge_refs_per_tensor(group_refs))
 
         canonical_kv_caches = CanonicalKVCaches(
             tensors=block_tensors,

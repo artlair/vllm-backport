@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.base import (
@@ -636,3 +637,63 @@ def test_register_kv_caches_uniform_type(backend):
     # opaque mapping rather than a certified, parallelism-agnostic one
     assert group_refs[0].mapping.parallelism_agnostic
     assert not group_refs[1].mapping.parallelism_agnostic
+
+
+def test_register_kv_caches_packed_draft_rides_host_page():
+    """GLM-5.3-Flash packs a drafter's pages into an MLA page (same block
+    stride, later start). They must share the MLA page's transfer region; a
+    region per draft view overflows the per-block offload slot, which is sized
+    to the GPU bytes per block, and kills worker startup.
+    """
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    mla_spec = MLAAttentionSpec(
+        block_size=BLOCK_SIZE, num_kv_heads=1, head_size=HEAD_SIZE, dtype=DTYPE
+    )
+    mla_page = mla_spec.page_size_bytes
+    draft_spec = SlidingWindowSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=32,
+        dtype=DTYPE,
+        sliding_window=8,
+        page_size_padded=mla_page,
+    )
+    draft_page = draft_spec.unpadded_page_size_bytes
+    draft_names = [f"draft.layers.{i}.attn" for i in range(3)]
+    assert 3 * draft_page <= mla_page
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=mla_page * NUM_BLOCKS,
+                layers=[name],
+                layer_stride=mla_page * NUM_BLOCKS,
+                block_stride=mla_page,
+                offset=offset,
+            )
+            for name, offset in [
+                ("mla.attn", 0),
+                *((name, i * draft_page) for i, name in enumerate(draft_names)),
+            ]
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["mla.attn"], kv_cache_spec=mla_spec),
+            KVCacheGroupSpec(layer_names=draft_names, kv_cache_spec=draft_spec),
+        ],
+    )
+    kv_caches = allocate_kv_cache(
+        kv_cache_config, torch.device("cpu"), KVCacheLayout.LBHNC, [BLOCK_SIZE, 4]
+    )
+
+    worker, spec = _make_worker(kv_cache_config)
+    worker.register_kv_caches(kv_caches)
+
+    canonical = spec.get_worker.call_args[0][0]
+    assert [t.tensor.shape for t in canonical.tensors] == [(NUM_BLOCKS, mla_page)]
+    mla_refs, draft_refs = canonical.group_data_refs
+    assert [(r.tensor_idx, r.page_size_bytes) for r in mla_refs] == [(0, mla_page)]
+    assert [(r.tensor_idx, r.page_size_bytes) for r in draft_refs] == [
+        (0, 3 * draft_page)
+    ]
