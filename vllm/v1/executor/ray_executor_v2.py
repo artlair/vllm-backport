@@ -46,6 +46,15 @@ else:
 logger = init_logger(__name__)
 
 
+def _ray_death_cause(run_ref: "ObjectRef") -> str:
+    """Ray's account of why a worker's run() ended (signal, OOM kill, ...)."""
+    try:
+        ray.get(run_ref, timeout=0)
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return "run() returned normally"
+
+
 @dataclass
 class RayWorkerHandle:
     """Handle for a Ray worker actor, compatible with MultiprocExecutor."""
@@ -529,6 +538,12 @@ class RayExecutorV2(MultiprocExecutor):
                     "RayWorkerProc rank=%s died unexpectedly, shutting down executor.",
                     dead_ranks,
                 )
+                for ref in done:
+                    logger.error(
+                        "RayWorkerProc rank=%s death cause: %s",
+                        ref_to_rank[ref],
+                        _ray_death_cause(ref),
+                    )
                 executor.shutdown()
                 if executor.failure_callback is not None:
                     callback = executor.failure_callback
