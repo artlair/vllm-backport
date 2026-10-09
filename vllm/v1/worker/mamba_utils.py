@@ -388,8 +388,8 @@ def postprocess_mamba_fused_kernel(
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
-    # per-request decision arrays are in req-state-slot order; the block table
-    # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
+    # per-request decision arrays and the block tables are both in
+    # req-state-slot order.
     idx_mapping_ptr,
     # Runtime parameter (varies per batch - NOT constexpr to avoid recompilation)
     num_reqs,
@@ -410,10 +410,6 @@ def postprocess_mamba_fused_kernel(
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
-    # Address block-table rows by request slot (req_idx) instead of batch row.
-    # Required when the kernel runs AFTER the batch it belongs to (the PP
-    # relay-consume path): the batch-order tables then hold a different batch.
-    BT_ROW_IS_REQ: tl.constexpr = False,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -478,10 +474,7 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
-    if BT_ROW_IS_REQ:
-        bt_row_idx = req_idx
-    else:
-        bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+    bt_row_idx = req_idx
     _copy_mamba_state_block(
         state_idx,
         bt_row_idx,
@@ -615,7 +608,7 @@ def precopy_mamba_align_fused_kernel(
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
-        batch_idx,
+        req_idx,
         src_col,
         dst_col,
         token_bias,
@@ -756,13 +749,10 @@ class MambaSpecDecodeGPUContext:
 
     # Per-group block-table base addresses: int64[num_groups]. Populated in
     # initialize_from_forward_context from the persistent per-group block
-    # table tensors (whose data_ptr is stable across steps).
+    # table tensors (whose data_ptr is stable across steps). Rows are request
+    # state slots for the state copies and batch rows for the aligned indices.
     block_table_ptrs: torch.Tensor
-    # Per-request-SLOT block tables (the persistent tables the batch-order
-    # input tables are gathered from), for kernels that run after their batch
-    # has been replaced (PP relay-consume postprocess). None until set.
-    slot_block_table_ptrs: torch.Tensor | None = None
-    slot_block_table_stride_req: int = 0
+    aligned_index_block_table_ptrs: torch.Tensor
     block_table_stride_req: int = 0
 
     # persistent output for the once-per-step, all-group aligned-index launch.
@@ -838,6 +828,9 @@ class MambaSpecDecodeGPUContext:
             block_table_ptrs=torch.zeros(
                 len(mamba_group_ids), dtype=torch.int64, device=device
             ),
+            aligned_index_block_table_ptrs=torch.zeros(
+                len(mamba_group_ids), dtype=torch.int64, device=device
+            ),
             aligned_state_indices=torch.empty(
                 (
                     len(mamba_group_ids),
@@ -862,6 +855,7 @@ class MambaSpecDecodeGPUContext:
         forward_context: dict[str, Any],
         mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
         block_tables: list[torch.Tensor],
+        aligned_index_block_tables: list[torch.Tensor] | None = None,
     ) -> None:
         """
         Extract and cache memory layout metadata from Mamba state tensors.
@@ -894,8 +888,12 @@ class MambaSpecDecodeGPUContext:
             mamba_state_copy_funcs: Tuple of copy functions (one per state type)
                 used to determine whether each state is a conv or temporal state.
             block_tables: per-mamba-group persistent block-table tensors, in
-                the same order as `mamba_group_ids`. Their `data_ptr()` /
-                `stride(0)` are captured once for the kernel to index into.
+                the same order as `mamba_group_ids`, with one row per request
+                state slot. Their `data_ptr()` / `stride(0)` are captured once
+                for the state-copy kernels to index into.
+            aligned_index_block_tables: per-mamba-group persistent tables
+                read by `compute_aligned_state_indices`, with one row per
+                batch row. Defaults to `block_tables`.
         """
         if self.is_initialized:
             return
@@ -906,6 +904,7 @@ class MambaSpecDecodeGPUContext:
                 forward_context,
                 mamba_state_copy_funcs,
                 block_tables,
+                aligned_index_block_tables or block_tables,
             )
 
     def _populate_metadata(
@@ -914,6 +913,7 @@ class MambaSpecDecodeGPUContext:
         forward_context: dict[str, Any],
         mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
         block_tables: list[torch.Tensor],
+        aligned_index_block_tables: list[torch.Tensor],
     ) -> None:
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
@@ -1010,32 +1010,21 @@ class MambaSpecDecodeGPUContext:
         # `block_tables[i]` is the persistent 2D int32 block-table tensor for
         # `mamba_group_ids[i]`; `data_ptr()` / `stride(0)` are stable for the
         # engine's lifetime, so we capture them once here.
-        assert len(block_tables) == self.num_groups, (
-            f"expected {self.num_groups} block tables, got {len(block_tables)}"
-        )
-        strides = {bt.stride(0) for bt in block_tables}
+        assert len(block_tables) == len(aligned_index_block_tables) == self.num_groups
+        strides = {bt.stride(0) for bt in (*block_tables, *aligned_index_block_tables)}
         assert len(strides) == 1, (
             f"all mamba block tables must share stride(0), got {strides}"
         )
         self.block_table_stride_req = int(next(iter(strides)))
-        for i, bt in enumerate(block_tables):
+        for i, (bt, aligned_bt) in enumerate(
+            zip(block_tables, aligned_index_block_tables)
+        ):
             self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
+            self.aligned_index_block_table_ptrs[i] = _reinterpret_u64_as_i64(
+                aligned_bt.data_ptr()
+            )
 
         self.is_initialized = True
-
-    def set_slot_block_tables(self, slot_block_tables: list[torch.Tensor]) -> None:
-        """Capture the per-request-slot block tables (same order as
-        ``mamba_group_ids``) for ``run_fused_postprocess_align``."""
-        assert len(slot_block_tables) == self.num_groups
-        strides = {bt.stride(0) for bt in slot_block_tables}
-        assert len(strides) == 1, strides
-        self.slot_block_table_stride_req = int(next(iter(strides)))
-        ptrs = torch.zeros(
-            self.num_groups, dtype=torch.int64, device=self.block_table_ptrs.device
-        )
-        for i, bt in enumerate(slot_block_tables):
-            ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
-        self.slot_block_table_ptrs = ptrs
 
     def compute_aligned_state_indices(
         self,
@@ -1055,7 +1044,7 @@ class MambaSpecDecodeGPUContext:
         block_rows = 32
         grid = (triton.cdiv(num_reqs, block_rows),)
         get_aligned_state_indices_multi_group_kernel[grid](
-            self.block_table_ptrs,
+            self.aligned_index_block_table_ptrs,
             seq_lens,
             self.aligned_state_indices,
             self.block_table_stride_req,
@@ -1206,19 +1195,14 @@ class MambaSpecDecodeGPUContext:
 
         total_states = self.num_layers * self.num_state_types
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
-        # Under PP this runs on non-last ranks when the sampled outputs are
-        # consumed, pp_size steps after the forward: the batch-order input
-        # block tables then describe a DIFFERENT batch, so address rows by
-        # request slot through the persistent per-slot tables.
-        use_slot = self.slot_block_table_ptrs is not None
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_snapshot,
             state_idx_gpu,
             None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED
             new_num_computed_tokens_gpu,
             None,  # num_draft: unused under PRECOMPUTED_NEW_COMPUTED
-            self.slot_block_table_ptrs if use_slot else self.block_table_ptrs,
-            self.slot_block_table_stride_req if use_slot else self.block_table_stride_req,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
             self.state_base_addrs,
             self.state_block_strides,
             self.state_elem_sizes,
@@ -1236,7 +1220,6 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
-            BT_ROW_IS_REQ=use_slot,
         )
 
 
