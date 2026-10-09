@@ -228,3 +228,48 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
     # 4. Assert that the layers are DFlash2Qwen3DecoderLayer (the subclass)
     assert len(model.layers) == 2
     assert isinstance(model.layers[0], DFlash2Qwen3DecoderLayer)
+
+
+def test_pp_drafter_loads_target_embedding_from_checkpoint(tmp_path):
+    """incoai/GLM-5.3-Flash-DFlash2 ships no embed_tokens and relies on the
+    target's. Under PP the drafting stage has no target embedding to share, so
+    the loader reads it from the target checkpoint (via the shard index, under
+    GLM's multimodal key) instead of leaving the draft's embedding
+    uninitialized, which silently collapses acceptance.
+    """
+    import json
+
+    from safetensors.torch import save_file
+
+    from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
+        _load_target_embedding_into_draft,
+    )
+
+    weight = torch.randn(32, 8)
+    save_file(
+        {
+            "model.language_model.embed_tokens.weight": weight,
+            "lm_head.weight": torch.zeros(32, 8),
+        },
+        tmp_path / "model-00001-of-00001.safetensors",
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.language_model.embed_tokens.weight": (
+                        "model-00001-of-00001.safetensors"
+                    ),
+                    "lm_head.weight": "model-00001-of-00001.safetensors",
+                }
+            }
+        )
+    )
+    draft_embed = torch.nn.Embedding(32, 8)
+    torch.nn.init.zeros_(draft_embed.weight)
+
+    _load_target_embedding_into_draft(
+        draft_embed, SimpleNamespace(model=str(tmp_path), revision=None)
+    )
+
+    torch.testing.assert_close(draft_embed.weight.data, weight)

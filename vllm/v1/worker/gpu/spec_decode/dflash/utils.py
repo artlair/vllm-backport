@@ -1,14 +1,78 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
+
+import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import ModelConfig, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
 )
+
+logger = init_logger(__name__)
+
+_TARGET_EMBED_NAMES = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+    "language_model.model.embed_tokens.weight",
+)
+
+
+def _read_target_embedding(model_config: ModelConfig) -> torch.Tensor:
+    """Read the target's input embedding from its safetensors checkpoint."""
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+
+    def resolve(filename: str) -> str:
+        if os.path.isdir(model_config.model):
+            return os.path.join(model_config.model, filename)
+        return hf_hub_download(
+            model_config.model, filename, revision=model_config.revision
+        )
+
+    try:
+        index_path = resolve("model.safetensors.index.json")
+        with open(index_path) as f:
+            weight_map: dict[str, str] = json.load(f)["weight_map"]
+    except (OSError, KeyError):
+        weight_map = {name: "model.safetensors" for name in _TARGET_EMBED_NAMES}
+    for name in _TARGET_EMBED_NAMES:
+        if name not in weight_map:
+            continue
+        with safe_open(resolve(weight_map[name]), framework="pt") as f:
+            if name in f.keys():  # noqa: SIM118
+                return f.get_tensor(name)
+    raise RuntimeError(
+        f"no input embedding ({', '.join(_TARGET_EMBED_NAMES)}) in the target "
+        f"checkpoint {model_config.model}"
+    )
+
+
+def _load_target_embedding_into_draft(
+    draft_embed: nn.Module, model_config: ModelConfig
+) -> None:
+    """Give a PP-stage drafter the target embedding it cannot share.
+
+    A drafter checkpoint without its own embedding relies on the target's, but
+    under PP the drafting (last) stage holds no target embedding: it lives on
+    the first stage. Left alone, the draft's embedding stays uninitialized and
+    every anchor/mask token embeds to garbage; acceptance collapses with no
+    error (the same failure GLM-5.3-Flash MTP had, c10a067fe2).
+    """
+    weight = _read_target_embedding(model_config)
+    param = draft_embed.weight
+    getattr(param, "weight_loader", default_weight_loader)(param, weight)
+    logger.info(
+        "Loaded the target input embedding %s into the PP drafter",
+        tuple(weight.shape),
+    )
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -54,8 +118,15 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
 
-    # Skip embedding sharing under PP — each rank owns its own embedding.
-    if get_pp_group().world_size == 1:
+    # Under PP the target embedding lives on the first stage, so a drafter
+    # without its own embedding loads the target's from the checkpoint.
+    if get_pp_group().world_size > 1:
+        draft_embed = getattr(draft_inner, "embed_tokens", None)
+        if draft_embed is not None and not getattr(
+            dflash_model, "has_own_embed_tokens", False
+        ):
+            _load_target_embedding_into_draft(draft_embed, vllm_config.model_config)
+    else:
         target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
             target_inner, "embedding", None
         )
