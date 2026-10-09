@@ -173,6 +173,7 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import use_workspace_lane
 
 logger = init_logger(__name__)
+_AUX_TRACE_MAX = int(os.environ.get("VLLM_DFLASH_AUX_TRACE", "0"))
 
 _KPOOL_TAIL_GENERIC_EXCLUDE = (
     os.environ.get("VLLM_KPOOL_TAIL_GENERIC_EXCLUDE", "1") != "0"
@@ -1934,6 +1935,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             output_intermediate_tensors = model_output
 
+        if _AUX_TRACE_MAX and not dummy_run:
+            self._trace_aux_hidden_states(
+                model_inputs, aux_hidden_states, output_intermediate_tensors
+            )
+
         routed_experts = None
         if not dummy_run and (capturer := self.routed_experts_capturer) is not None:
             assert slot_mappings is not None
@@ -1959,6 +1965,69 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
         return None
+
+    def _trace_aux_hidden_states(
+        self,
+        model_inputs: dict[str, Any],
+        aux_hidden_states: list[torch.Tensor] | None,
+        output_intermediate_tensors: IntermediateTensors | None,
+    ) -> None:
+        """Debug (VLLM_DFLASH_AUX_TRACE=N): log aux tap norms for N small steps.
+
+        Run outside any CUDA graph, on TP rank 0, so the drafting stage's taps
+        can be matched by position against the stages that produced them.
+        """
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        count = getattr(self, "_aux_trace_count", 0)
+        positions = model_inputs["positions"]
+        if (
+            count >= _AUX_TRACE_MAX
+            or positions.shape[-1] > 16
+            or get_tensor_model_parallel_rank() != 0
+        ):
+            return
+        if aux_hidden_states is not None:
+            taps = {f"tap{i}": t for i, t in enumerate(aux_hidden_states)}
+        elif output_intermediate_tensors is not None:
+            taps = {
+                k: v
+                for k, v in output_intermediate_tensors.tensors.items()
+                if k != "hidden_states"
+            }
+        else:
+            return
+        if not taps:
+            return
+        self._aux_trace_count = count + 1
+        rows = min(3, positions.shape[-1])
+        input_ids = model_inputs.get("input_ids")
+        logger.warning(
+            "AUXTRACE pp=%d pos=%s ids=%s %s",
+            get_pp_group().rank_in_group,
+            positions[..., :16].tolist(),
+            None if input_ids is None else input_ids[:16].tolist(),
+            " ".join(
+                f"{k}={[round(x, 3) for x in t[:rows].float().norm(dim=-1).tolist()]}"
+                f"/{round(t[:rows].float().sum().item(), 3)}"
+                for k, t in taps.items()
+            ),
+        )
+
+    def _trace_draft_tokens(
+        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+    ) -> None:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        count = getattr(self, "_draft_trace_count", 0)
+        if count >= _AUX_TRACE_MAX or get_tensor_model_parallel_rank() != 0:
+            return
+        self._draft_trace_count = count + 1
+        logger.warning(
+            "DRAFTTRACE seq_len=%s draft=%s",
+            input_batch.seq_lens_cpu_upper_bound[:1].tolist(),
+            draft_tokens[:1].tolist(),
+        )
 
     @torch.inference_mode()
     @step_eplb_after()
@@ -2118,6 +2187,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # this communicator strictly by order — sending draft first
                 # pairs it with the wider sampled recv and deadlocks the group.
                 self.pp_handler.broadcast_draft(draft_tokens, input_batch)
+                if _AUX_TRACE_MAX and input_batch.num_reqs == 1:
+                    self._trace_draft_tokens(input_batch, draft_tokens)
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
