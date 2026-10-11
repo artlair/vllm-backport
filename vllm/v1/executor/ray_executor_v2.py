@@ -448,9 +448,25 @@ class RayExecutorV2(MultiprocExecutor):
         # Step 7: Initialize workers with local logical ranks and the
         # logical-to-physical GPU mapping discovered from Ray placement.
         init_worker_refs = []
-        for i, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
-            local_rank = node_workers[node_id].index(i)
+        for i, (node_id, own_gpu_ids) in enumerate(worker_node_and_physical_gpu_ids):
             assigned_physical_gpu_ids = sorted(node_physical_gpu_ids[node_id])
+            # Pick the logical index of the GPU Ray reserved for this worker's
+            # bundle, not the worker's position among the node's ranks: with
+            # VLLM_RAY_BUNDLE_INDICES the rank order differs from the bundle
+            # (and so the card) order, and the rank-order index would pin the
+            # rank to some other card. Workers holding more than one GPU keep
+            # the rank-order index.
+            if len(own_gpu_ids) == 1:
+                local_rank = assigned_physical_gpu_ids.index(own_gpu_ids[0])
+            else:
+                local_rank = node_workers[node_id].index(i)
+            logger.info(
+                "Ray worker rank %d: bundle %d, node %s, physical GPU %s",
+                self.ray_worker_handles[i].rank,
+                self.ray_worker_handles[i].bundle_id_idx,
+                bundle_assignments[i]["node_ip"],
+                assigned_physical_gpu_ids[local_rank],
+            )
             worker_env_vars: dict[str, str] = {}
             self.ray_worker_handles[i].local_rank = local_rank
             init_worker_refs.append(
