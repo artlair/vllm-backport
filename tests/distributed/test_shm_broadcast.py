@@ -778,3 +778,58 @@ def test_remote_subscribe_addr_unique_concurrent_writers(
 
     for q in queues:
         q.remote_socket.close(linger=0)
+
+
+@pytest.mark.parametrize("kind", ["tensor", "numpy", "numpy_readonly"])
+@pytest.mark.parametrize(
+    "nbytes, overflow, num_oob",
+    [
+        pytest.param(1024 * 1024 - 2, False, 0, id="inline"),
+        pytest.param(1024 * 1024, False, 1, id="shm_oob"),
+    ],
+)
+def test_broadcast_retains_values_after_ring_reuse(kind, nbytes, overflow, num_oob):
+    """Received data belongs to its consumer, not the next queue message."""
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=2 * 1024 * 1024,
+        max_chunks=1,
+        connect_ip="127.0.0.1",
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    writer.wait_until_ready()
+    reader.wait_until_ready()
+    array = np.full(nbytes // 2, 17, dtype=np.uint16)
+    array.flags.writeable = kind != "numpy_readonly"
+    payload = torch.from_numpy(array) if kind == "tensor" else array
+    try:
+        with (
+            mock.patch.object(MessageQueue, "recv", wraps=MessageQueue.recv) as recv,
+            mock.patch.object(pickle, "loads", wraps=pickle.loads) as loads,
+        ):
+            writer.enqueue(payload)
+            received = reader.dequeue(timeout=5)
+            received_oob = len(loads.call_args.kwargs["buffers"])
+            # The spy must not keep the ring's memoryviews alive.
+            loads.reset_mock()
+            assert recv.call_count == int(overflow)
+            assert received_oob == num_oob
+        assert type(received) is type(payload)
+        assert received.dtype == payload.dtype
+        if isinstance(received, np.ndarray):
+            assert received.flags.writeable == array.flags.writeable
+        np.testing.assert_array_equal(received, array)
+        for value in range(4):
+            # Fit the replacement in SHM even when the original overflowed.
+            writer.enqueue(np.full(512 * 1024, value, dtype=np.uint16))
+            replacement = reader.dequeue(timeout=5)
+            np.testing.assert_array_equal(replacement, value)
+            np.testing.assert_array_equal(received, array)
+        if array.flags.writeable:
+            received[0] = 42
+            assert array[0] == 17
+    finally:
+        reader.shutdown()
+        writer.shutdown()
+
