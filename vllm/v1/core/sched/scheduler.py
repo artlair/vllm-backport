@@ -366,6 +366,17 @@ class Scheduler(SchedulerInterface):
                 for group in kv_cache_config.kv_cache_groups
             )
         )
+        # Mamba managers already account for their speculative state blocks.
+        num_spec_decode_tokens = (
+            1 + self.num_spec_tokens + self.num_lookahead_tokens
+            if self.num_spec_tokens
+            else 0
+        )
+        self._spec_decode_step_blocks = sum(
+            cdiv(num_spec_decode_tokens, manager.block_size)
+            for manager in self.kv_cache_manager.coordinator.single_type_managers
+            if not isinstance(manager.kv_cache_spec, MambaSpec)
+        )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
         # hash boundary, so the split adds that stop.
@@ -1149,7 +1160,7 @@ class Scheduler(SchedulerInterface):
                     # predictable preemptions.
                     reserved_blocks = (
                         self._inflight_prefill_reserved_blocks()
-                        + self._spec_decode_step_blocks()
+                        + self._spec_decode_step_blocks
                     )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
@@ -2876,29 +2887,18 @@ class Scheduler(SchedulerInterface):
     def _request_remaining_blocks(self, request: Request) -> int:
         """Blocks `request` still needs to hold its full sequence and be promoted."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
-        num_blocks = self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+        num_tokens = full_num_tokens
+        if self.num_spec_tokens:
+            num_tokens += 1 + self.num_spec_tokens + self.num_lookahead_tokens
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
-            num_tokens=full_num_tokens,
+            num_tokens=num_tokens,
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
             num_encoder_tokens=0,
             total_computed_tokens=request.num_computed_tokens,
             num_local_computed_tokens=request.num_computed_tokens,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
-        )
-        return num_blocks + self._spec_decode_step_blocks()
-
-    def _spec_decode_step_blocks(self) -> int:
-        """Number of blocks for the extra KV slots a spec decode step needs.
-
-        When using async kv load, scheduler must reserve enough blocks for
-        full sequence + the spec decode step, otherwise request cannot be
-        able to run after the async_load if we are out of kv blocks.
-        """
-        if not self.num_spec_tokens:
-            return 0
-        return cdiv(
-            1 + self.num_spec_tokens + self.num_lookahead_tokens, self.block_size
         )
 
     def _inflight_prefill_reserved_blocks(self) -> int:
