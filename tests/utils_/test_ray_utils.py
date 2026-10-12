@@ -5,7 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm.v1.executor.ray_utils import get_bundles_sorted_by_node
+from vllm.v1.executor.ray_utils import (
+    get_bundles_for_indices,
+    get_bundles_sorted_by_node,
+)
 
 NODE_A = "node_a"
 NODE_B = "node_b"
@@ -98,3 +101,36 @@ def test_get_bundles_sorted_by_node(bundles_to_node_id, bundle_specs, expected):
         result = get_bundles_sorted_by_node(mock_pg)
 
     assert result == expected
+
+
+def test_get_bundles_for_indices_is_driver_relative():
+    """Indices pick driver-first positions, so a placement group that put
+    bundle 0 on the worker node still gives ranks 0-1 the driver's GPUs."""
+    mock_pg = MagicMock()
+    mock_pg.bundle_specs = [{"GPU": 1}] * 4
+
+    mock_ctx = MagicMock()
+    mock_ctx.get_node_id.return_value = NODE_A
+
+    with (
+        patch(
+            "vllm.v1.executor.ray_utils.placement_group_table",
+            return_value={
+                "bundles_to_node_id": {0: NODE_B, 1: NODE_B, 2: NODE_A, 3: NODE_A}
+            },
+        ),
+        patch("vllm.v1.executor.ray_utils.ray") as mock_ray,
+        patch("vllm.v1.executor.ray_utils.current_platform") as mock_platform,
+    ):
+        mock_ray.get_runtime_context.return_value = mock_ctx
+        mock_ray.nodes.return_value = MOCK_RAY_NODES
+        mock_platform.ray_device_key = "GPU"
+
+        result = get_bundles_for_indices(mock_pg, [1, 0, 3, 2], 4)
+
+    assert result == [
+        (3, NODE_A, IP_A),
+        (2, NODE_A, IP_A),
+        (1, NODE_B, IP_B),
+        (0, NODE_B, IP_B),
+    ]

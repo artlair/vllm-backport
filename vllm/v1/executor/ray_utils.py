@@ -369,6 +369,11 @@ def get_bundles_for_indices(
     """
     Return GPU bundle indices paired with node IDs and node IPs for
     explicit bundle indices specified via VLLM_RAY_BUNDLE_INDICES.
+
+    Each index is a position in the driver-first bundle order of
+    get_bundles_sorted_by_node, not a raw placement group bundle id: Ray
+    may place bundle 0 on any node, so raw ids would move ranks between
+    nodes from one boot to the next.
     """
     assert len(bundle_indices) == world_size, (
         "VLLM_RAY_BUNDLE_INDICES must have the same size"
@@ -380,15 +385,8 @@ def get_bundles_for_indices(
         f" but got {bundle_indices=}"
     )
 
-    pg_data = placement_group_table(placement_group)
-    pg_bundle_to_node = pg_data["bundles_to_node_id"]
-    node_id_to_ip = {
-        n["NodeID"]: n["NodeManagerAddress"] for n in ray.nodes() if n["Alive"]
-    }
-    return [
-        (bid, pg_bundle_to_node[bid], node_id_to_ip[pg_bundle_to_node[bid]])
-        for bid in bundle_indices
-    ]
+    sorted_bundles = get_bundles_sorted_by_node(placement_group)
+    return [sorted_bundles[i] for i in bundle_indices]
 
 
 def get_bundles_sorted_by_node(

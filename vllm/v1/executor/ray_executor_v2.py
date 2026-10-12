@@ -351,10 +351,13 @@ class RayExecutorV2(MultiprocExecutor):
         # Step 4: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
-        n_local = sum(1 for a in bundle_assignments if a["node_id"] == driver_node)
+        local_ranks = [
+            a["rank"] for a in bundle_assignments if a["node_id"] == driver_node
+        ]
         self.rpc_broadcast_mq = MessageQueue(
             self.world_size,
-            n_local,
+            len(local_ranks),
+            local_reader_ranks=local_ranks,
             max_chunk_bytes=max_chunk_bytes,
             connect_ip=ray.util.get_node_ip_address(),
         )
