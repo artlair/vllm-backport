@@ -832,4 +832,3 @@ def test_broadcast_retains_values_after_ring_reuse(kind, nbytes, overflow, num_o
     finally:
         reader.shutdown()
         writer.shutdown()
-

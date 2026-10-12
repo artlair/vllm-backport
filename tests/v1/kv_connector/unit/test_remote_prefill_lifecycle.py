@@ -839,9 +839,7 @@ def test_async_load_not_admitted_behind_blockless_request():
     def schedule():
         output = scheduler.schedule()
         blockless_seen = False
-        for request in itertools.chain(
-            scheduler.kv_holding_waiting, scheduler.waiting
-        ):
+        for request in itertools.chain(scheduler.kv_holding_waiting, scheduler.waiting):
             holds_blocks = scheduler._holds_kv_blocks(request)
             assert not (blockless_seen and holds_blocks)
             blockless_seen |= not holds_blocks
