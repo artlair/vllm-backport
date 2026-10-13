@@ -2,8 +2,9 @@
 # (zot.lan / zot.apps.lan, the in-cluster registry on k8s-w-5).
 #
 # Runs on the ARC `vllm-build` runner (privileged DinD pod on k8s-w-5, 16
-# vCPU). A cold build is on the order of two hours; buildx layer cache lives
-# in the registry (buildcache tag) so subsequent builds are incremental.
+# vCPU). The buildkit state (layer cache plus the ccache and uv cache mounts)
+# persists on the node's data disk across runner pods, so rebuilds are
+# incremental: a Python-only change reuses the compiled CUDA extensions.
 #
 # Manual by design: a 20 GB image per push is too heavy for branch automation.
 #   gh workflow run publish.yml -R artlair/vllm-backport -f name=glm53
@@ -41,25 +42,33 @@ jobs:
           [registry."zot.apps.lan"]
             http = true
 
-          # Bound the persistent build scratch (hostPath on the node disk;
-          # 148 GB shared with the OS + containerd, kubelet evicts at <15%
-          # free, so keep the cache at 40 GiB and prune images post-push).
+          # CI pushes images here: the LB bypasses Traefik (60s body cap on
+          # big pushes). Plain HTTP, same zot data as zot.apps.lan.
+          [registry."k8s-w-5.lan:5000"]
+            http = true
+
+          # Bound the persistent build scratch (hostPath on k8s-w-5's 492 GB
+          # data disk, /var/lib/longhorn, shared with the longhorn replicas
+          # that back zot). One full build needs more than 40 GiB of cache:
+          # at 40 GiB the GC evicted the compiled CUDA layer, the ccache
+          # mount and the runtime-base installs after every build, so every
+          # build recompiled csrc from scratch (~30 min). 140 GiB holds a
+          # full build with headroom and leaves ~100 GB free on the disk.
           [worker.oci]
             [[worker.oci.gcpolicy]]
-              keepBytes = 42949672960
+              keepBytes = 150323855360
               all = true
           EOF
-          # Reuse the builder across runs: the DinD daemon's storage (and the
-          # buildkit state volume in it) persists on the node, so base images
-          # and the build cache survive and rebuilds are incremental. NOTE:
-          # changes to this buildkitd.toml need `docker buildx rm zotbuilder`
-          # once (the config is baked in at create time).
-          if docker buildx inspect --bootstrap zotbuilder >/dev/null 2>&1; then
-            docker buildx use zotbuilder
-          else
-            docker buildx create --use --name zotbuilder \
-              --driver-opt network=host --config /tmp/buildkitd.toml
-          fi
+          # Recreate the builder container each run so the current toml
+          # always applies. Its state volume (buildkit_buildkit..._state)
+          # is named after the builder and survives docker rm -f, so the
+          # build cache persists across runs (that is the point of the
+          # persistent scratch). docker buildx rm would delete the volume,
+          # so remove the container directly.
+          docker rm -f buildx_buildkit_zotbuilder0 >/dev/null 2>&1 || true
+          docker buildx create --use --name zotbuilder \
+            --driver-opt network=host --config /tmp/buildkitd.toml >/dev/null
+          docker buildx inspect --bootstrap zotbuilder >/dev/null 2>&1
 
           # sm86 only: the fleet's GPUs (RTX 3090, A6000) are all SM86. The
           # upstream matrix also builds sm80/sm89, tripling build time for
@@ -71,11 +80,16 @@ jobs:
           # image into the DinD dockerd and docker push (the plain client
           # every fleet host uses). The rebuild after a failed push comes
           # from the local buildkit cache, so retries cost minutes, not hours.
+          # --provenance/--sbom off: buildx's default attestation manifests
+          # make the pushed image an OCI index that zot rejects with 415
+          # ("manifest invalid"), and the docker-push fallback inherits it
+          # when the built image is loaded. Plain image manifests only.
           push_ok=0
           for i in 1 2 3; do
             if docker buildx build \
+              --provenance=false --sbom=false \
               --file docker/Dockerfile \
-              --target vllm-openai \
+              --target vllm-openai-ray \
               --build-arg torch_cuda_arch_list="8.6" \
               --build-arg max_jobs="$(nproc)" \
               --build-arg nvcc_threads=1 \
@@ -87,7 +101,8 @@ jobs:
           done
           if [ "${push_ok}" != "1" ]; then
             echo "falling back to docker push via the DinD daemon"
-            docker buildx build --file docker/Dockerfile --target vllm-openai \
+            docker buildx build --provenance=false --sbom=false \
+              --file docker/Dockerfile --target vllm-openai-ray \
               --build-arg torch_cuda_arch_list="8.6" \
               --build-arg max_jobs="$(nproc)" --build-arg nvcc_threads=1 \
               --load --tag "${IMG}" .
