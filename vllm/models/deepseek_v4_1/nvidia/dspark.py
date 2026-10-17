@@ -85,12 +85,10 @@ class DSparkDeepseekV4Model(nn.Module):
             or 3
         )
 
-        # Shared with the target (aliased by the speculator's loading utility).
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
-        )
+        # Aliased to the target's by the speculator's loading utility; not
+        # allocated here, a vocab x hidden placeholder would add ~1.2 GiB to
+        # the load-time peak of the drafter's stage.
+        self.embed_tokens: VocabParallelEmbedding | None = None
 
         self.main_proj = ReplicatedLinear(
             config.hidden_size * len(self.target_layer_ids),
@@ -319,12 +317,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self.model = DSparkDeepseekV4Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        # Shared with the target (aliased by the speculator's load utility).
-        self.lm_head = ParallelLMHead(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        # Aliased to the target's by the speculator's load utility (see
+        # embed_tokens above for why it is not allocated here).
+        self.lm_head: ParallelLMHead | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     # --- Hooks used by the speculator -------------------------------------
