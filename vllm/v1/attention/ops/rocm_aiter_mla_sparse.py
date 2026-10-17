@@ -3026,6 +3026,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     attn_sink: torch.Tensor | None,
     nope_head_dim: int,
     rope_head_dim: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
@@ -3065,7 +3066,9 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         and num_heads == block_h
         and head_dim == block_d
     )
-    out = torch.empty_like(q)
+    if out is None:
+        out = torch.empty_like(q)
+    assert out.shape == q.shape and out.dtype == q.dtype
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
@@ -4124,6 +4127,9 @@ def rocm_sparse_attn_prefill(
             return
 
     if ragged_indices is not None and ragged_indptr is not None:
+        # Write straight into `output` when it matches q: a q-sized
+        # temporary plus copy is a large, unprofiled prefill transient.
+        direct = output.shape == q.shape and output.dtype == q.dtype
         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
             q=q,
             kv=kv.squeeze(1),
@@ -4133,7 +4139,10 @@ def rocm_sparse_attn_prefill(
             attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
             nope_head_dim=nope_head_dim,
             rope_head_dim=rope_head_dim,
+            out=output if direct else None,
         )
+        if direct:
+            return
     else:
         assert indices is not None
         indices_2d = indices.reshape(indices.shape[0], -1)
