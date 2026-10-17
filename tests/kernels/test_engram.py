@@ -838,3 +838,59 @@ def test_engram_loader_reads_mapped_checkpoint_directly(tmp_path, monkeypatch, t
     assert copied == [True] * (2 * tp_size)
     # An in-memory source has no file mapping and takes the plain copy.
     assert not copy_uncached(torch.empty_like(scales), scales.clone())
+
+
+@pytest.mark.parametrize(
+    "stage, expected_layers", [((0, 7), 1), ((7, 14), 0), ((14, 40), 1), ((0, 40), 2)]
+)
+def test_engram_host_memory_counts_only_local_stage_tables(
+    monkeypatch, stage, expected_layers
+):
+    """Under PP a rank pins only the tables of its own stage's layers."""
+    seen = []
+    engram_config = SimpleNamespace(
+        cpu_offload=True,
+        verify_host_memory=lambda node, rank: seen.append((node, rank)),
+    )
+    monkeypatch.setattr(
+        engram_ops,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(engram_config=engram_config),
+    )
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(
+        engram_ops, "get_world_group", lambda: SimpleNamespace(world_size=1)
+    )
+    heads = ((5, 7), (11, 13))
+    layout = SimpleNamespace(layer_ids=(1, 14), head_dim=256, primes=(heads, heads))
+    engram_ops.verify_engram_host_memory(layout, *stage)
+    # TP rank 0 of 2 owns the first two heads: 5 + 7 rows of 256 + 8 bytes.
+    expected = expected_layers * 12 * 264
+    assert seen == [(expected, expected)]
+
+
+@pytest.mark.parametrize("cgroup_limit", [None, 100 << 30])
+def test_engram_host_memory_rejects_node_overcommit(monkeypatch, cgroup_limit):
+    """Pinned tables cannot be reclaimed, so a node-level overcommit fails early."""
+    import psutil
+
+    from vllm.config.engram import EngramConfig
+    from vllm.utils import cpu_resource_utils
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(total=125 << 30)
+    )
+    monkeypatch.setattr(
+        cpu_resource_utils, "get_cgroup_memory_limit", lambda: (cgroup_limit, None)
+    )
+    config = EngramConfig(cpu_offload=True)
+    # One DeepSeek-V4.1-Flash table per node (four TP4 shards) fits in 125 GiB.
+    config.verify_host_memory(95 << 30, 24 << 30)
+    if cgroup_limit is None:
+        with pytest.raises(ValueError, match="189.0 GiB of pinned host memory"):
+            config.verify_host_memory(189 << 30, 24 << 30)
+    else:
+        with pytest.raises(ValueError, match="container memory limit"):
+            config.verify_host_memory(101 << 30, 24 << 30)
+    EngramConfig(cpu_offload=False).verify_host_memory(189 << 30, 24 << 30)

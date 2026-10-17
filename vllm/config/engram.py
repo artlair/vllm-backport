@@ -84,6 +84,57 @@ class EngramConfig:
                 "Engram embedding_across_dp is not supported with elastic EP yet."
             )
 
+    def verify_host_memory(self, node_bytes: int, rank_bytes: int) -> None:
+        """Refuse to pin more host memory for Engram than this node can hold.
+
+        Offloaded tables are pinned, so they can be neither reclaimed nor
+        swapped, and every rank on a node pins its own shard: the node needs
+        the sum. Under PP only the stages owning an Engram layer pin anything,
+        so `node_bytes` is the sum over the ranks actually on this node.
+
+        Args:
+            node_bytes: Pinned Engram bytes of all ranks on this node.
+            rank_bytes: Pinned Engram bytes of this rank.
+
+        Raises:
+            ValueError: If `node_bytes` exceeds physical RAM or the cgroup
+                memory limit.
+        """
+        if not self.cpu_offload or node_bytes == 0:
+            return
+        import psutil
+
+        from vllm.utils.cpu_resource_utils import get_cgroup_memory_limit
+
+        limit, source = psutil.virtual_memory().total, "physical RAM"
+        hint = (
+            "use a host with more memory, or put the Engram layers on "
+            "pipeline stages of different nodes"
+        )
+        cgroup_limit, _ = get_cgroup_memory_limit()
+        if cgroup_limit is not None and cgroup_limit < limit:
+            limit, source = cgroup_limit, "container memory limit"
+            hint = "raise the container memory limit"
+        gib = 1 << 30
+        if node_bytes > limit:
+            raise ValueError(
+                f"Engram tables need {node_bytes / gib:.1f} GiB of pinned host "
+                f"memory on this node, but the {source} is {limit / gib:.1f} "
+                "GiB. Pinned memory cannot be reclaimed or swapped, so this "
+                "allocation cannot succeed. Keep the tables in GPU memory with "
+                f"--engram-config '{{\"cpu_offload\": false}}', or {hint}."
+            )
+        log = logger.warning if node_bytes > 0.85 * limit else logger.info
+        log(
+            "Engram pins %.1f GiB of host memory on this rank and %.1f GiB on "
+            "this node, leaving %.1f GiB of the %.1f GiB %s for everything else.",
+            rank_bytes / gib,
+            node_bytes / gib,
+            (limit - node_bytes) / gib,
+            limit / gib,
+            source,
+        )
+
     def get_parallel_size(self, parallel_config: "ParallelConfig") -> int:
         """Derive the embedding group size from the parallel configuration."""
         size = parallel_config.tensor_parallel_size

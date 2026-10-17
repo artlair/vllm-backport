@@ -35,6 +35,7 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
 """
 
 import os
+import socket
 import weakref
 
 import numpy as np
@@ -45,6 +46,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_world_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
@@ -721,9 +723,9 @@ class ParallelEngramEmbedding(nn.Module):
         self.n_hash_cols = len(head_sizes)
         self.part_n_hash_cols = triton.cdiv(self.n_hash_cols, tp_size)
         self.head_start = tp_rank * self.part_n_hash_cols
-        head_end = self.head_start + self.part_n_hash_cols
-        self.vocab_start_idx = sum(head_sizes[: self.head_start])
-        self.vocab_end_idx = sum(head_sizes[:head_end])
+        self.vocab_start_idx, self.vocab_end_idx = self.shard_rows(
+            head_sizes, tp_rank, tp_size
+        )
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         self.tp_size = tp_size
         self.cpu_offload = cpu_offload
@@ -760,6 +762,15 @@ class ParallelEngramEmbedding(nn.Module):
                 dim,
                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
             )
+
+    @staticmethod
+    def shard_rows(
+        head_sizes: tuple[int, ...], tp_rank: int, tp_size: int
+    ) -> tuple[int, int]:
+        """[start, end) table rows of the complete heads owned by `tp_rank`."""
+        part = triton.cdiv(len(head_sizes), tp_size)
+        head_start = tp_rank * part
+        return sum(head_sizes[:head_start]), sum(head_sizes[: head_start + part])
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Parameters when resident, else cached UVA views of the pinned shard.
@@ -826,6 +837,38 @@ class ParallelEngramEmbedding(nn.Module):
             out = tensor_model_parallel_all_gather(out, dim=1)
             out = out[:, : self.n_hash_cols]
         return out
+
+
+def verify_engram_host_memory(
+    layout: EngramLayout, start_layer: int, end_layer: int, block_size: int = 32
+) -> None:
+    """Check that the offloaded tables of every rank on this node fit in it.
+
+    Collective over the world group: each rank reports what it will pin for
+    its stage's Engram layers, and ranks are grouped into nodes by hostname.
+    Runs before the tables are allocated.
+    """
+    engram_config = get_current_vllm_config().engram_config
+    if engram_config is None or not engram_config.cpu_offload:
+        return
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    row_bytes = layout.head_dim + layout.head_dim // block_size
+    rank_bytes = 0
+    for index, layer_id in enumerate(layout.layer_ids):
+        if start_layer <= layer_id < end_layer:
+            heads = tuple(size for order in layout.primes[index] for size in order)
+            start, end = ParallelEngramEmbedding.shard_rows(heads, tp_rank, tp_size)
+            rank_bytes += (end - start) * row_bytes
+    world = get_world_group()
+    host = socket.gethostname()
+    entries: list[tuple[str, int]] = [(host, rank_bytes)] * world.world_size
+    if world.world_size > 1:
+        torch.distributed.all_gather_object(
+            entries, (host, rank_bytes), group=world.cpu_group
+        )
+    node_bytes = sum(nbytes for name, nbytes in entries if name == host)
+    engram_config.verify_host_memory(node_bytes, rank_bytes)
 
 
 @triton.jit(do_not_specialize=["num_kv_tokens"])
