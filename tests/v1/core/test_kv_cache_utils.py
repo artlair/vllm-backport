@@ -1365,6 +1365,29 @@ def test_pp_worker_config_skips_uniform_group_owned_by_other_stage():
     assert allocated == set(stage1_spec)
 
 
+def test_pp_layer_on_two_stages_is_allocated_on_both():
+    # DeepSeek V4.1 PP relay shadows a source layer on a later stage under
+    # the source's name, so both stages hold its cache in the same group
+    # (one block table) and each allocates its own copy.
+    model_config = ModelConfig(max_model_len=16)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+    spec = new_kv_cache_spec()
+    worker_specs = [
+        {"layer1": new_kv_cache_spec(), "layer2": new_kv_cache_spec()},
+        {"layer2": new_kv_cache_spec(), "layer3": new_kv_cache_spec()},
+    ]
+    configs = get_kv_cache_configs(
+        vllm_config, worker_specs, [spec.page_size_bytes * 2 * 10] * 2
+    )
+    for config, worker_spec in zip(configs, worker_specs):
+        assert config.num_blocks == 10
+        assert [g.layer_names for g in config.kv_cache_groups] == [list(worker_spec)]
+        allocated = [name for t in config.kv_cache_tensors for name in t.layers]
+        assert sorted(allocated) == sorted(worker_spec)
+
+
 def test_dcp_world_size_for_kv_cache_spec_shards_full_attention_only():
     dcp = 8
     full = FullAttentionSpec(

@@ -83,6 +83,7 @@ from ..common.engram import (
     verify_engram_host_memory,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
+from ..common.pp_relay import relay_key, relay_source_ids, shadow_source_ids
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -314,6 +315,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
+        attn_input_out: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # The reference collapses each sublayer's input with the *previous*
         # sublayer's pre-mix: attention uses the pre-mix carried in (identity
@@ -382,6 +384,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
+        if attn_input_out is not None:
+            attn_input_out.append(x)
 
         x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
@@ -404,6 +408,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix, ffn_pre
+
+
+class DeepseekV4RelaySource(nn.Module):
+    """PP shadow of a source layer on an earlier stage.
+
+    Holds only the attention, under ``attn`` so the source's
+    ``layers.<id>.attn.*`` checkpoint weights map onto it by prefix.
+    """
+
+    def __init__(self, attn: DeepseekV4Attention):
+        super().__init__()
+        self.attn = attn
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
@@ -480,6 +496,45 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ),
             )
 
+        # Sources on earlier PP stages are shadowed here before the local
+        # layers are built, so local consumers resolve their caches by name.
+        pp_group = get_pp_group()
+        start_layer, end_layer = get_pp_indices(
+            config.num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
+        )
+        self.relay_in_ids = (
+            relay_source_ids(config, start_layer) if start_layer > 0 else ()
+        )
+        self.relay_out_ids = (
+            relay_source_ids(config, end_layer)
+            if end_layer < config.num_hidden_layers
+            else ()
+        )
+        attn_cls = _select_dsv4_attn_cls(vllm_config)
+        self.pp_relay_sources = nn.ModuleDict(
+            {
+                str(source_id): DeepseekV4RelaySource(
+                    attn_cls(
+                        vllm_config,
+                        prefix=f"{prefix}.layers.{source_id}.attn",
+                        topk_indices_buffer=self.topk_indices_buffer,
+                        aux_stream_list=aux_stream_list,
+                        candidate_block_buffer=self.candidate_block_buffer,
+                        relay_shadow=True,
+                    )
+                )
+                for source_id in shadow_source_ids(config, start_layer, end_layer)
+            }
+        )
+        if self.pp_relay_sources:
+            logger.info(
+                "PP stage layers [%d, %d) shadow sharing sources %s from "
+                "earlier stages.",
+                start_layer,
+                end_layer,
+                list(self.pp_relay_sources),
+            )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -492,6 +547,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        assert (self.start_layer, self.end_layer) == (start_layer, end_layer)
+        # Every relayed source is produced here or passed through from the
+        # previous stage, and every shadow's input arrives from it.
+        local_ids = set(range(start_layer, end_layer))
+        assert set(self.relay_out_ids) <= local_ids | set(self.relay_in_ids)
+        assert {int(i) for i in self.pp_relay_sources} <= set(self.relay_in_ids)
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
         # (chunked prefill / decode lookback); key it off the first local
@@ -549,7 +610,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # token embedding to hc_mult streams before the first decoder
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
-        # for its attention collapse.
+        # for its attention collapse, and the attention inputs of sharing
+        # sources on earlier stages that this or a later stage depends on.
         return IntermediateTensors(
             {
                 "hidden_states": torch.zeros(
@@ -562,6 +624,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     dtype=torch.float32,
                     device=device,
                 ),
+            }
+            | {
+                relay_key(source_id): torch.zeros(
+                    (batch_size, self.config.hidden_size),
+                    dtype=dtype,
+                    device=device,
+                )
+                for source_id in self.relay_in_ids
             }
         )
 
@@ -652,6 +722,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
+            for source_id, source in self.pp_relay_sources.items():
+                source = typing.cast(DeepseekV4RelaySource, source)
+                source.attn.forward_relay_source(
+                    positions, intermediate_tensors[relay_key(int(source_id))]
+                )
+        relay_out: dict[int, list[torch.Tensor]] = {
+            source_id: [] for source_id in self.relay_out_ids
+        }
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
@@ -669,6 +747,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
                 engram_hashes,
                 engram_mask,
+                relay_out.get(idx),
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
@@ -690,11 +769,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
+            relayed: dict[str, torch.Tensor] = {}
+            for source_id, captured in relay_out.items():
+                key = relay_key(source_id)
+                if captured:
+                    relayed[key] = captured[0]
+                else:
+                    # Passed through from an earlier stage.
+                    assert intermediate_tensors is not None
+                    relayed[key] = intermediate_tensors[key]
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,
                     "pre_mix": pre_mix,
                     **self.pack_local_aux_hidden_states(aux_hidden_states),
+                    **relayed,
                 }
             )
 
@@ -754,6 +843,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         for name, loaded_weight in weights:
+            name = self._relay_source_weight_name(name)
             if name.startswith(("vision.", "aligner.", "image_")):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
@@ -847,6 +937,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     continue
 
         return loaded_params
+
+    def _relay_source_weight_name(self, name: str) -> str:
+        """Route a shadowed source layer's attention weights to its shadow."""
+        match = re.match(r"layers\.(\d+)\.attn\.", name)
+        if match is None or match.group(1) not in self.pp_relay_sources:
+            return name
+        return f"pp_relay_sources.{name.removeprefix('layers.')}"
 
     @staticmethod
     def _pad_shared_expert_weight(
