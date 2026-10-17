@@ -327,3 +327,30 @@ def test_warmup_pp_decode_update_matches_serving_specialization(monkeypatch):
     # must compile that specialization (non-None draft pointers) too.
     assert broadcast_drafts.shape == (1, 2) and broadcast_drafts.dtype == torch.int64
     assert draft_tokens_out is runner.req_states.draft_tokens
+
+
+@requires_cuda
+def test_draft_relay_snapshots_before_the_side_stream_stalls(monkeypatch):
+    """The sampled-token sends ahead of the draft relay can hold the side stream
+    back on peer progress while the next step rewrites the persistent draft
+    table on the main stream. The relay must still carry this step's drafts."""
+    sender = make_handler(monkeypatch, is_last_rank=True, num_speculative_steps=3)
+    sent: list[torch.Tensor] = []
+
+    def stalled_broadcast(tensor, src, group):
+        torch.cuda._sleep(100_000_000)
+        sent.append(tensor.clone())
+
+    monkeypatch.setattr(torch.distributed, "broadcast", stalled_broadcast)
+    input_batch = make_input_batch()
+    sampled = torch.zeros(3, 1, dtype=torch.int64, device="cuda")
+    counts = torch.zeros(3, dtype=torch.int32, device="cuda")
+    persistent = torch.full((8, 3), 7, dtype=torch.int64, device="cuda")
+
+    sender.broadcast(sampled, counts, counts, input_batch)
+    sender.broadcast_drafts(persistent, input_batch)
+    persistent.fill_(-1)
+    torch.accelerator.synchronize()
+
+    assert len(sent) == 3
+    assert (sent[2] == 7).all()

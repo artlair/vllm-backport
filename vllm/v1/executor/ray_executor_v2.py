@@ -49,6 +49,15 @@ else:
 logger = init_logger(__name__)
 
 
+def _ray_death_cause(run_ref: "ObjectRef") -> str:
+    """Ray's account of why a worker's run() ended (signal, OOM kill, ...)."""
+    try:
+        ray.get(run_ref, timeout=0)
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return "run() returned normally"
+
+
 @dataclass
 class RayWorkerHandle:
     """Handle for a Ray worker actor, compatible with MultiprocExecutor."""
@@ -327,10 +336,13 @@ class RayExecutorV2(MultiprocExecutor):
         # Step 3: Create broadcast MessageQueue.
         # Workers on the driver node use shared memory; the rest use TCP.
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
-        n_local = sum(1 for a in bundle_assignments if a["node_id"] == driver_node)
+        local_ranks = [
+            a["rank"] for a in bundle_assignments if a["node_id"] == driver_node
+        ]
         self.rpc_broadcast_mq = MessageQueue(
             self.world_size,
-            n_local,
+            len(local_ranks),
+            local_reader_ranks=local_ranks,
             max_chunk_bytes=max_chunk_bytes,
             connect_ip=ray.util.get_node_ip_address(),
         )
@@ -430,9 +442,25 @@ class RayExecutorV2(MultiprocExecutor):
             self.ray_worker_handles[0].actor.create_dist_init_method.remote()
         )
         init_worker_refs = []
-        for i, (node_id, _) in enumerate(worker_node_and_physical_gpu_ids):
-            local_rank = node_workers[node_id].index(i)
+        for i, (node_id, own_gpu_ids) in enumerate(worker_node_and_physical_gpu_ids):
             assigned_physical_gpu_ids = sorted(node_physical_gpu_ids[node_id])
+            # Pick the logical index of the GPU Ray reserved for this worker's
+            # bundle, not the worker's position among the node's ranks: with
+            # VLLM_RAY_BUNDLE_INDICES the rank order differs from the bundle
+            # (and so the card) order, and the rank-order index would pin the
+            # rank to some other card. Workers holding more than one GPU keep
+            # the rank-order index.
+            if len(own_gpu_ids) == 1:
+                local_rank = assigned_physical_gpu_ids.index(own_gpu_ids[0])
+            else:
+                local_rank = node_workers[node_id].index(i)
+            logger.info(
+                "Ray worker rank %d: bundle %d, node %s, physical GPU %s",
+                self.ray_worker_handles[i].rank,
+                self.ray_worker_handles[i].bundle_id_idx,
+                bundle_assignments[i]["node_ip"],
+                assigned_physical_gpu_ids[local_rank],
+            )
             worker_env_vars: dict[str, str] = {}
             self.ray_worker_handles[i].local_rank = local_rank
             init_worker_refs.append(
@@ -521,6 +549,12 @@ class RayExecutorV2(MultiprocExecutor):
                     "RayWorkerProc rank=%s died unexpectedly, shutting down executor.",
                     dead_ranks,
                 )
+                for ref in done:
+                    logger.error(
+                        "RayWorkerProc rank=%s death cause: %s",
+                        ref_to_rank[ref],
+                        _ray_death_cause(ref),
+                    )
                 executor.shutdown()
                 if executor.failure_callback is not None:
                     callback = executor.failure_callback

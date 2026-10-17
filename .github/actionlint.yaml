@@ -3,6 +3,8 @@
 self-hosted-runner:
   labels:
     - vllm-runners
+    # The fork's homelab ARC runner (publish.yml).
+    - vllm-build
     # Not yet in actionlint's known-label set.
     - macos-26
     - ubuntu-slim
