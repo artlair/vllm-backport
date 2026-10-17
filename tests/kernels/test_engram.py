@@ -859,11 +859,30 @@ def test_engram_host_memory_counts_only_local_stage_tables(
 ):
     """Under PP a rank pins only the tables of its own stage's layers, minus
     the heads it keeps in HBM."""
+    # TP rank 0 of 2 owns the first two heads: 5 + 7 rows of 256 + 8 bytes.
+    expected = expected_layers * host_rows * 264
+    seen = _verify_engram_host_memory(monkeypatch, gpu_heads, stage)
+    assert seen == [(expected, expected)]
+
+
+@pytest.mark.parametrize(
+    "stage, host_rows", [((0, 14), 0), ((14, 40), 7), ((0, 40), 7), ((2, 14), 0)]
+)
+def test_engram_host_memory_honors_per_layer_gpu_heads(monkeypatch, stage, host_rows):
+    """A per-layer mapping (JSON string keys) sets each table's HBM heads."""
+    seen = _verify_engram_host_memory(monkeypatch, {"1": 2, "14": 1}, stage)
+    assert seen == [(host_rows * 264, host_rows * 264)]
+
+
+def _verify_engram_host_memory(monkeypatch, gpu_heads, stage):
+    from vllm.config.engram import EngramConfig
+
     seen = []
-    engram_config = SimpleNamespace(
-        cpu_offload=True,
-        gpu_resident_heads=gpu_heads,
-        verify_host_memory=lambda node, rank: seen.append((node, rank)),
+    engram_config = EngramConfig(cpu_offload=True, gpu_resident_heads=gpu_heads)
+    monkeypatch.setattr(
+        EngramConfig,
+        "verify_host_memory",
+        lambda self, node, rank: seen.append((node, rank)),
     )
     monkeypatch.setattr(
         engram_ops,
@@ -878,9 +897,21 @@ def test_engram_host_memory_counts_only_local_stage_tables(
     heads = ((5, 7), (11, 13))
     layout = SimpleNamespace(layer_ids=(1, 14), head_dim=256, primes=(heads, heads))
     engram_ops.verify_engram_host_memory(layout, *stage)
-    # TP rank 0 of 2 owns the first two heads: 5 + 7 rows of 256 + 8 bytes.
-    expected = expected_layers * host_rows * 264
-    assert seen == [(expected, expected)]
+    return seen
+
+
+def test_engram_gpu_resident_heads_config():
+    """An int applies to every layer; a mapping defaults missing layers to 0."""
+    from pydantic import ValidationError
+
+    from vllm.config.engram import EngramConfig
+
+    assert EngramConfig(gpu_resident_heads=2).gpu_heads_for_layer(14) == 2
+    per_layer = EngramConfig(gpu_resident_heads={"1": 2, "14": 1})
+    assert [per_layer.gpu_heads_for_layer(i) for i in (1, 14, 20)] == [2, 1, 0]
+    assert per_layer.compute_hash() != EngramConfig().compute_hash()
+    with pytest.raises(ValidationError):
+        EngramConfig(gpu_resident_heads={"1": -1})
 
 
 @pytest.mark.parametrize("cgroup_limit", [None, 100 << 30])

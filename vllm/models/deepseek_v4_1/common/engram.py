@@ -924,7 +924,6 @@ def verify_engram_host_memory(
     engram_config = get_current_vllm_config().engram_config
     if engram_config is None or not engram_config.cpu_offload:
         return
-    gpu_heads = engram_config.gpu_resident_heads
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
     row_bytes = layout.head_dim + layout.head_dim // block_size
@@ -934,7 +933,8 @@ def verify_engram_host_memory(
             heads = tuple(size for order in layout.primes[index] for size in order)
             start, end = ParallelEngramEmbedding.shard_rows(heads, tp_rank, tp_size)
             part = triton.cdiv(len(heads), tp_size)
-            hbm_end = sum(heads[: tp_rank * part + min(gpu_heads, part)])
+            gpu_heads = min(engram_config.gpu_heads_for_layer(layer_id), part)
+            hbm_end = sum(heads[: tp_rank * part + gpu_heads])
             rank_bytes += (end - max(start, min(hbm_end, end))) * row_bytes
     world = get_world_group()
     host = socket.gethostname()
@@ -1097,7 +1097,11 @@ class Engram(nn.Module):
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=engram_config.cpu_offload if engram_config else True,
-            gpu_heads=engram_config.gpu_resident_heads if engram_config else 0,
+            gpu_heads=(
+                engram_config.gpu_heads_for_layer(layout.layer_ids[layer_hash_index])
+                if engram_config
+                else 0
+            ),
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
