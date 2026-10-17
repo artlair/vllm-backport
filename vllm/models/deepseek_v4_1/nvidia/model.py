@@ -587,8 +587,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         # Engram n-gram hashes for the whole (flattened) batch, computed once
         # on the full token stream — before any sequence-parallel sharding —
-        # and consumed by the engram layers (1 and 14) below. Skipped on
-        # profile runs (KV cache unbound).
+        # and consumed by the engram layers (1 and 14) below. Profile runs
+        # (KV cache unbound) cannot hash, so they gather in-range dummy rows
+        # instead: Engram's per-token transients (wkv output, the new hc
+        # stream) must count towards the profiled activation peak.
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         if (
@@ -629,6 +631,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
+            elif attn_metadata is None:
+                engram_hashes = self.engram_hash.profile_hashes(input_ids.shape[0])
+            if engram_hashes is not None:
                 # Gather all Engram rows before entering the decoder layers.
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)

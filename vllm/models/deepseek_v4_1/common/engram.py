@@ -470,6 +470,16 @@ class NgramHashState(nn.Module):
         self._kv_cache_ref = weakref.ref(kv_cache)
         return True
 
+    def profile_hashes(self, num_tokens: int) -> torch.Tensor:
+        """In-range stand-in for `forward`'s output on profile runs: every
+        token hits the first bucket of each hash column."""
+        return (
+            self.offsets.to(torch.int32)
+            .unsqueeze(0)
+            .expand(num_tokens, -1, -1)
+            .contiguous()
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
