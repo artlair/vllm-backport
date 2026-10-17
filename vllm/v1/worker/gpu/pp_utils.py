@@ -167,12 +167,13 @@ class PPHandler:
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
             return
+        # Gather on the main stream. The side stream can sit behind this step's
+        # earlier sends, which wait on the peers, while the next step's
+        # propose() rewrites draft_tokens on the main stream with no wait on it.
+        send = draft_tokens[input_batch.idx_mapping].to(torch.int64)
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
-            send = draft_tokens[input_batch.idx_mapping].contiguous()
-            # Must record the idx_mapping tensor since it was allocated
-            # on the main stream.
-            input_batch.idx_mapping.record_stream(self.broadcast_stream)
+            send.record_stream(self.broadcast_stream)
             torch.distributed.broadcast(
                 send, src=self.last_rank, group=self.broadcast_group
             )
