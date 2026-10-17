@@ -34,6 +34,7 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
   cache for the rest.
 """
 
+import os
 import weakref
 
 import numpy as np
@@ -49,6 +50,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.offloader.base import empty_pinned_exact
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
@@ -59,6 +61,9 @@ logger = init_logger(__name__)
 
 # Cache value for tokens that take no part in an n-gram (image spans).
 DEAD_ID = -1
+
+# pread granularity when loading table shards around the page cache.
+_UNCACHED_CHUNK_BYTES = 256 << 20
 
 
 def _is_prime(n: int) -> bool:
@@ -547,6 +552,70 @@ class NgramHashState(nn.Module):
         return output
 
 
+def _find_file_mapping(ptr: int, nbytes: int) -> tuple[str, int, int] | None:
+    """(path, inode, file offset) of the file mapping holding [ptr, ptr+nbytes)."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=5)
+                if len(fields) < 6 or not fields[5].startswith("/"):
+                    continue
+                start, end = (int(x, 16) for x in fields[0].split("-"))
+                if start <= ptr and ptr + nbytes <= end:
+                    offset = int(fields[2], 16) + ptr - start
+                    return fields[5].rstrip("\n"), int(fields[4]), offset
+    except OSError:
+        pass
+    return None
+
+
+def _copy_uncached(dst: torch.Tensor, src: torch.Tensor) -> bool:
+    """Read a tensor that views a mmapped checkpoint file straight into `dst`.
+
+    A TP shard of an Engram table is tens of GiB. Copying it through the
+    mapping leaves every page cached and mapped until the load ends, next to
+    the pinned copy; reading the byte range with pread and dropping each chunk
+    from the page cache keeps the checkpoint's footprint at one chunk. Assumes
+    the mapping was not written to, as for safetensors' read-only use.
+
+    Returns:
+        False when `src` is not a contiguous view of a file mapping; the
+        caller then falls back to a plain copy.
+    """
+    nbytes = src.numel() * src.element_size()
+    if (
+        not hasattr(os, "preadv")
+        or src.device.type != "cpu"
+        or dst.device.type != "cpu"
+        or not src.is_contiguous()
+        or not dst.is_contiguous()
+        or nbytes != dst.numel() * dst.element_size()
+    ):
+        return False
+    mapping = _find_file_mapping(src.data_ptr(), nbytes)
+    if mapping is None:
+        return False
+    path, inode, offset = mapping
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        if os.fstat(fd).st_ino != inode:
+            return False
+        out = memoryview(dst.view(-1).view(torch.uint8).numpy())
+        done = 0
+        while done < nbytes:
+            n = os.preadv(fd, [out[done : done + _UNCACHED_CHUNK_BYTES]], offset + done)
+            if n <= 0:
+                raise OSError(f"short read of {path} at {offset + done}")
+            os.posix_fadvise(fd, offset + done, n, os.POSIX_FADV_DONTNEED)
+            done += n
+    finally:
+        os.close(fd)
+    return True
+
+
 def _engram_head_shard_weight_loader(
     param: torch.nn.Parameter, loaded_weight: torch.Tensor
 ) -> None:
@@ -559,7 +628,8 @@ def _engram_head_shard_weight_loader(
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
     )
-    param.data.copy_(shard)
+    if shard.dtype != param.dtype or not _copy_uncached(param.data, shard):
+        param.data.copy_(shard)
 
 
 @triton.jit
@@ -663,22 +733,15 @@ class ParallelEngramEmbedding(nn.Module):
             torch.accelerator.current_device_index()
         ).multi_processor_count
 
-        # Explicit device: model init runs under a `torch.device("cuda")`
-        # context, which would otherwise put the shard in HBM.
-        kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+        # Offloaded shards are pinned at exact size: torch's pinned allocator
+        # rounds up to a power of two, which turns a 23.6 GiB shard into 33.
+        alloc = empty_pinned_exact if cpu_offload else torch.empty
         self.weight = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
-            ),
+            alloc((self.part_num_embeddings, dim), dtype=torch.float8_e4m3fn),
             requires_grad=False,
         )
         self.weight_scale_inv = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                dim // block_size,
-                dtype=torch.uint8,
-                **kwargs,
-            ),
+            alloc((self.part_num_embeddings, dim // block_size), dtype=torch.uint8),
             requires_grad=False,
         )
         for param in (self.weight, self.weight_scale_inv):

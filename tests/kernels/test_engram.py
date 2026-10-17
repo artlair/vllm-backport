@@ -776,3 +776,65 @@ def test_engram_head_collectives_survive_graph_breaks():
     if torch.accelerator.device_count() < 2:
         pytest.skip("Requires two GPUs")
     torch.multiprocessing.spawn(_engram_tp_worker, args=(2, get_open_port()), nprocs=2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_engram_offloaded_shard_is_pinned_at_exact_size(monkeypatch):
+    """torch's pinned allocator would round a 23.6 GiB TP4 shard up to 33 GiB."""
+    from vllm.model_executor.offloader import base
+
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
+    head_sizes = (1009, 1013, 1019)
+    with torch.device("cuda"):
+        layer = ParallelEngramEmbedding(sum(head_sizes), 256, head_sizes, 32, True)
+    for param in (layer.weight, layer.weight_scale_inv):
+        assert param.device.type == "cpu" and param.is_pinned()
+        mapping = base._PINNED_MAPPINGS[param.data_ptr()]
+        nbytes = param.numel() * param.element_size()
+        assert nbytes <= len(mapping) < nbytes + 4096
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("tp_size", [1, 4])
+def test_engram_loader_reads_mapped_checkpoint_directly(tmp_path, monkeypatch, tp_size):
+    """A safetensors table shard is pread into the pinned param, bit-exact."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    head_sizes = (17, 19, 23, 29, 31, 37, 41, 43)
+    rows, dim = sum(head_sizes), 64
+    torch.manual_seed(0)
+    weight = torch.randn(rows, dim).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (rows, dim // 32), dtype=torch.uint8)
+    path = str(tmp_path / "engram.safetensors")
+    save_file({"w": weight, "s": scales.view(torch.float8_e8m0fnu)}, path)
+    copied = []
+    copy_uncached = engram_ops._copy_uncached
+
+    def spy(dst, src):
+        copied.append(copy_uncached(dst, src))
+        return copied[-1]
+
+    monkeypatch.setattr(engram_ops, "_copy_uncached", spy)
+    monkeypatch.setattr(
+        engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    with safe_open(path, framework="pt") as f:
+        loaded_weight, loaded_scales = f.get_tensor("w"), f.get_tensor("s")
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            engram_ops, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        with torch.device("cuda"):
+            layer = ParallelEngramEmbedding(rows, dim, head_sizes, cpu_offload=True)
+        layer.weight.weight_loader(layer.weight, loaded_weight)
+        layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, loaded_scales)
+        start, end = layer.vocab_start_idx, layer.vocab_end_idx
+        assert torch.equal(
+            layer.weight.view(torch.uint8), weight[start:end].view(torch.uint8)
+        )
+        assert torch.equal(layer.weight_scale_inv, scales[start:end])
+    assert copied == [True] * (2 * tp_size)
+    # An in-memory source has no file mapping and takes the plain copy.
+    assert not copy_uncached(torch.empty_like(scales), scales.clone())
