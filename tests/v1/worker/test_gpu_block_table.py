@@ -312,3 +312,73 @@ def test_dummy_request_slot_mapping_is_pad():
         num_tokens_padded=3,
     )
     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
+
+
+@pytest.fixture
+def populated_block_tables():
+    tables = BlockTables(
+        block_sizes=[16, 32],
+        max_num_reqs=8,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[3, 5],
+        device=torch.device("cuda"),
+        kernel_block_sizes=[16, 32],
+    )
+    for req_index in range(8):
+        tables.append_block_ids(
+            req_index, ([req_index + 1] * 3, [req_index + 1] * 5), overwrite=True
+        )
+    tables.apply_staged_writes()
+    tables.gather_block_tables(torch.arange(8, device="cuda"), num_reqs_padded=8)
+    return tables
+
+
+@pytest.mark.parametrize("previous_dummy", [False, True])
+@pytest.mark.parametrize("next_dummy", [False, True])
+def test_shared_block_tables_clear_rows_from_larger_batch(
+    populated_block_tables, previous_dummy, next_dummy
+):
+    """A smaller target batch must leave no stale rows for larger draft graphs."""
+    tables = populated_block_tables
+    if previous_dummy:
+        for table in tables.get_dummy_block_tables(8):
+            table.fill_(99)  # Profiling supplies valid context/state slots.
+    ptrs = [table.data_ptr() for table in tables.input_block_tables]
+    idx = torch.tensor([7, 2, 0, 5, 1], device="cuda")
+    for num_reqs in (3, 5, 0):
+        if next_dummy:
+            out = tables.get_dummy_block_tables(num_reqs)
+            num_rows = num_reqs
+        else:
+            num_rows = num_reqs + 1
+            out = tables.gather_block_tables(idx[:num_reqs], num_rows)
+        for table, view, ptr in zip(tables.input_block_tables, out, ptrs):
+            assert view.shape == (num_rows, table.shape[1])
+            assert table.data_ptr() == ptr
+            if num_rows:
+                assert view.data_ptr() == ptr
+            assert torch.count_nonzero(table[num_reqs:]).item() == 0
+            if next_dummy:
+                assert torch.count_nonzero(view).item() == 0
+                view.fill_(99)
+            else:
+                expected = (idx[:num_reqs, None] + 1).expand(-1, table.shape[1])
+                torch.testing.assert_close(view[:num_reqs], expected.to(torch.int32))
+
+
+def test_external_block_table_output_preserves_shared_rows(populated_block_tables):
+    """PCP-local gathers must neither clear shared rows nor reset their tracking."""
+    tables = populated_block_tables
+    previous = [table.clone() for table in tables.input_block_tables]
+    out = tuple(torch.full_like(table[:3], -1) for table in previous)
+    out_ptrs = torch.tensor(
+        [table.data_ptr() for table in out], dtype=torch.uint64, device="cuda"
+    )
+    idx = torch.tensor([7, 2], device="cuda")
+    result = tables.gather_block_tables(idx, 3, out=out, out_ptrs=out_ptrs)
+    for table, before, view in zip(tables.input_block_tables, previous, result):
+        torch.testing.assert_close(table, before)
+        assert view[:, 0].tolist() == [8, 3, 0]
+    tables.gather_block_tables(idx[:1], num_reqs_padded=1)
+    for table in tables.input_block_tables:
+        assert torch.count_nonzero(table[1:]).item() == 0
