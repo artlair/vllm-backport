@@ -70,6 +70,12 @@
     "RUN_WHEEL_CHECK": {
       "default": "true"
     },
+    "LMCACHE_REPO": {
+      "default": "https://github.com/wtdcode/LMCache.git"
+    },
+    "LMCACHE_REF": {
+      "default": "2acb7b24bea5ac55c5dfc6a41366099236ec525c"
+    },
     "FLASHINFER_VERSION": {
       "default": "0.6.18.post1"
     },
@@ -84,6 +90,12 @@
     },
     "RUNAI_MODEL_STREAMER_VERSION": {
       "default": ">=0.15.7"
+    },
+    "INSTALL_LMCACHE": {
+      "default": "false"
+    },
+    "RAY_VERSION": {
+      "default": "2.58.0"
     }
   }
 }
