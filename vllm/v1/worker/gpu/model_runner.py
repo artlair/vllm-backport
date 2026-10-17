@@ -150,6 +150,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    requires_aux_hidden_states,
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
 )
@@ -286,48 +287,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self._speculator_fence_streams
                     )
 
-            if self.speculative_config.method in (
-                "eagle3",
-                "dflash",
-                "dspark",
-                "extract_hidden_states",
-            ):
-                # Drafting may require auxiliary hidden states from target model outputs
-                self.use_aux_hidden_state_outputs = True
-                if self.use_pp and self.speculative_config.method == "dspark":
-                    # DSpark declares its aux layers up front, and its
-                    # target models do not relay aux states across
-                    # stages, so every tap must live on the last stage.
-                    # eagle3, dflash and extract_hidden_states instead
-                    # configure their taps at load time and relay
-                    # off-stage taps through the PPHandler (verified in
-                    # load_model).
-                    aux_layers = self._pp_aux_hidden_state_layers()
-                    if aux_layers is None:
-                        raise ValueError(
-                            f"{self.speculative_config.method} with pipeline "
-                            "parallel is not supported."
-                        )
-                    # Total layers, not get_num_layers(): that one already
-                    # divides by the pipeline size, so feeding it back into
-                    # get_pp_indices splits an already-split count.
-                    start, end = get_pp_indices(
-                        self.model_config.get_total_num_hidden_layers(),
-                        get_pp_group().rank_in_group,
-                        get_pp_group().world_size,
+            self.use_aux_hidden_state_outputs = requires_aux_hidden_states(
+                self.speculative_config
+            )
+            if self.use_pp and self.speculative_config.method == "dspark":
+                # DSpark declares its aux layers up front, and its
+                # target models do not relay aux states across
+                # stages, so every tap must live on the last stage.
+                # eagle3, dflash and extract_hidden_states instead
+                # configure their taps at load time and relay
+                # off-stage taps through the PPHandler (verified in
+                # load_model).
+                aux_layers = self._pp_aux_hidden_state_layers()
+                if aux_layers is None:
+                    raise ValueError(
+                        f"{self.speculative_config.method} with pipeline "
+                        "parallel is not supported."
                     )
-                    off_stage = [
-                        layer for layer in aux_layers if not start <= layer < end
-                    ]
-                    if self.is_last_pp_rank and off_stage:
-                        raise ValueError(
-                            f"{self.speculative_config.method} with pipeline "
-                            f"parallel requires every auxiliary hidden-state "
-                            f"layer to live on the last pipeline stage, but "
-                            f"{off_stage} fall outside its range [{start}, "
-                            f"{end}). Reduce --pipeline-parallel-size or use a "
-                            "checkpoint whose draft layers sit at the end."
-                        )
+                # Total layers, not get_num_layers(): that one already
+                # divides by the pipeline size, so feeding it back into
+                # get_pp_indices splits an already-split count.
+                start, end = get_pp_indices(
+                    self.model_config.get_total_num_hidden_layers(),
+                    get_pp_group().rank_in_group,
+                    get_pp_group().world_size,
+                )
+                off_stage = [layer for layer in aux_layers if not start <= layer < end]
+                if self.is_last_pp_rank and off_stage:
+                    raise ValueError(
+                        f"{self.speculative_config.method} with pipeline "
+                        f"parallel requires every auxiliary hidden-state "
+                        f"layer to live on the last pipeline stage, but "
+                        f"{off_stage} fall outside its range [{start}, "
+                        f"{end}). Reduce --pipeline-parallel-size or use a "
+                        "checkpoint whose draft layers sit at the end."
+                    )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
