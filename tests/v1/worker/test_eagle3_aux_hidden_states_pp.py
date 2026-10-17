@@ -53,6 +53,7 @@ class _FakeV41Layer(torch.nn.Module):
         residual,
         engram_hashes=None,
         engram_mask=None,
+        attn_input_out=None,
     ):
         if residual is None:
             residual = x if x.dim() == 3 else x.unsqueeze(1).expand(-1, HC, -1)
@@ -92,6 +93,9 @@ def _v41_stage(monkeypatch, partition: list[int], rank: int):
     inner.use_sequence_parallel = False
     inner.engram_hash = None
     inner._mtp_hidden_buffer = None
+    # The fake layers share no attention state, so nothing is relayed.
+    inner.pp_relay_sources = torch.nn.ModuleDict()
+    inner.relay_out_ids = ()
     inner._set_aux_hidden_state_layers(V41_AUX_LAYERS)
     return inner, SimpleNamespace(model=inner)
 
