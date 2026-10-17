@@ -90,12 +90,16 @@ def empty_pinned_exact(
     nbytes = numel * dtype.itemsize
     if nbytes == 0:
         return torch.empty(shape, dtype=dtype, device="cpu")
-    buf = mmap.mmap(-1, nbytes)
-    if hasattr(mmap, "MADV_HUGEPAGE"):
-        # Before registration faults the pages in: huge pages cut the TLB
-        # misses of random UVA reads.
-        with contextlib.suppress(OSError):
-            buf.madvise(mmap.MADV_HUGEPAGE)
+    # Private, not shared: THP for shared anonymous memory follows the
+    # shmem_enabled knob, which defaults to never, and 4 KiB pages slow down
+    # small random UVA gathers.
+    buf = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE)
+    for advice in ("MADV_HUGEPAGE", "MADV_DONTFORK"):
+        # Before registration faults the pages in. A forked child must not
+        # make the pinned pages copy-on-write under the GPU.
+        if hasattr(mmap, advice):
+            with contextlib.suppress(OSError):
+                buf.madvise(getattr(mmap, advice))
     try:
         # Build the tensor at its final dtype/shape directly: a uint8 -> dtype
         # -> shape view chain leaves intermediate bases that confuse code
