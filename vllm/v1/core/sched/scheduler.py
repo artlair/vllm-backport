@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -357,6 +358,17 @@ class Scheduler(SchedulerInterface):
             not isinstance(group.kv_cache_spec, MambaSpec)
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
+        )
+        # Mamba managers already account for their speculative state blocks.
+        num_spec_decode_tokens = (
+            1 + self.num_spec_tokens + self.num_lookahead_tokens
+            if self.num_spec_tokens
+            else 0
+        )
+        self._spec_decode_step_blocks = sum(
+            cdiv(num_spec_decode_tokens, manager.block_size)
+            for manager in self.kv_cache_manager.coordinator.single_type_managers
+            if not isinstance(manager.kv_cache_spec, MambaSpec)
         )
         # A finer prefix_match_unit is configured: a mamba partial tail entry
         # can only be registered by a step ending exactly at the prompt's last
@@ -1146,9 +1158,13 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # An async load holds its blocks for the whole transfer with
                     # no forward progress and isn't preemptible here. Admit it
-                    # only if it fits in (free - other in-flight reservations), to
-                    # avoid deadlock and predictable preemptions.
-                    reserved_blocks = self._inflight_prefill_reserved_blocks()
+                    # only if it fits in (free - other in-flight reservations)
+                    # plus its own spec decode step blocks, to avoid deadlock and
+                    # predictable preemptions.
+                    reserved_blocks = (
+                        self._inflight_prefill_reserved_blocks()
+                        + self._spec_decode_step_blocks
+                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -2908,11 +2924,14 @@ class Scheduler(SchedulerInterface):
         return delay_free or partial_tail_delay, kv_xfer_params
 
     def _request_remaining_blocks(self, request: Request) -> int:
-        """Blocks `request` still needs to allocate to hold its full sequence."""
+        """Blocks `request` still needs to hold its full sequence and be promoted."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
+        num_tokens = full_num_tokens
+        if self.num_spec_tokens:
+            num_tokens += 1 + self.num_spec_tokens + self.num_lookahead_tokens
         return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
-            num_tokens=full_num_tokens,
+            num_tokens=num_tokens,
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
             num_encoder_tokens=0,
             total_computed_tokens=request.num_computed_tokens,

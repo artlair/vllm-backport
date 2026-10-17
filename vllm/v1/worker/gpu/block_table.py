@@ -74,6 +74,7 @@ class BlockTables:
         self.input_block_tables: list[torch.Tensor] = [
             torch.zeros_like(b.gpu) for b in self.block_tables
         ]
+        self._num_dirty_rows = 0
 
         self.slot_mappings = torch.zeros(
             self.num_kv_cache_groups,
@@ -155,15 +156,18 @@ class BlockTables:
     ) -> tuple[torch.Tensor, ...]:
         if self.num_kv_cache_groups == 0:
             return ()
+        num_reqs = idx_mapping.shape[0]
+        num_rows = num_reqs_padded
         if out is None:
             out = tuple(self.input_block_tables)
             out_ptrs = self.input_block_table_ptrs
+            num_rows = max(num_rows, self._num_dirty_rows)
+            self._num_dirty_rows = num_reqs
         else:
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
-        num_reqs = idx_mapping.shape[0]
-        # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
-        _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
+        # Also clear rows left by a larger batch in the shared buffer.
+        _gather_block_tables_kernel[(self.num_kv_cache_groups, num_rows)](
             idx_mapping,
             self.block_table_ptrs,
             out_ptrs,
@@ -184,9 +188,12 @@ class BlockTables:
         # Zero the rows so dummy runs write mamba state to the reserved null
         # block rather than through the previous real step's (stale) block
         # ids, which may point at blocks since freed and reallocated.
-        return tuple(
-            block_table[:num_reqs].zero_() for block_table in self.input_block_tables
-        )
+        num_rows = max(num_reqs, self._num_dirty_rows)
+        for block_table in self.input_block_tables:
+            block_table[:num_rows].zero_()
+        # Profiling may populate the returned rows with valid block IDs.
+        self._num_dirty_rows = num_reqs
+        return tuple(block_table[:num_reqs] for block_table in self.input_block_tables)
 
     def compute_slot_mappings(
         self,
@@ -315,6 +322,9 @@ def _compute_slot_mappings_kernel(
     mapping_enabled = tl.load(slot_mapping_enabled + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
+    # idx_mapping == -1 marks a dummy (or CUDA-graph padding) request that owns
+    # no blocks: never read its block-table row and emit PAD for its tokens.
+    is_real_req = req_state_idx >= 0
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
@@ -342,12 +352,12 @@ def _compute_slot_mappings_kernel(
         block_offsets = local_positions % kernel_block_size
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
-            mask=is_local,
+            mask=is_local & is_real_req,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
         if CP_SIZE != 1:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
-        slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
+        slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
