@@ -839,14 +839,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     ) -> torch.Tensor:
         if not isinstance(attn_metadata, dict):
             # Profile run: kernel doesn't fire; produce a padded tensor so
-            # downstream FlashMLA gets the right shape.
-            if self.n_local_heads < self.padded_heads:
-                return F.pad(
-                    q,
-                    (0, 0, 0, self.padded_heads - self.n_local_heads),
-                    value=0.0,
-                )
-            return q
+            # downstream FlashMLA gets the right shape. Always a fresh tensor:
+            # the real op allocates its output while q is still alive, and
+            # that transient must be profiled.
+            return F.pad(
+                q,
+                (0, 0, 0, self.padded_heads - self.n_local_heads),
+                value=0.0,
+            )
 
         swa_metadata = cast(
             "DeepseekSparseSWAMetadata | None",
