@@ -212,7 +212,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
+        relay_shadow: bool = False,
     ) -> None:
+        """
+        Args:
+            relay_shadow: Build a pipeline-parallel shadow of a source layer
+                that lives on an earlier stage (see ``common/pp_relay.py``).
+                It registers under the source's layer name, owns the source's
+                compressed-KV / index-K caches and runs only the compressor
+                and indexer, via ``forward_relay_source``.
+        """
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -273,6 +282,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         is_backbone = layer_id < config.num_hidden_layers
         self.is_kv_source = is_backbone and layer_id in self.kv_source_layers
         self.is_index_source = is_backbone and layer_id in self.index_source_layers
+        self.relay_shadow = relay_shadow
+        if relay_shadow and not (self.is_kv_source or self.is_index_source):
+            raise ValueError(f"Layer {layer_id} is not a v4.1 sharing source.")
         if self.compress_ratio > 0:
             if not self.kv_source_layers or not self.index_source_layers:
                 raise ValueError(
@@ -392,8 +404,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 if index_k_cache is None:
                     raise NotImplementedError(
                         f"Indexer K cache source {k_cache_prefix} not found on "
-                        "this rank; PP splits inside a v4.1 kv-sharing group "
-                        "are not supported."
+                        "this rank; this model does not relay v4.1 sharing "
+                        "sources across pipeline-parallel stages."
                     )
             is_candidate_source = layer_id == self.candidate_source_layer
             uses_candidates = 0 <= self.candidate_source_layer < layer_id
@@ -446,15 +458,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
         )
 
-        self.swa_cache_layer = DeepseekV4SWACache(
-            head_dim=self.head_dim,
-            window_size=self.window_size,
-            dtype=self.kv_cache_torch_dtype,
-            prefix=f"{prefix}.swa_cache",
-            cache_config=cache_config,
-            backend_cls=self.swa_backend_cls,
-            block_size=32,
-        )
+        # A relay shadow never attends, so it allocates no sliding-window
+        # cache and leaves the attribute unset.
+        self.swa_cache_layer: DeepseekV4SWACache
+        if not relay_shadow:
+            self.swa_cache_layer = DeepseekV4SWACache(
+                head_dim=self.head_dim,
+                window_size=self.window_size,
+                dtype=self.kv_cache_torch_dtype,
+                prefix=f"{prefix}.swa_cache",
+                cache_config=cache_config,
+                backend_cls=self.swa_backend_cls,
+                block_size=32,
+            )
 
         # The attention layer itself was already registered with the
         # compilation context above (before indexer/compressor creation).
@@ -485,8 +501,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             ):
                 raise NotImplementedError(
                     f"Compressed-KV source {self.compressed_cache_prefix} not "
-                    "found on this rank; PP splits inside a v4.1 kv-sharing "
-                    "group are not supported."
+                    "found on this rank; this model does not relay v4.1 "
+                    "sharing sources across pipeline-parallel stages."
                 )
         else:
             self.compressed_cache_prefix = None
@@ -498,11 +514,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
 
             _COMPUTE_PREFILL_METADATA_KERNEL.register_warmup()
-            _COMPUTE_SWA_INDICES_AND_LENS_KERNEL.register_warmup(
-                window_size=self.window_size,
-                block_size=self.swa_cache_layer.block_size,
-                max_image_tokens=self.max_image_tokens,
-            )
+            if not relay_shadow:
+                _COMPUTE_SWA_INDICES_AND_LENS_KERNEL.register_warmup(
+                    window_size=self.window_size,
+                    block_size=self.swa_cache_layer.block_size,
+                    max_image_tokens=self.max_image_tokens,
+                )
 
             if self.compress_ratio > 1:
                 from vllm.v1.attention.backends.mla.compressor_utils import (
@@ -521,7 +538,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 _BUILD_PREFILL_CHUNK_METADATA_KERNEL.register_warmup()
 
             spec_config = vllm_config.speculative_config
-            if spec_config is not None and spec_config.use_dspark():
+            if (
+                spec_config is not None
+                and spec_config.use_dspark()
+                and not relay_shadow
+            ):
                 from vllm.v1.attention.backends.mla.sparse_swa import (
                     _COMPUTE_DSPARK_NONCAUSAL_SWA_INDICES_KERNEL,
                 )
@@ -579,6 +600,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
 
+    def forward_relay_source(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> None:
+        """Rebuild a source layer's shared state from its relayed input.
+
+        Runs the same input projections, compressor and indexer as the
+        source layer's ``forward`` on its attention input, so the shadow's
+        compressed-KV / index-K caches, the top-k indices and the candidate
+        blocks match the source's. The main query, SWA insert and MLA are
+        skipped.
+        """
+        assert self.relay_shadow
+        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+            hidden_states
+        )
+        qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        self._prepare_and_attn_fn(
+            hidden_states,
+            qr,
+            kv,
+            qr_scale,
+            kv_score,
+            indexer_weights,
+            positions,
+            None,
+        )
+
     @cached_property
     def _can_fuse_query_quant(self) -> bool:
         from vllm.models.deepseek_v4_1.common.ops.query_quant import (
@@ -631,7 +679,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         kv_score: torch.Tensor,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
-        o_padded: torch.Tensor,
+        o_padded: torch.Tensor | None,
     ) -> None:
         """Wide eager region: the whole of ``_prepare_and_attn`` runs eagerly.
 
@@ -658,7 +706,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         kv_score: torch.Tensor,
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
-        o_padded: torch.Tensor,
+        o_padded: torch.Tensor | None,
     ) -> None:
         """Attention input preparation followed by the sparse indexer and MLA.
 
@@ -673,7 +721,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         compressor = self.compressor
         aux_streams = self.aux_stream_list
 
-        def project_query_and_cache_kv() -> torch.Tensor:
+        def project_query_and_cache_kv() -> torch.Tensor | None:
+            if self.relay_shadow:
+                return None
             q = self._wq_b_proj(qr, qr_scale).view(
                 -1, self.n_local_heads, self.head_dim
             )
@@ -809,10 +859,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         index_q: torch.Tensor | None,
         index_q_scale: torch.Tensor | None,
         index_weights: torch.Tensor | None,
-        q: torch.Tensor,
+        q: torch.Tensor | None,
         kv: torch.Tensor,
         positions: torch.Tensor,
-        out: torch.Tensor,
+        out: torch.Tensor | None,
     ) -> None:
         if self.indexer is not None and index_q is not None:
             assert index_weights is not None
@@ -824,6 +874,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 index_weights,
             )
 
+        if self.relay_shadow:
+            return
+        assert q is not None and out is not None
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
