@@ -1,0 +1,123 @@
+# Build the fork's vLLM image and push it to the homelab zot registry
+# (zot.lan / zot.apps.lan, the in-cluster registry on k8s-w-5).
+#
+# Runs on the ARC `vllm-build` runner (privileged DinD pod on k8s-w-5, 16
+# vCPU). The buildkit state (layer cache plus the ccache and uv cache mounts)
+# persists on the node's data disk across runner pods, so rebuilds are
+# incremental: a Python-only change reuses the compiled CUDA extensions.
+#
+# Manual by design: a 20 GB image per push is too heavy for branch automation.
+#   gh workflow run publish.yml -R artlair/vllm-backport --ref <branch> -f name=dsv41
+# The GLM lane dispatches its own branch with name=glm53.
+# Repo-gated so a PR run on a fork of the fork can never touch the registry.
+name: publish
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "image name under zot.lan/vllm-backport/ (branch/model lane)"
+        default: dsv41
+        type: string
+jobs:
+  build-and-push:
+    if: github.repository == 'artlair/vllm-backport'
+    runs-on: vllm-build
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build + push
+        env:
+          NAME: ${{ inputs.name }}
+        run: |
+          set -euo pipefail
+          SHA=$(echo "${GITHUB_SHA}" | cut -c1-9)
+          IMG="k8s-w-5.lan:5000/vllm-backport/${NAME}:${SHA}-serve"
+
+          # Registry cache needs a buildx driver that can export it (the
+          # default docker driver cannot). Run a buildkitd container on the
+          # DinD daemon; zot.apps.lan over plain HTTP skips the self-signed
+          # TLS problem (Traefik ingress -> zot; same registry data as the
+          # zot.lan name consumers pull).
+          cat > /tmp/buildkitd.toml <<'EOF'
+          [registry."zot.apps.lan"]
+            http = true
+
+          # CI pushes images here: the LB bypasses Traefik (60s body cap on
+          # big pushes). Plain HTTP, same zot data as zot.apps.lan.
+          [registry."k8s-w-5.lan:5000"]
+            http = true
+
+          # Bound the persistent build scratch (hostPath on k8s-w-5's 492 GB
+          # data disk, /var/lib/longhorn, shared with the longhorn replicas
+          # that back zot). One full build needs more than 40 GiB of cache:
+          # at 40 GiB the GC evicted the compiled CUDA layer, the ccache
+          # mount and the runtime-base installs after every build, so every
+          # build recompiled csrc from scratch (~30 min). 140 GiB holds a
+          # full build with headroom and leaves ~100 GB free on the disk.
+          [worker.oci]
+            [[worker.oci.gcpolicy]]
+              keepBytes = 150323855360
+              all = true
+          EOF
+          # Recreate the builder container each run so the current toml
+          # always applies. Its state volume (buildkit_buildkit..._state)
+          # is named after the builder and survives docker rm -f, so the
+          # build cache persists across runs (that is the point of the
+          # persistent scratch). docker buildx rm would delete the volume,
+          # so remove the container directly.
+          docker rm -f buildx_buildkit_zotbuilder0 >/dev/null 2>&1 || true
+          docker buildx create --use --name zotbuilder \
+            --driver-opt network=host --config /tmp/buildkitd.toml >/dev/null
+          docker buildx inspect --bootstrap zotbuilder >/dev/null 2>&1
+
+          # sm86 only: the fleet's GPUs (RTX 3090, A6000) are all SM86. The
+          # upstream matrix also builds sm80/sm89, tripling build time for
+          # hardware nobody here runs.
+          #
+          # Push hardened: buildkit's chunked blob uploads through Traefik
+          # occasionally trip zot's upload-session range checks (invalid
+          # range start), so retry the --push, then fall back to loading the
+          # image into the DinD dockerd and docker push (the plain client
+          # every fleet host uses). The rebuild after a failed push comes
+          # from the local buildkit cache, so retries cost minutes, not hours.
+          # --provenance/--sbom off: buildx's default attestation manifests
+          # make the pushed image an OCI index that zot rejects with 415
+          # ("manifest invalid"), and the docker-push fallback inherits it
+          # when the built image is loaded. Plain image manifests only.
+          push_ok=0
+          for i in 1 2 3; do
+            if docker buildx build \
+              --provenance=false --sbom=false \
+              --file docker/Dockerfile \
+              --target vllm-openai-ray \
+              --build-arg torch_cuda_arch_list="8.6" \
+              --build-arg max_jobs="$(nproc)" \
+              --build-arg nvcc_threads=1 \
+              --tag "${IMG}" \
+              --push \
+              .
+            then push_ok=1; break; fi
+            echo "buildx push attempt ${i} failed"; sleep 60
+          done
+          if [ "${push_ok}" != "1" ]; then
+            echo "falling back to docker push via the DinD daemon"
+            docker buildx build --provenance=false --sbom=false \
+              --file docker/Dockerfile --target vllm-openai-ray \
+              --build-arg torch_cuda_arch_list="8.6" \
+              --build-arg max_jobs="$(nproc)" --build-arg nvcc_threads=1 \
+              --load --tag "${IMG}" .
+            for i in 1 2 3; do
+              if docker push "${IMG}"; then push_ok=1; break; fi
+              echo "docker push attempt ${i} failed"; sleep 60
+            done
+          fi
+          [ "${push_ok}" = "1" ]
+
+          echo "pushed ${IMG} (pulled as zot.lan/vllm-backport/${NAME}:${SHA}-serve)"
+
+      - name: smoke check
+        run: |
+          set -euo pipefail
+          SHA=$(echo "${GITHUB_SHA}" | cut -c1-9)
+          curl -sk "https://zot.lan/v2/vllm-backport/${{ inputs.name }}/tags/list" | grep -o "${SHA}-serve"
