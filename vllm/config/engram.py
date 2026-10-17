@@ -3,7 +3,7 @@
 
 from typing import TYPE_CHECKING
 
-from pydantic import Field
+from pydantic import Field, NonNegativeInt
 
 import vllm.envs as envs
 from vllm.config.utils import config, get_hash_factors, hash_factors
@@ -45,11 +45,19 @@ class EngramConfig:
     For DeepSeek V4.1 each rank offloads its assigned hash heads, so host
     table storage and lookup traffic scale with the heads assigned to it."""
 
-    gpu_resident_heads: int = Field(default=0, ge=0)
+    gpu_resident_heads: NonNegativeInt | dict[int, NonNegativeInt] = 0
     """With `cpu_offload`, keep the first this-many of each rank's hash heads
-    in GPU memory and pin only the rest in host memory. Trades HBM for host
-    RAM: for DeepSeek V4.1 Flash one head is 3.93 GiB of each table. Only
-    honored by the DeepSeek V4.1 implementation."""
+    in GPU memory and pin only the rest in host memory. Either one count for
+    every Engram layer, or a mapping from Engram layer id to count (missing
+    layers keep 0). Trades HBM for host RAM: for DeepSeek V4.1 Flash one head
+    is 3.93 GiB of each table. Only honored by the DeepSeek V4.1
+    implementation."""
+
+    def gpu_heads_for_layer(self, layer_id: int) -> int:
+        """GPU-resident heads per rank for the Engram table of `layer_id`."""
+        if isinstance(self.gpu_resident_heads, dict):
+            return self.gpu_resident_heads.get(layer_id, 0)
+        return self.gpu_resident_heads
 
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
