@@ -5,6 +5,7 @@
 """Base classes for model parameter offloading."""
 
 import contextlib
+import math
 import mmap
 from abc import ABC, abstractmethod
 from collections.abc import Generator
@@ -56,37 +57,67 @@ def pin_exact(t: torch.Tensor) -> torch.Tensor:
     ``cudaHostRegister`` yields page-locked memory with no bucketing. Falls back
     to ``pin_memory()`` for non-contiguous inputs or if registration fails.
     """
-    nbytes = t.numel() * t.element_size()
-    if nbytes == 0 or not t.is_contiguous():
+    if t.numel() == 0 or not t.is_contiguous():
         return t.pin_memory()
 
-    buf = None
     try:
-        buf = mmap.mmap(-1, nbytes)
-        # Build the tensor at its final dtype/shape directly: a uint8 -> dtype
-        # -> shape view chain leaves intermediate bases that confuse code
-        # inspecting storage_offset()/is_contiguous().
-        out = torch.frombuffer(buf, dtype=t.dtype, count=t.numel()).view(t.shape)
-        # Register the whole mapping (mmap rounds up to a page), not nbytes.
-        rc = torch.cuda.cudart().cudaHostRegister(out.data_ptr(), len(buf), 0)
-        if int(rc) != 0:
-            raise RuntimeError(f"cudaHostRegister returned {rc}")
-        out.copy_(t)
-        # The mapping must outlive every view of it. Callers reassign
-        # ``param.data`` and drop the returned tensor's Python object, so hold a
-        # process-level reference keyed by pointer; release_pinned() drops it.
-        _PINNED_MAPPINGS[out.data_ptr()] = buf
-        return out
+        out = empty_pinned_exact(t.shape, t.dtype)
     except Exception as e:
-        if buf is not None:
-            with contextlib.suppress(Exception):
-                buf.close()
         logger.warning_once(
             "pin_exact() unavailable (%s); falling back to Tensor.pin_memory(), "
             "which rounds allocations up to the next power of two.",
             e,
         )
         return t.pin_memory()
+    out.copy_(t)
+    return out
+
+
+def empty_pinned_exact(
+    shape: tuple[int, ...] | torch.Size, dtype: torch.dtype
+) -> torch.Tensor:
+    """Allocate an uninitialized page-locked CPU tensor of exactly its size.
+
+    Unlike ``torch.empty(..., pin_memory=True)``, which goes through the
+    power-of-two ``CachingHostAllocator``, this backs the tensor with an
+    anonymous mmap registered via ``cudaHostRegister``. Release it with
+    release_pinned().
+
+    Raises:
+        RuntimeError: If the mapping cannot be registered.
+    """
+    numel = math.prod(shape)
+    nbytes = numel * dtype.itemsize
+    if nbytes == 0:
+        return torch.empty(shape, dtype=dtype, device="cpu")
+    # Private, not shared: THP for shared anonymous memory follows the
+    # shmem_enabled knob, which defaults to never, and 4 KiB pages slow down
+    # small random UVA gathers.
+    buf = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE)
+    for advice in ("MADV_HUGEPAGE", "MADV_DONTFORK"):
+        # Before registration faults the pages in. A forked child must not
+        # make the pinned pages copy-on-write under the GPU.
+        if hasattr(mmap, advice):
+            with contextlib.suppress(OSError):
+                buf.madvise(getattr(mmap, advice))
+    try:
+        # Build the tensor at its final dtype/shape directly: a uint8 -> dtype
+        # -> shape view chain leaves intermediate bases that confuse code
+        # inspecting storage_offset()/is_contiguous().
+        out = torch.frombuffer(buf, dtype=dtype, count=numel).view(shape)
+        # Register the whole mapping (mmap rounds up to a page), not nbytes.
+        rc = torch.cuda.cudart().cudaHostRegister(out.data_ptr(), len(buf), 0)
+        if int(rc) != 0:
+            raise RuntimeError(f"cudaHostRegister returned {rc}")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            buf.close()
+        raise
+    # The mapping must outlive every view of it. Callers reassign
+    # ``param.data`` and drop the returned tensor's Python object, so hold a
+    # process-level reference keyed by pointer; release_pinned() drops it.
+    _PINNED_MAPPINGS[out.data_ptr()] = buf
+    return out
 
 
 def release_pinned(ptr: int) -> bool:

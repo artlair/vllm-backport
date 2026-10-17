@@ -539,6 +539,7 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
     layer.part_num_embeddings = rows
     # A window strictly inside the table, so unowned rows are exercised too.
     layer.vocab_start_idx, layer.vocab_end_idx = rows // 4, rows // 4 + rows // 2
+    layer.hbm_heads, layer.hbm_end_idx = 0, layer.vocab_start_idx
     layer._views = layer._view_src = None
     layer._num_sms = torch.cuda.get_device_properties(
         torch.accelerator.current_device_index()
@@ -560,10 +561,15 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
-@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize(
+    "cpu_offload, gpu_heads", [(False, 0), (True, 0), (True, 1), (True, 6)]
+)
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeypatch):
-    """Keep complete buckets and reconstruct head order, including TP padding."""
+def test_engram_head_shards_reconstruct_checkpoint(
+    cpu_offload, gpu_heads, tp_size, monkeypatch
+):
+    """Keep complete buckets and reconstruct head order, including TP padding
+    and heads split between HBM and pinned host memory."""
     head_sizes = (17, 19, 23, 29, 31, 37)
     num_rows, dim = sum(head_sizes), 64
     torch.manual_seed(0)
@@ -589,7 +595,11 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
         )
         with torch.device("cuda"):
             layer = ParallelEngramEmbedding(
-                num_rows + 7, dim, head_sizes, cpu_offload=cpu_offload
+                num_rows + 7,
+                dim,
+                head_sizes,
+                cpu_offload=cpu_offload,
+                gpu_heads=gpu_heads,
             )
         layer.weight.weight_loader(layer.weight, weight)
         layer.weight_scale_inv.weight_loader(
@@ -776,3 +786,124 @@ def test_engram_head_collectives_survive_graph_breaks():
     if torch.accelerator.device_count() < 2:
         pytest.skip("Requires two GPUs")
     torch.multiprocessing.spawn(_engram_tp_worker, args=(2, get_open_port()), nprocs=2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+def test_engram_offloaded_shard_is_pinned_at_exact_size(monkeypatch):
+    """torch's pinned allocator would round a 23.6 GiB TP4 shard up to 33 GiB."""
+    from vllm.model_executor.offloader import base
+
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
+    head_sizes = (1009, 1013, 1019)
+    with torch.device("cuda"):
+        layer = ParallelEngramEmbedding(sum(head_sizes), 256, head_sizes, 32, True)
+    for param in (layer.weight, layer.weight_scale_inv):
+        assert param.device.type == "cpu" and param.is_pinned()
+        mapping = base._PINNED_MAPPINGS[param.data_ptr()]
+        nbytes = param.numel() * param.element_size()
+        assert nbytes <= len(mapping) < nbytes + 4096
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("tp_size", [1, 4])
+def test_engram_loader_reads_mapped_checkpoint_directly(tmp_path, monkeypatch, tp_size):
+    """A safetensors table shard is pread into the pinned param, bit-exact."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    head_sizes = (17, 19, 23, 29, 31, 37, 41, 43)
+    rows, dim = sum(head_sizes), 64
+    torch.manual_seed(0)
+    weight = torch.randn(rows, dim).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 134, (rows, dim // 32), dtype=torch.uint8)
+    path = str(tmp_path / "engram.safetensors")
+    save_file({"w": weight, "s": scales.view(torch.float8_e8m0fnu)}, path)
+    copied = []
+    copy_uncached = engram_ops._copy_uncached
+
+    def spy(dst, src):
+        copied.append(copy_uncached(dst, src))
+        return copied[-1]
+
+    monkeypatch.setattr(engram_ops, "_copy_uncached", spy)
+    monkeypatch.setattr(
+        engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    with safe_open(path, framework="pt") as f:
+        loaded_weight, loaded_scales = f.get_tensor("w"), f.get_tensor("s")
+    for rank in range(tp_size):
+        monkeypatch.setattr(
+            engram_ops, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        with torch.device("cuda"):
+            layer = ParallelEngramEmbedding(rows, dim, head_sizes, cpu_offload=True)
+        layer.weight.weight_loader(layer.weight, loaded_weight)
+        layer.weight_scale_inv.weight_loader(layer.weight_scale_inv, loaded_scales)
+        start, end = layer.vocab_start_idx, layer.vocab_end_idx
+        assert torch.equal(
+            layer.weight.view(torch.uint8), weight[start:end].view(torch.uint8)
+        )
+        assert torch.equal(layer.weight_scale_inv, scales[start:end])
+    assert copied == [True] * (2 * tp_size)
+    # An in-memory source has no file mapping and takes the plain copy.
+    assert not copy_uncached(torch.empty_like(scales), scales.clone())
+
+
+@pytest.mark.parametrize(
+    "stage, expected_layers", [((0, 7), 1), ((7, 14), 0), ((14, 40), 1), ((0, 40), 2)]
+)
+@pytest.mark.parametrize("gpu_heads, host_rows", [(0, 12), (1, 7), (2, 0), (3, 0)])
+def test_engram_host_memory_counts_only_local_stage_tables(
+    monkeypatch, stage, expected_layers, gpu_heads, host_rows
+):
+    """Under PP a rank pins only the tables of its own stage's layers, minus
+    the heads it keeps in HBM."""
+    seen = []
+    engram_config = SimpleNamespace(
+        cpu_offload=True,
+        gpu_resident_heads=gpu_heads,
+        verify_host_memory=lambda node, rank: seen.append((node, rank)),
+    )
+    monkeypatch.setattr(
+        engram_ops,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(engram_config=engram_config),
+    )
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(
+        engram_ops, "get_world_group", lambda: SimpleNamespace(world_size=1)
+    )
+    heads = ((5, 7), (11, 13))
+    layout = SimpleNamespace(layer_ids=(1, 14), head_dim=256, primes=(heads, heads))
+    engram_ops.verify_engram_host_memory(layout, *stage)
+    # TP rank 0 of 2 owns the first two heads: 5 + 7 rows of 256 + 8 bytes.
+    expected = expected_layers * host_rows * 264
+    assert seen == [(expected, expected)]
+
+
+@pytest.mark.parametrize("cgroup_limit", [None, 100 << 30])
+def test_engram_host_memory_rejects_node_overcommit(monkeypatch, cgroup_limit):
+    """Pinned tables cannot be reclaimed, so a node-level overcommit fails early."""
+    import psutil
+
+    from vllm.config.engram import EngramConfig
+    from vllm.utils import cpu_resource_utils
+
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(total=125 << 30)
+    )
+    monkeypatch.setattr(
+        cpu_resource_utils, "get_cgroup_memory_limit", lambda: (cgroup_limit, None)
+    )
+    config = EngramConfig(cpu_offload=True)
+    # One DeepSeek-V4.1-Flash table per node (four TP4 shards) fits in 125 GiB.
+    config.verify_host_memory(95 << 30, 24 << 30)
+    if cgroup_limit is None:
+        with pytest.raises(ValueError, match="189.0 GiB of pinned host memory"):
+            config.verify_host_memory(189 << 30, 24 << 30)
+    else:
+        with pytest.raises(ValueError, match="container memory limit"):
+            config.verify_host_memory(101 << 30, 24 << 30)
+    EngramConfig(cpu_offload=False).verify_host_memory(189 << 30, 24 << 30)
