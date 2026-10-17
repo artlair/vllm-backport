@@ -45,6 +45,12 @@ class EngramConfig:
     For DeepSeek V4.1 each rank offloads its assigned hash heads, so host
     table storage and lookup traffic scale with the heads assigned to it."""
 
+    gpu_resident_heads: int = Field(default=0, ge=0)
+    """With `cpu_offload`, keep the first this-many of each rank's hash heads
+    in GPU memory and pin only the rest in host memory. Trades HBM for host
+    RAM: for DeepSeek V4.1 Flash one head is 3.93 GiB of each table. Only
+    honored by the DeepSeek V4.1 implementation."""
+
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
     Otherwise, each DP rank has a separate TP-sharded embedding replica.

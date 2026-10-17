@@ -622,10 +622,14 @@ def _engram_head_shard_weight_loader(
     param: torch.nn.Parameter, loaded_weight: torch.Tensor
 ) -> None:
     """Load this rank's complete head buckets. ue8m0 scales arrive as
-    float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
+    float8_e8m0fnu; keep the raw bytes (the param stores uint8). The rows of
+    heads kept in HBM under CPU offload go to the param's `engram_hbm`."""
     part_rows = param.shape[0]
     if loaded_weight.dtype == torch.float8_e8m0fnu:
         loaded_weight = loaded_weight.view(torch.uint8)
+    hbm = param.engram_hbm
+    if hbm.numel():
+        hbm.copy_(loaded_weight.narrow(0, param.engram_hbm_start, hbm.shape[0]))
     shard = loaded_weight.narrow(0, param.engram_vocab_start, part_rows)
     assert shard.shape == param.shape, (
         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
@@ -648,6 +652,8 @@ def _engram_lookup_kernel(
     HEAD_START: tl.constexpr,
     LOCAL_HEADS: tl.constexpr,
     TOTAL_HEADS: tl.constexpr,
+    FIRST_HEAD: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
     DIM: tl.constexpr,
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
@@ -656,16 +662,19 @@ def _engram_lookup_kernel(
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
-    `weight`/`scales` may address pinned host memory through UVA. `weight` is
-    the uint8 view of the e4m3 rows so the decode also compiles below SM89.
+    A launch writes local heads [FIRST_HEAD, FIRST_HEAD + NUM_HEADS), whose
+    rows `weight` holds from `vocab_start`. `weight`/`scales` may address
+    pinned host memory through UVA. `weight` is the uint8 view of the e4m3
+    rows so the decode also compiles below SM89.
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
     for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, GRID * BLOCK_R):
         rows = base + tl.arange(0, BLOCK_R)
         valid = rows < num_rows
-        head = HEAD_START + rows % LOCAL_HEADS
-        token = (rows // LOCAL_HEADS).to(tl.int64)
+        local_head = FIRST_HEAD + rows % NUM_HEADS
+        head = HEAD_START + local_head
+        token = (rows // NUM_HEADS).to(tl.int64)
         index = tl.load(
             ids + token * ids_stride_t + head * ids_stride_h,
             mask=valid & (head < TOTAL_HEADS),
@@ -688,7 +697,7 @@ def _engram_lookup_kernel(
         # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
         scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         tl.store(
-            out + rows[:, None] * DIM + cols[None, :],
+            out + (token * LOCAL_HEADS + local_head)[:, None] * DIM + cols[None, :],
             (values * scale).to(tl.bfloat16),
             mask=valid[:, None],
         )
@@ -699,7 +708,8 @@ class ParallelEngramEmbedding(nn.Module):
     Rows stay fp8 and are dequantized with ue8m0 per-32 scales on lookup.
 
     With `cpu_offload` the shard lives in pinned host memory and is read over
-    UVA instead of HBM; the TP sharding is unchanged either way.
+    UVA instead of HBM, except for its first `gpu_heads` heads; the TP
+    sharding is unchanged either way.
     """
 
     def __init__(
@@ -709,6 +719,7 @@ class ParallelEngramEmbedding(nn.Module):
         head_sizes: tuple[int, ...],
         block_size: int = 32,
         cpu_offload: bool = False,
+        gpu_heads: int = 0,
     ):
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
@@ -727,6 +738,12 @@ class ParallelEngramEmbedding(nn.Module):
             head_sizes, tp_rank, tp_size
         )
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
+        owned = max(0, min(self.part_n_hash_cols, self.n_hash_cols - self.head_start))
+        self.hbm_heads = min(gpu_heads, owned) if cpu_offload else 0
+        self.hbm_end_idx = max(
+            self.vocab_start_idx, sum(head_sizes[: self.head_start + self.hbm_heads])
+        )
+        host_rows = self.vocab_end_idx - self.hbm_end_idx
         self.tp_size = tp_size
         self.cpu_offload = cpu_offload
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -739,28 +756,48 @@ class ParallelEngramEmbedding(nn.Module):
         # rounds up to a power of two, which turns a 23.6 GiB shard into 33.
         alloc = empty_pinned_exact if cpu_offload else torch.empty
         self.weight = nn.Parameter(
-            alloc((self.part_num_embeddings, dim), dtype=torch.float8_e4m3fn),
-            requires_grad=False,
+            alloc((host_rows, dim), dtype=torch.float8_e4m3fn), requires_grad=False
         )
         self.weight_scale_inv = nn.Parameter(
-            alloc((self.part_num_embeddings, dim // block_size), dtype=torch.uint8),
+            alloc((host_rows, dim // block_size), dtype=torch.uint8),
             requires_grad=False,
         )
-        for param in (self.weight, self.weight_scale_inv):
+        # Not parameters: the checkpoint has one tensor per table, which the
+        # loader of `weight` / `weight_scale_inv` splits between both.
+        hbm_rows = self.hbm_end_idx - self.vocab_start_idx
+        self.register_buffer(
+            "hbm_weight",
+            torch.empty(hbm_rows, dim, dtype=torch.float8_e4m3fn),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hbm_weight_scale_inv",
+            torch.empty(hbm_rows, dim // block_size, dtype=torch.uint8),
+            persistent=False,
+        )
+        for param, hbm in (
+            (self.weight, self.hbm_weight),
+            (self.weight_scale_inv, self.hbm_weight_scale_inv),
+        ):
             set_weight_attrs(
                 param,
                 {
                     "weight_loader": _engram_head_shard_weight_loader,
-                    "engram_vocab_start": self.vocab_start_idx,
+                    "engram_vocab_start": self.hbm_end_idx,
+                    "engram_hbm": hbm,
+                    "engram_hbm_start": self.vocab_start_idx,
                 },
             )
         if cpu_offload:
+            row_gib = (dim + dim // block_size) / 1024**3
             logger.info(
                 "Engram table offloaded to pinned host memory: %d rows x %d, "
-                "%.2f GiB per rank",
-                self.part_num_embeddings,
+                "%.2f GiB per rank; %d heads (%.2f GiB) kept in GPU memory",
+                host_rows,
                 dim,
-                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
+                host_rows * row_gib,
+                self.hbm_heads,
+                hbm_rows * row_gib,
             )
 
     @staticmethod
@@ -797,10 +834,44 @@ class ParallelEngramEmbedding(nn.Module):
 
         `background` limits the grid to leave SMs for concurrent work.
         """
-        rows = indices.shape[0] * self.part_n_hash_cols
-        if not rows:
+        if not indices.shape[0]:
             return
-        weight, scales = self._storage()
+        if self.hbm_heads:
+            self._lookup_heads(
+                (self.hbm_weight, self.hbm_weight_scale_inv),
+                self.vocab_start_idx,
+                self.hbm_end_idx,
+                0,
+                self.hbm_heads,
+                indices,
+                out,
+                background,
+            )
+        if self.hbm_heads < self.part_n_hash_cols:
+            self._lookup_heads(
+                self._storage(),
+                self.hbm_end_idx,
+                self.vocab_end_idx,
+                self.hbm_heads,
+                self.part_n_hash_cols - self.hbm_heads,
+                indices,
+                out,
+                background,
+            )
+
+    def _lookup_heads(
+        self,
+        storage: tuple[torch.Tensor, torch.Tensor],
+        vocab_start: int,
+        vocab_end: int,
+        first_head: int,
+        num_heads: int,
+        indices: torch.Tensor,
+        out: torch.Tensor,
+        background: bool,
+    ) -> None:
+        weight, scales = storage
+        rows = indices.shape[0] * num_heads
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
@@ -810,14 +881,16 @@ class ParallelEngramEmbedding(nn.Module):
             scales,
             indices,
             out,
-            self.vocab_start_idx,
-            self.vocab_end_idx,
+            vocab_start,
+            vocab_end,
             rows,
             indices.stride(0),
             indices.stride(1),
             HEAD_START=self.head_start,
             LOCAL_HEADS=self.part_n_hash_cols,
             TOTAL_HEADS=self.n_hash_cols,
+            FIRST_HEAD=first_head,
+            NUM_HEADS=num_heads,
             DIM=self.dim,
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
@@ -851,6 +924,7 @@ def verify_engram_host_memory(
     engram_config = get_current_vllm_config().engram_config
     if engram_config is None or not engram_config.cpu_offload:
         return
+    gpu_heads = engram_config.gpu_resident_heads
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
     row_bytes = layout.head_dim + layout.head_dim // block_size
@@ -859,7 +933,9 @@ def verify_engram_host_memory(
         if start_layer <= layer_id < end_layer:
             heads = tuple(size for order in layout.primes[index] for size in order)
             start, end = ParallelEngramEmbedding.shard_rows(heads, tp_rank, tp_size)
-            rank_bytes += (end - start) * row_bytes
+            part = triton.cdiv(len(heads), tp_size)
+            hbm_end = sum(heads[: tp_rank * part + min(gpu_heads, part)])
+            rank_bytes += (end - max(start, min(hbm_end, end))) * row_bytes
     world = get_world_group()
     host = socket.gethostname()
     entries: list[tuple[str, int]] = [(host, rank_bytes)] * world.world_size
@@ -1021,6 +1097,7 @@ class Engram(nn.Module):
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=engram_config.cpu_offload if engram_config else True,
+            gpu_heads=engram_config.gpu_resident_heads if engram_config else 0,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(

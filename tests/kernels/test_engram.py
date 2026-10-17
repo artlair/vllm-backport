@@ -539,6 +539,7 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
     layer.part_num_embeddings = rows
     # A window strictly inside the table, so unowned rows are exercised too.
     layer.vocab_start_idx, layer.vocab_end_idx = rows // 4, rows // 4 + rows // 2
+    layer.hbm_heads, layer.hbm_end_idx = 0, layer.vocab_start_idx
     layer._views = layer._view_src = None
     layer._num_sms = torch.cuda.get_device_properties(
         torch.accelerator.current_device_index()
@@ -560,10 +561,15 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
-@pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize(
+    "cpu_offload, gpu_heads", [(False, 0), (True, 0), (True, 1), (True, 6)]
+)
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeypatch):
-    """Keep complete buckets and reconstruct head order, including TP padding."""
+def test_engram_head_shards_reconstruct_checkpoint(
+    cpu_offload, gpu_heads, tp_size, monkeypatch
+):
+    """Keep complete buckets and reconstruct head order, including TP padding
+    and heads split between HBM and pinned host memory."""
     head_sizes = (17, 19, 23, 29, 31, 37)
     num_rows, dim = sum(head_sizes), 64
     torch.manual_seed(0)
@@ -589,7 +595,11 @@ def test_engram_head_shards_reconstruct_checkpoint(cpu_offload, tp_size, monkeyp
         )
         with torch.device("cuda"):
             layer = ParallelEngramEmbedding(
-                num_rows + 7, dim, head_sizes, cpu_offload=cpu_offload
+                num_rows + 7,
+                dim,
+                head_sizes,
+                cpu_offload=cpu_offload,
+                gpu_heads=gpu_heads,
             )
         layer.weight.weight_loader(layer.weight, weight)
         layer.weight_scale_inv.weight_loader(
@@ -843,13 +853,16 @@ def test_engram_loader_reads_mapped_checkpoint_directly(tmp_path, monkeypatch, t
 @pytest.mark.parametrize(
     "stage, expected_layers", [((0, 7), 1), ((7, 14), 0), ((14, 40), 1), ((0, 40), 2)]
 )
+@pytest.mark.parametrize("gpu_heads, host_rows", [(0, 12), (1, 7), (2, 0), (3, 0)])
 def test_engram_host_memory_counts_only_local_stage_tables(
-    monkeypatch, stage, expected_layers
+    monkeypatch, stage, expected_layers, gpu_heads, host_rows
 ):
-    """Under PP a rank pins only the tables of its own stage's layers."""
+    """Under PP a rank pins only the tables of its own stage's layers, minus
+    the heads it keeps in HBM."""
     seen = []
     engram_config = SimpleNamespace(
         cpu_offload=True,
+        gpu_resident_heads=gpu_heads,
         verify_host_memory=lambda node, rank: seen.append((node, rank)),
     )
     monkeypatch.setattr(
@@ -866,7 +879,7 @@ def test_engram_host_memory_counts_only_local_stage_tables(
     layout = SimpleNamespace(layer_ids=(1, 14), head_dim=256, primes=(heads, heads))
     engram_ops.verify_engram_host_memory(layout, *stage)
     # TP rank 0 of 2 owns the first two heads: 5 + 7 rows of 256 + 8 bytes.
-    expected = expected_layers * 12 * 264
+    expected = expected_layers * host_rows * 264
     assert seen == [(expected, expected)]
 
 
