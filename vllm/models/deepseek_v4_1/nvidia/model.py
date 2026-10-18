@@ -1243,6 +1243,16 @@ class DeepseekV41LLMForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        # The loader's strict check exempts quantized linears, so a node whose
+        # checkpoint lacks a shadowed source's files would run the shadow on
+        # uninitialized weights without an error.
+        for source_id in self.model.pp_relay_sources:
+            prefix = f"model.pp_relay_sources.{source_id}."
+            if not any(name.startswith(prefix) for name in loaded_params):
+                raise ValueError(
+                    f"No weights of layer {source_id} reached its PP shadow; the "
+                    "checkpoint files holding them are missing on this node."
+                )
         self.process_weights_after_loading()
         return loaded_params
 
