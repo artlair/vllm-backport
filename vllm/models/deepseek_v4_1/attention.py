@@ -71,6 +71,13 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+# Token-count ceiling under which the long default chain (fused_wqa_wkv) is
+# enqueued before the aux fork. At small batches starting the longest chain
+# first shortens the step tail; larger batches saturate the device and prefer
+# the aux chains first. Each captured graph bakes one order per size. 0
+# disables it, which keeps the aux-first order everywhere.
+DEFAULT_FIRST_MAX_TOKENS = 96
+
 
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
     """Swap the layer index inside a ``...layers.<idx>...`` prefix."""
@@ -848,6 +855,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_streams,
             enable=hidden_states.shape[0]
             <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            default_first=hidden_states.shape[0] <= DEFAULT_FIRST_MAX_TOKENS,
         )
 
         return qr_kv, kv_score, indexer_weights
