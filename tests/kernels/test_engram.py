@@ -850,6 +850,106 @@ def test_engram_loader_reads_mapped_checkpoint_directly(tmp_path, monkeypatch, t
     assert not copy_uncached(torch.empty_like(scales), scales.clone())
 
 
+class _StubEngramTables(torch.nn.Module):
+    """Stands in for the hash tables; `wkv` is what the tests below check."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.part_n_hash_cols = 1
+        self.n_hash_cols = 1
+        self.tp_size = 1
+
+
+def _make_engram(monkeypatch, dims, tp_size, tp_rank):
+    """An Engram whose only real submodule is `wkv`, set up as on `tp_rank`."""
+    from vllm.model_executor import parameter as parameter_ops
+    from vllm.model_executor.layers import linear as linear_ops
+
+    monkeypatch.setattr(engram_ops, "ParallelEngramEmbedding", _StubEngramTables)
+    monkeypatch.setattr(
+        engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(
+        engram_ops, "get_tensor_model_parallel_rank", lambda rank=tp_rank: rank
+    )
+    monkeypatch.setattr(
+        linear_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
+    monkeypatch.setattr(
+        linear_ops, "get_tensor_model_parallel_rank", lambda rank=tp_rank: rank
+    )
+    # BasevLLMParameter seeds tp_rank/tp_size from the global state; the layer
+    # then overwrites both with its own values in update_param_tp_status().
+    monkeypatch.setattr(parameter_ops, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_ops, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        engram_ops,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            engram_config=None,
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        ),
+    )
+    layout = SimpleNamespace(
+        layer_ids=(1,),
+        num_embeddings=(64,),
+        head_dim=dims.head_dim,
+        max_ngram_size=3,
+        n_heads=dims.n_heads,
+        primes=(((3,) * dims.n_heads, (5,) * dims.n_heads),),
+    )
+    config = SimpleNamespace(
+        hidden_size=dims.dim, hc_mult=dims.hc_mult, rms_norm_eps=1e-6
+    )
+    return Engram(config, None, layout, 0, dims.sp, "engram")
+
+
+@pytest.mark.parametrize("tp_size", [1, 4, 8])
+@pytest.mark.parametrize("use_sequence_parallel", [False, True])
+def test_engram_wkv_is_column_parallel(monkeypatch, tp_size, use_sequence_parallel):
+    """Every TP rank loads and computes only its own output columns of `wkv`
+    (1/TP of the projection), and the layer gathers the full result back, so a
+    rank that loaded another rank's slice would silently corrupt the gate.
+    Sequence parallelism shards tokens instead and must stay replicated."""
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
+
+    # DeepSeek-V4.1-Flash dimensions: 16 hash columns of 256, hidden 5120,
+    # hc_mult 4, so wkv is [25600, 4096] and splits evenly at TP 4 and 8.
+    dims = SimpleNamespace(
+        dim=5120, hc_mult=4, head_dim=256, n_heads=8, sp=use_sequence_parallel
+    )
+    n_hash_cols = 2 * dims.n_heads
+    width = dims.dim * (dims.hc_mult + 1)
+
+    checkpoint = torch.randn(width, n_hash_cols * dims.head_dim, dtype=torch.bfloat16)
+    shards = []
+    for rank in range(tp_size):
+        module = _make_engram(monkeypatch, dims, tp_size, rank)
+        wkv = module.wkv
+        assert isinstance(wkv, ColumnParallelLinear)
+        # The fused post-wkv kernel reads every column, so they are gathered.
+        assert wkv.gather_output
+        assert wkv.input_size == n_hash_cols * dims.head_dim
+        assert wkv.output_size == width
+        if use_sequence_parallel:
+            assert (wkv.tp_size, wkv.tp_rank) == (1, 0)
+            assert wkv.weight.shape == (width, n_hash_cols * dims.head_dim)
+            continue
+        shard = width // tp_size
+        assert (wkv.tp_size, wkv.tp_rank) == (tp_size, rank)
+        assert wkv.weight.shape == (shard, n_hash_cols * dims.head_dim)
+        # The checkpoint stores wkv unsharded; the layer's weight loader is
+        # what narrows it, so drive it the way the model loader does.
+        wkv.weight.weight_loader(wkv.weight, checkpoint)
+        expected = checkpoint[rank * shard : (rank + 1) * shard]
+        assert torch.equal(wkv.weight.data, expected)
+        shards.append(wkv.weight.data.clone())
+    if not use_sequence_parallel:
+        assert torch.equal(torch.cat(shards, dim=0), checkpoint)
+
+
 @pytest.mark.parametrize(
     "stage, expected_layers", [((0, 7), 1), ((7, 14), 0), ((14, 40), 1), ((0, 40), 2)]
 )
