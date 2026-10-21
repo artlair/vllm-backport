@@ -1118,50 +1118,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
                 return seq_lens, block_table, decode_lens, num_decode_tokens, False
             else:
-                # Variable decode lengths.
-                # Assume 4 requests with seq_lens [10, 7, 12, 0] (the final req is
-                # padding) and decode_lens [3, 1, 4, 0] in the below example comments.
-                # The context lengths are therefore
-                # [10-3, 7-1, 12-4, 0-0] = [7, 6, 8, 0].
-
-                # 3 + 1 + 4 + 0 = 8
-                actual_expanded = int(decode_lens_cpu.sum().item())
-
-                # Fuse expanded_base and expanded_starts into a single
-                # repeat_interleave:
-                # seq_len_i = (context_start[b] - query_start_loc[b]) + arange[i] + 1
-                # where context_start[b] = seq_lens[b] - decode_lens[b].
-                # Example: offsets = [7-0, 6-3, 8-4, 0-8] = [7, 3, 4, -8]
-                # expanded_offsets  = [7, 7, 7, 3, 4, 4, 4, 4]
-                # result            = [8, 9, 10, 7, 9, 10, 11, 12]
-                expanded_offsets = torch.repeat_interleave(
-                    seq_lens - decode_lens - query_start_loc,
-                    decode_lens,
-                    output_size=actual_expanded,
+                # Variable decode lengths: one device kernel derives the same
+                # per-token rows as the repeat_interleave chain it replaces,
+                # from device query_start_loc, and clears the graph padding.
+                self._build_flattened_decode_metadata(
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    block_table=block_table,
+                    num_decodes=num_decodes,
+                    num_decode_tokens=num_decode_tokens,
                 )
-
-                # [8, 9, 10, 7, 9, 10, 11, 12, ...] where ... is unused buffer space
-                self.decode_seq_lens_buffer[:actual_expanded] = (
-                    expanded_offsets + self.arange_buffer[:actual_expanded] + 1
-                )
-                self.decode_seq_lens_buffer[actual_expanded:] = 0
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
-
-                # Give each of the flattened entries the same block table row as the
-                # original request.
-                self.expanded_block_table_buffer[:actual_expanded] = (
-                    torch.repeat_interleave(
-                        block_table, decode_lens, dim=0, output_size=actual_expanded
-                    )
-                )
-                if actual_expanded < num_decode_tokens:
-                    self.expanded_block_table_buffer[
-                        actual_expanded:num_decode_tokens, 0
-                    ] = 0
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]
-
-                # All reqs now have decode_len=1
-                self.decode_lens_buffer[:num_decode_tokens] = 1
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
                 return seq_lens, block_table, decode_lens, num_decode_tokens, False
         else:
@@ -1220,27 +1188,45 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.global_decode_seq_lens_buffer[actual_expanded:num_decode_tokens] = 0
         return self.global_decode_seq_lens_buffer[:num_decode_tokens]
 
-    def _build_varlen_decode_indices(
+    def _build_flattened_decode_metadata(
         self,
-        decode_lens: torch.Tensor,
-        decode_lens_cpu: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        num_decodes: int,
         num_decode_tokens: int,
-    ) -> torch.Tensor:
-        """Build request ids for flattened SM100 varlen rows."""
-        indices = self.decode_indices_buffer[:num_decode_tokens]
-        actual_expanded = int(decode_lens_cpu.sum().item())
-        num_decodes = decode_lens.shape[0]
-        indices[:actual_expanded] = torch.repeat_interleave(
-            self.arange_buffer[:num_decodes],
-            decode_lens,
-            output_size=actual_expanded,
+    ) -> None:
+        """Flatten one row per decode token, from device query_start_loc.
+
+        Fills the per-token seq_lens, block table rows, decode_lens (all 1),
+        token-to-request indices and per-request query lens, and clears the
+        graph-padding tail of the seq_lens buffer.
+        """
+        from vllm.v1.attention.ops.metadata import _indexer_decode_metadata_kernel
+
+        assert block_table.shape[1] == self.expanded_block_table_buffer.shape[1]
+        capacity = self.decode_seq_lens_buffer.numel()
+        grid = max(
+            num_decodes,
+            num_decode_tokens + triton.cdiv(capacity - num_decode_tokens, 256),
         )
-        if actual_expanded < num_decode_tokens:
-            pad = num_decode_tokens - actual_expanded
-            indices[actual_expanded:num_decode_tokens] = (
-                num_decodes + self.arange_buffer[:pad]
-            )
-        return indices
+        _indexer_decode_metadata_kernel[(grid,)](
+            query_start_loc,
+            seq_lens,
+            block_table,
+            self.decode_seq_lens_buffer,
+            self.expanded_block_table_buffer,
+            self.decode_lens_buffer,
+            self.decode_indices_buffer,
+            self.per_req_decode_lens_buffer,
+            num_decodes,
+            num_decode_tokens,
+            capacity,
+            block_table.stride(0),
+            self.expanded_block_table_buffer.stride(0),
+            BLOCK_COLS=block_table.shape[1],
+            num_warps=4,
+        )
 
     @staticmethod
     def _split_indexer_prefill_chunks(
@@ -1450,12 +1436,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata = None
         if num_decodes > 0:
-            torch.diff(
-                common_attn_metadata.query_start_loc[: num_decodes + 1],
-                out=self.decode_lens_buffer[:num_decodes],
-            )
+            if not self.supports_varlen:
+                torch.diff(
+                    common_attn_metadata.query_start_loc[: num_decodes + 1],
+                    out=self.decode_lens_buffer[:num_decodes],
+                )
+                self.per_req_decode_lens_buffer[:num_decodes].copy_(
+                    self.decode_lens_buffer[:num_decodes]
+                )
             decode_lens = self.decode_lens_buffer[:num_decodes]
-            self.per_req_decode_lens_buffer[:num_decodes].copy_(decode_lens)
             decode_lens_cpu = torch.diff(
                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
             )
@@ -1490,38 +1479,56 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 and step_next_n_ok
             )
 
-            global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
-                global_seq_lens=global_seq_lens_for_decode,
-                decode_lens=decode_lens,
-                decode_lens_cpu=decode_lens_cpu,
-                query_start_loc=common_attn_metadata.query_start_loc[:num_decodes],
-                num_decode_tokens=num_decode_tokens,
-                use_native=use_native,
-                max_decode_len=max_decode_len,
-            )
-
             decode_indices = None
             if self.supports_varlen:
-                decode_indices = self._build_varlen_decode_indices(
-                    decode_lens=decode_lens,
-                    decode_lens_cpu=decode_lens_cpu,
-                    num_decode_tokens=num_decode_tokens,
-                )
-
-            seq_lens, block_table, decode_lens, batch_size, requires_padding = (
-                self._prepare_decode_tensors(
+                self._build_flattened_decode_metadata(
+                    query_start_loc=query_start_loc,
                     seq_lens=seq_lens,
                     block_table=block_table,
+                    num_decodes=num_decodes,
+                    num_decode_tokens=num_decode_tokens,
+                )
+                seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
+                block_table = self.expanded_block_table_buffer[:num_decode_tokens]
+                decode_lens = self.decode_lens_buffer[:num_decode_tokens]
+                decode_indices = self.decode_indices_buffer[:num_decode_tokens]
+                batch_size = num_decode_tokens
+                requires_padding = False
+                # The kernel flattened the global bounds along with seq_lens.
+                if global_seq_lens_for_decode is not None and max_decode_len > 1:
+                    self.global_decode_seq_lens_buffer[:num_decode_tokens].copy_(
+                        seq_lens
+                    )
+                    global_seq_lens_for_decode = self.global_decode_seq_lens_buffer[
+                        :num_decode_tokens
+                    ]
+            else:
+                global_seq_lens_for_decode = self._prepare_global_decode_seq_lens(
+                    global_seq_lens=global_seq_lens_for_decode,
                     decode_lens=decode_lens,
                     decode_lens_cpu=decode_lens_cpu,
                     query_start_loc=common_attn_metadata.query_start_loc[:num_decodes],
-                    num_decodes=num_decodes,
                     num_decode_tokens=num_decode_tokens,
                     use_native=use_native,
-                    next_n=next_n,
                     max_decode_len=max_decode_len,
                 )
-            )
+
+                seq_lens, block_table, decode_lens, batch_size, requires_padding = (
+                    self._prepare_decode_tensors(
+                        seq_lens=seq_lens,
+                        block_table=block_table,
+                        decode_lens=decode_lens,
+                        decode_lens_cpu=decode_lens_cpu,
+                        query_start_loc=common_attn_metadata.query_start_loc[
+                            : num_decodes + 1
+                        ],
+                        num_decodes=num_decodes,
+                        num_decode_tokens=num_decode_tokens,
+                        use_native=use_native,
+                        next_n=next_n,
+                        max_decode_len=max_decode_len,
+                    )
+                )
 
             # Decode half of the indexer query shard. `batch_size` is the
             # kernels' query-group dimension, so the partition is over exactly
