@@ -320,7 +320,6 @@ if TYPE_CHECKING:
     VLLM_SPARSE_RAGGED_FAST_SCAN: bool = False
     VLLM_DSV4_FIXED_DECODE_SPLITS: int = 0
     VLLM_DSV4_LOGITS_ROW_CHUNK: int = 128
-    VLLM_DSV41_SPARSE_MQA: bool = False
     VLLM_DSV4_CANDIDATE_SELECTION_BACKEND: Literal["torch", "triton_radix"] = "torch"
     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
     VLLM_TOKEN_BUCKET_PAD: bool = True
@@ -2305,12 +2304,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "torch" (default) keeps the existing selector. See candidate_radix.py.
     "VLLM_DSV4_CANDIDATE_SELECTION_BACKEND": env_with_choices(
         "VLLM_DSV4_CANDIDATE_SELECTION_BACKEND", "torch", ["torch", "triton_radix"]
-    ),
-    # Score only the two-level candidate blocks in the SM8x decode indexer and
-    # run the token top-k over that compact buffer instead of the full-width
-    # logits. Off by default: opt-in until it is validated on this fleet.
-    "VLLM_DSV41_SPARSE_MQA": lambda: (
-        os.environ.get("VLLM_DSV41_SPARSE_MQA", "0") == "1"
     ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient
