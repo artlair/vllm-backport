@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton
 
 
@@ -164,6 +165,8 @@ def select_candidate_blocks(
 
     Row bounds are in packed column space; absent starts mean zero.
     Decode rows share bounds in groups of ``row_repeat``. Output is -1 padded.
+    ``VLLM_DSV4_CANDIDATE_SELECTION_BACKEND=triton_radix`` swaps the
+    full-width top-k for the length-aware radix selector on CUDA sm8x.
     """
     assert logits.is_cuda
     rows, width = logits.shape
@@ -172,12 +175,27 @@ def select_candidate_blocks(
     if not width:
         out.fill_(-1)
         return
+    if (
+        envs.VLLM_DSV4_CANDIDATE_SELECTION_BACKEND == "triton_radix"
+        and topk_blocks > 0
+        and logits.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        from vllm.model_executor.kernels.attention.dsa.candidate_radix import (
+            select_candidate_blocks_radix,
+        )
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda() and current_platform.has_device_capability(80):
+            select_candidate_blocks_radix(
+                logits, row_ks, row_ke, topk_blocks, block_size, out, row_repeat
+            )
+            return
     nblocks = triton.cdiv(width, block_size)
     scores = logits.new_empty((rows, nblocks))
     # Logits are max_model_len wide (CUDA-graph static) but rows are shorter:
     # the score kernel only loads valid columns and publishes live block
     # counts. No DeepSelect on sm8x, so the -inf tail is still written and the
-    # counts are informational for a future length-aware top-k.
+    # torch fallback ignores the counts (the radix backend uses its own).
     valid_blocks = torch.empty(rows, dtype=torch.int32, device=logits.device)
     _block_scores_kernel[(rows, 32)](
         logits,
