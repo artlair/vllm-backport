@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton
 
 
@@ -17,38 +18,52 @@ def _block_scores_kernel(
     starts,
     ends,
     scores,
+    valid_blocks,
     stride_row,
     stride_col,
     stride_start,
     stride_end,
+    stride_scores,
     width,
     nblocks,
     BLOCK_SIZE: tl.constexpr,
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
     TILE: tl.constexpr,
+    FULL_WIDTH: tl.constexpr,
 ):
+    # Publishes each row's live block count; FULL_WIDTH also writes the -inf
+    # tail so the full-width top-k reads the same scores as before.
     row = tl.program_id(0).to(tl.int64)
-    blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
     start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
     end = tl.load(ends + row // ROW_REPEAT * stride_end)
+    col_end = tl.minimum(end, width)
+    num_valid = tl.cdiv(tl.maximum(col_end - start, 0), BLOCK_SIZE)
+    # Pin the newest block even when its columns sit past the logits
+    # allocation; _candidate_flags_kernel maps that block to the edge flag.
+    newest = (end - start - 1) // BLOCK_SIZE
+    num_valid = tl.where(
+        (end > start) & (newest >= 0),
+        tl.maximum(num_valid, newest + 1),
+        num_valid,
+    )
+    num_valid = tl.minimum(num_valid, nblocks)
+    if tl.program_id(1) == 0:
+        tl.store(valid_blocks + row, num_valid)
+    num_blocks = nblocks if FULL_WIDTH else num_valid
     offsets = tl.arange(0, triton.next_power_of_2(BLOCK_SIZE))
-    cols = start + blocks[:, None] * BLOCK_SIZE + offsets[None, :]
-    values = tl.load(
-        logits + row * stride_row + cols * stride_col,
-        (blocks[:, None] < nblocks)
-        & (offsets[None, :] < BLOCK_SIZE)
-        & (cols < end)
-        & (cols < width),
-        other=-float("inf"),
-    )
-    reduced = tl.reduce(values, 1, _max_with_nan)
-    reduced = tl.where(
-        (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE),
-        float("inf"),
-        reduced,
-    )
-    tl.store(scores + row * nblocks + blocks, reduced, blocks < nblocks)
+    num_tiles = tl.cdiv(num_blocks, TILE)
+    for tile_id in range(tl.program_id(1), num_tiles, tl.num_programs(1)):
+        blocks = tile_id * TILE + tl.arange(0, TILE)
+        cols = start + blocks[:, None] * BLOCK_SIZE + offsets[None, :]
+        values = tl.load(
+            logits + row * stride_row + cols * stride_col,
+            (offsets[None, :] < BLOCK_SIZE) & (cols < col_end),
+            other=-float("inf"),
+        ).to(tl.float32)
+        reduced = tl.reduce(values, 1, _max_with_nan)
+        reduced = tl.where((end > start) & (blocks == newest), float("inf"), reduced)
+        tl.store(scores + row * stride_scores + blocks, reduced, blocks < num_blocks)
 
 
 @triton.jit(do_not_specialize=["k"])
@@ -150,6 +165,8 @@ def select_candidate_blocks(
 
     Row bounds are in packed column space; absent starts mean zero.
     Decode rows share bounds in groups of ``row_repeat``. Output is -1 padded.
+    ``VLLM_DSV4_CANDIDATE_SELECTION_BACKEND=triton_radix`` swaps the
+    full-width top-k for the length-aware radix selector on CUDA sm8x.
     """
     assert logits.is_cuda
     rows, width = logits.shape
@@ -158,22 +175,45 @@ def select_candidate_blocks(
     if not width:
         out.fill_(-1)
         return
+    if (
+        envs.VLLM_DSV4_CANDIDATE_SELECTION_BACKEND == "triton_radix"
+        and topk_blocks > 0
+        and logits.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        from vllm.model_executor.kernels.attention.dsa.candidate_radix import (
+            select_candidate_blocks_radix,
+        )
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda() and current_platform.has_device_capability(80):
+            select_candidate_blocks_radix(
+                logits, row_ks, row_ke, topk_blocks, block_size, out, row_repeat
+            )
+            return
     nblocks = triton.cdiv(width, block_size)
     scores = logits.new_empty((rows, nblocks))
-    _block_scores_kernel[(rows, triton.cdiv(nblocks, 128))](
+    # Logits are max_model_len wide (CUDA-graph static) but rows are shorter:
+    # the score kernel only loads valid columns and publishes live block
+    # counts. No DeepSelect on sm8x, so the -inf tail is still written and the
+    # torch fallback ignores the counts (the radix backend uses its own).
+    valid_blocks = torch.empty(rows, dtype=torch.int32, device=logits.device)
+    _block_scores_kernel[(rows, 32)](
         logits,
         row_ks,
         row_ke,
         scores,
+        valid_blocks,
         *logits.stride(),
         row_ks.stride(0) if row_ks is not None else 0,
         row_ke.stride(0),
+        scores.stride(0),
         width,
         nblocks,
         block_size,
         row_ks is not None,
         row_repeat,
-        128,
+        TILE=128,
+        FULL_WIDTH=True,
     )
     # Keep the existing top-k tie behavior.
     top = scores.topk(min(topk_blocks, nblocks), dim=-1)
