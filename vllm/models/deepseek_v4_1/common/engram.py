@@ -50,7 +50,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.offloader.base import empty_pinned_exact
 from vllm.model_executor.utils import set_weight_attrs
@@ -1114,13 +1114,17 @@ class Engram(nn.Module):
             ),
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
-        self.wkv = ReplicatedLinear(
+        # Without sequence parallelism every TP rank holds every token, so
+        # shard the output columns instead of replicating the projection.
+        self.wkv = ColumnParallelLinear(
             n_hash_cols * layout.head_dim,
             self.dim * (self.hc_mult + 1),
             bias=False,
+            gather_output=True,
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wkv",
+            disable_tp=use_sequence_parallel,
         )
         self.q_weight = nn.Parameter(
             torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16),
