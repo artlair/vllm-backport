@@ -22,6 +22,10 @@ def make_manager(
     num_reqs, num_steps = confidences.shape
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.num_speculative_steps = num_steps
+    # PP1, i.e. the last-rank-only path these cases pin.
+    manager.pp_world_size = 1
+    manager.pp_rank = 0
+    manager._confidence_cpu = None
     manager._stale_confidences = [SimpleNamespace(np=confidences)]
     manager._stale_idx = 0
     manager.req_states = SimpleNamespace(
@@ -113,6 +117,9 @@ def test_profiled_batches_seed_cost_curves_via_consumer():
     manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)
     manager.num_speculative_steps = 7
     manager.num_bonus_tokens = 1
+    manager.pp_world_size = 1
+    manager.pp_rank = 0
+    manager._confidence_cpu = None
     curves: dict[str, list[tuple[int, float]]] = {}
     manager.set_cost_curves = lambda draft, verify: curves.update(
         draft=draft, verify=verify

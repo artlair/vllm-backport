@@ -624,12 +624,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
-        # The speculator clears the flag at load time when the checkpoint has
-        # no confidence head, so it holds the effective value.
+        # The speculator raises at load time when the checkpoint has no
+        # confidence head, so the flag it holds is the effective value. Only the
+        # last PP rank loads the draft model, so every rank has to agree with it
+        # on whether the confidence payload rides the PP relay.
+        enable_adaptive_verification = getattr(
+            self.speculator, "enable_adaptive_verification", False
+        )
+        if self.use_pp:
+            enable_adaptive_verification = get_pp_group().broadcast_object(
+                enable_adaptive_verification, src=get_pp_group().last_rank
+            )
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
-            enable_adaptive_verification=getattr(
-                self.speculator, "enable_adaptive_verification", False
-            ),
+            enable_adaptive_verification=enable_adaptive_verification,
             attn_groups=self.attn_groups,
             attn_cg_support=attn_cg_support,
             req_states=self.req_states,
@@ -639,7 +646,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vllm_config=self.vllm_config,
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
+            pp_world_size=self.parallel_config.pipeline_parallel_size,
+            pp_rank=get_pp_group().rank_in_group,
         )
+        if self.use_pp and self.pp_handler is not None:
+            self.pp_handler.set_adaptive_confidences(
+                self.adaptive_verification is not None
+            )
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -1062,12 +1075,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_pp_decode_requests(self):
         # For non-last PP ranks, update decode requests with sampler output from
         # the prior step in which they were scheduled (pp_size steps ago).
-        if self.pp_handler is not None:
-            outputs = self.pp_handler.get_prev_sampled_outputs(
-                self.req_states.draft_tokens
-            )
-            if outputs is not None:
-                self.postprocess_sampled(**outputs)
+        if self.pp_handler is None:
+            return
+        outputs = self.pp_handler.get_prev_sampled_outputs(self.req_states.draft_tokens)
+        confidences = None
+        if outputs is not None:
+            confidences = outputs.pop("confidences")
+            self.postprocess_sampled(**outputs)
+        if confidences is None:
+            # The last rank has no deferred queue: its own confidences ride a
+            # self-ring of the same depth so it prices the generation its peers
+            # price instead of the one it just proposed.
+            confidences = self.pp_handler.pop_self_confidences()
+        if confidences is not None:
+            assert self.adaptive_verification is not None
+            # Before this step's budget is priced and before a reused slot can
+            # be reset by add_request.
+            self.adaptive_verification.install_confidences(confidences)
 
     def warmup_pp_decode_update(self) -> None:
         """JIT-compile the kernel behind ``update_pp_decode_requests``.
@@ -2118,9 +2142,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if self.pp_handler is not None:
                     # Earlier stages never run the speculator; ship the
                     # drafts so their next verification step embeds the real
-                    # draft tokens instead of stale buffer contents.
+                    # draft tokens instead of stale buffer contents. The
+                    # confidences that score that block ride the same payload.
+                    confidences = None
+                    if self.adaptive_verification is not None:
+                        assert self.speculator is not None
+                        # Snapshot on the main stream: the speculator reuses
+                        # this buffer next step, before the side-stream send and
+                        # host copy complete.
+                        confidences = self.speculator.draft_token_confidence_probs[
+                            : input_batch.num_reqs
+                        ].clone()
                     self.pp_handler.broadcast_drafts(
-                        self.req_states.draft_tokens, input_batch
+                        self.req_states.draft_tokens, input_batch, confidences
                     )
             if draft_tokens is not None and self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
