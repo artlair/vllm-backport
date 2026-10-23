@@ -11,7 +11,10 @@ import torch
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
-from vllm.v1.worker.gpu.pp_utils import AdaptiveConfidenceRing
+from vllm.v1.worker.gpu.pp_utils import (
+    AdaptiveConfidenceRing,
+    PendingConfidences,
+)
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
@@ -308,18 +311,30 @@ def pp_cost_tables():
     )
 
 
-def make_pp_manager(pp_world_size, stale_confidences, num_spec=PP_NUM_SPEC):
+def make_pp_manager(
+    pp_world_size, stale_confidences, num_spec=PP_NUM_SPEC, device="cpu"
+):
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.num_speculative_steps = num_spec
     manager.num_bonus_tokens = 1
     manager.pp_world_size = pp_world_size
     manager.pp_rank = 0
     manager._confidence_cpu = np.ones((PP_MAX_REQS, num_spec), dtype=np.float32)
-    manager._confidence_probs = torch.ones((PP_MAX_REQS, num_spec), dtype=torch.float32)
-    manager._batch_draft_capacity = torch.zeros(PP_MAX_REQS, dtype=torch.int32)
-    manager._num_non_draft_tokens = torch.zeros(PP_MAX_REQS, dtype=torch.int32)
-    manager._cu_num_logits = torch.zeros(PP_MAX_REQS + 1, dtype=torch.int32)
-    manager.query_start_loc = torch.zeros(PP_MAX_REQS + 1, dtype=torch.int32)
+    manager._confidence_probs = torch.ones(
+        (PP_MAX_REQS, num_spec), dtype=torch.float32, device=device
+    )
+    manager._batch_draft_capacity = torch.zeros(
+        PP_MAX_REQS, dtype=torch.int32, device=device
+    )
+    manager._num_non_draft_tokens = torch.zeros(
+        PP_MAX_REQS, dtype=torch.int32, device=device
+    )
+    manager._cu_num_logits = torch.zeros(
+        PP_MAX_REQS + 1, dtype=torch.int32, device=device
+    )
+    manager.query_start_loc = torch.zeros(
+        PP_MAX_REQS + 1, dtype=torch.int32, device=device
+    )
     # The PP budget must never read these (they are the PP1 ping-pong slots).
     # Poisoning them differently per rank makes any such read visible.
     manager._stale_confidences = [
@@ -336,6 +351,7 @@ def make_pp_manager(pp_world_size, stale_confidences, num_spec=PP_NUM_SPEC):
         max_num_reqs=PP_MAX_REQS,
         max_num_batched_tokens=32,
         num_speculative_steps=num_spec,
+        device=device,
     )
     manager.cost_tables = pp_cost_tables()
     return manager
@@ -637,3 +653,47 @@ def test_pp_record_confidences_leaves_both_tables_to_the_install():
 
     assert (manager._confidence_probs == 0.25).all()
     assert (manager._confidence_cpu == 1.0).all()
+
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="checks the device-side scatter"
+)
+
+
+def test_pp_budget_table_differs_from_the_pingpong_slots():
+    """The PP budget reads the installed host table, not the PP1 ping-pong
+    slots; the two disagree in this test, so a regression is visible."""
+    relay = PPRelay(2)
+    idx_mapping_np = np.arange(3, dtype=np.intp)
+    for _ in range(2):
+        relay.consume()
+        relay.propose(
+            torch.full((3, PP_NUM_SPEC), 0.1, dtype=torch.float32), idx_mapping_np
+        )
+    relay.consume()
+
+    for manager in relay.managers:
+        assert manager._stale_confidences[0].np[0, 0] != pytest.approx(0.1)
+        assert manager._confidence_cpu[0, 0] == pytest.approx(0.1)
+    # The trim the poisoned slot would not produce.
+    plan = assert_same_plan(relay, *decode_batch())
+    assert plan.draft_budget < 6
+
+
+@requires_cuda
+def test_pp_install_scatters_into_the_ranking_table_on_device():
+    """The budget reads the host table and the ranking kernel reads the device
+    table; both must come from the same payload rows."""
+    manager = make_pp_manager(2, stale_confidences=1.0, device="cuda")
+    payload = PendingConfidences(
+        confidences=torch.tensor([[0.3, 0.3], [0.6, 0.6]], device="cuda"),
+        confidences_np=np.array([[0.3, 0.3], [0.6, 0.6]], dtype=np.float32),
+        idx_mapping_np=np.array([3, 1], dtype=np.intp),
+    )
+
+    manager.install_confidences(payload)
+
+    for table in (manager._confidence_cpu, manager._confidence_probs):
+        assert np.allclose(table[3].tolist(), [0.3, 0.3])
+        assert np.allclose(table[1].tolist(), [0.6, 0.6])
+        assert np.allclose(table[0].tolist(), [1.0, 1.0])

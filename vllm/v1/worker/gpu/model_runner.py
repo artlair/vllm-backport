@@ -186,6 +186,18 @@ logger = init_logger(__name__)
 _PP_ADAPTIVE_PLAN_KEY = "adaptive_verification_plan"
 
 
+def broadcast_pp_adaptive_verification_flag(enabled: bool) -> bool:
+    """Agree on the effective adaptive-verification flag across PP stages.
+
+    Only the last stage loads the draft model, so only it can confirm that the
+    checkpoint ships a confidence head. `broadcast_object` expects a local group
+    rank, and the last local rank is `world_size - 1` even when the PP group's
+    global ranks are not contiguous (e.g. [2, 6, 10, 14, 18, 22]).
+    """
+    pp_group = get_pp_group()
+    return pp_group.broadcast_object(enabled, src=pp_group.world_size - 1)
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -633,13 +645,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # The speculator raises at load time when the checkpoint has no
         # confidence head, so the flag it holds is the effective value. Only the
         # last PP rank loads the draft model, so every rank has to agree with it
-        # on whether the confidence payload rides the PP relay.
+        # on whether the confidence payload rides the PP relay. Gated on the
+        # config flag so a default-off PP startup adds no collective.
         enable_adaptive_verification = getattr(
             self.speculator, "enable_adaptive_verification", False
         )
-        if self.use_pp:
-            enable_adaptive_verification = get_pp_group().broadcast_object(
-                enable_adaptive_verification, src=get_pp_group().last_rank
+        if (
+            self.use_pp
+            and self.speculative_config is not None
+            and self.speculative_config.enable_adaptive_verification
+        ):
+            enable_adaptive_verification = broadcast_pp_adaptive_verification_flag(
+                enable_adaptive_verification
             )
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
             enable_adaptive_verification=enable_adaptive_verification,
@@ -1108,8 +1125,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         Ranks that disagree would pad the same step into different graph buckets
         and read padding rows as real tokens, silently, so this fails closed.
         """
-        if not self._pp_adaptive_debug or received is None:
+        if not self._pp_adaptive_debug:
             return
+        if received is None:
+            raise RuntimeError(
+                "VLLM_PP_ADAPTIVE_DEBUG is set but the previous PP stage sent no "
+                "adaptive verification plan for this step"
+            )
         local = self._pp_adaptive_plan(input_batch)
         with gpu_sync_allowed():
             mismatch = not torch.equal(received, local)

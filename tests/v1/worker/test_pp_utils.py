@@ -637,6 +637,37 @@ def test_pp_adaptive_plan_debug_compare_covers_per_request_boundaries():
     with pytest.raises(RuntimeError):
         runner._check_pp_adaptive_plan(plan, batch([0, 2, 5], [0, 2, 3], [1, 0]))
 
+    # A stage that forgot to send the plan must not pass silently.
+    with pytest.raises(RuntimeError):
+        runner._check_pp_adaptive_plan(None, batch_state)
+
     # The flag is required; without it the payload is neither sent nor checked.
     runner._pp_adaptive_debug = False
     runner._check_pp_adaptive_plan(plan, batch([0, 2, 5], [0, 2, 3], [1, 0]))
+    runner._check_pp_adaptive_plan(None, batch_state)
+
+
+def test_pp_adaptive_flag_broadcast_uses_the_last_local_rank(monkeypatch):
+    """`GroupCoordinator.broadcast_object` takes a local group rank, while
+    `PPHandler` needs the global last rank for its NCCL broadcast. On a
+    non-contiguous PP group (TP4 x PP6) the two differ, and passing the global
+    rank here trips the coordinator's `src < world_size` assert."""
+
+    class FakePPGroup:
+        world_size = 6
+        ranks = [2, 6, 10, 14, 18, 22]
+        last_rank = 22
+
+        def broadcast_object(self, obj, src):
+            assert 0 <= src < self.world_size, f"invalid local src rank ({src})"
+            self.src_global_rank = self.ranks[src]
+            # Only the last stage knows the effective value.
+            return obj if src != self.world_size - 1 else False
+
+    pp_group = FakePPGroup()
+    monkeypatch.setattr(model_runner, "get_pp_group", lambda: pp_group)
+
+    # A non-last stage sees the last stage's answer.
+    assert model_runner.broadcast_pp_adaptive_verification_flag(True) is False
+    assert pp_group.src_global_rank == 22
+    assert model_runner.broadcast_pp_adaptive_verification_flag(False) is False

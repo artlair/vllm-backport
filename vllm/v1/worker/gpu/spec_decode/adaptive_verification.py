@@ -202,13 +202,28 @@ class AdaptiveVerificationManager:
         assert payload.idx_mapping_np.shape == (payload.confidences.shape[0],)
         if payload.confidences.shape[0] == 0:
             return
-        # Fail closed on a payload that cannot be a survival probability: a NaN
-        # would collapse the budget to zero on every step.
+        # Fail closed on rows that cannot be survival probabilities: a NaN or an
+        # out-of-range value would silently collapse the budget.
         assert np.isfinite(payload.confidences_np).all(), (
             "adaptive verification received non-finite draft confidences"
         )
-        self._confidence_probs[payload.idx_mapping_np] = payload.confidences
-        self._confidence_cpu[payload.idx_mapping_np] = payload.confidences_np
+        assert (payload.confidences_np >= 0.0).all(), (
+            "adaptive verification received negative draft confidences"
+        )
+        assert (payload.confidences_np <= 1.0).all(), (
+            "adaptive verification received draft confidences above one"
+        )
+        idx_mapping_np = payload.idx_mapping_np
+        if self._confidence_probs.is_cuda:
+            # A NumPy index would stage an unpinned H2D copy, which the GPU sync
+            # checker flags in the middle of the step.
+            idx_mapping = async_copy_to_gpu(
+                idx_mapping_np, device=self.req_states.device
+            )
+        else:
+            idx_mapping = idx_mapping_np
+        self._confidence_probs[idx_mapping] = payload.confidences
+        self._confidence_cpu[idx_mapping_np] = payload.confidences_np
 
     def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
