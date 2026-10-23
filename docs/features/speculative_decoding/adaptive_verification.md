@@ -14,6 +14,8 @@ The practical effect is that one configuration holds up across the whole load ra
 
 Adaptive verification needs per-position acceptance estimates, so today it is only supported for DSpark with a **confidence head**.
 
+An experimental pipeline-parallel route exists for the DeepSeek-V4.1 DSpark lane. It carries each proposal's confidence block with the existing draft-token payload, generation-aligned, so every rank prices the same block and recomputes the budget locally. The budget and per-request plan are never broadcast. Startup verify costs are summed over all pipeline stages (the draft cost comes from the last stage), which prices verification conservatively. This route is limited to CUDA compute capability 8.x, DSpark with greedy drafting and standard rejection sampling, async scheduling, DP/DCP/PCP size 1, no expert parallelism, microbatching or LoRA, and full cudagraphs. Only the sm86 TP4 x PP6 lane has been exercised; its benefit is unproven until measured, and the standard non-adaptive lane is unchanged.
+
 ## Usage
 
 It is off by default. Enable it in the speculative config:
@@ -36,7 +38,9 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.
 - Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.
-- Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries) or pipeline parallelism (cost curves and confidences exist only on the last rank).
+- Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries).
+- Pipeline parallelism only supports the experimental route described above; every other PP configuration is rejected at startup.
+- Trimming is value-dependent, because the cut depends on the confidence values. For stochastic drafting that needs a non-anticipation proof that the inclusion decision does not depend on the draft token being verified; prefix contiguity alone does not provide it. The PP route therefore requires greedy drafting, and probabilistic drafting remains out of scope.
 
 ## Tuning the cost profile
 
