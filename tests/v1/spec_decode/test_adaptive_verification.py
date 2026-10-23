@@ -615,3 +615,25 @@ def test_pp_confidence_table_is_request_keyed_not_row_keyed():
         assert np.allclose(table[2], 0.2)
         assert np.allclose(table[0], 0.8)
         assert np.allclose(table[1], 1.0)
+
+
+def test_pp_record_confidences_leaves_both_tables_to_the_install():
+    """The relay payload is the only PP writer of the device and host tables.
+
+    Publishing this step's freshly proposed block here would put the last rank a
+    generation ahead of its peers on any step that proposes but ships no payload.
+    """
+    relay = PPRelay(2)
+    manager = relay.managers[1]
+    manager._confidence_probs.fill_(0.25)
+
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping=torch.tensor([0, 1], dtype=torch.int64),
+    )
+    manager.record_confidences(
+        torch.full((PP_MAX_REQS, PP_NUM_SPEC), 0.9, dtype=torch.float32), input_batch
+    )
+
+    assert (manager._confidence_probs == 0.25).all()
+    assert (manager._confidence_cpu == 1.0).all()

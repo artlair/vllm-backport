@@ -286,11 +286,12 @@ class AdaptiveVerificationManager:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
         num_reqs = input_batch.num_reqs
-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
         if self._confidence_cpu is not None:
-            # Under PP the host table is written only by the generation-aligned
-            # install: the draft relay carries this step's block to every rank,
-            # this one included, and pays for one D2H instead of two.
+            # Under PP the relay payload is the only writer of both tables: this
+            # step's block reaches every rank, this one included, when the step
+            # that verifies it runs. Publishing it here would leave this rank a
+            # generation ahead of its peers on any step that proposes without
+            # shipping a payload.
             return
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():
@@ -302,6 +303,7 @@ class AdaptiveVerificationManager:
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
 
+        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
 
