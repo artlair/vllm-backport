@@ -2,19 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The adaptive PP relay over a real gloo transport.
 
-Two spawned ranks run the production ``PPHandler`` send/receive path, the
+Spawned ranks run the production ``PPHandler`` send/receive path, the
 production confidence ring, and the production confidence install and draft
 budget. The payload crosses a real gloo broadcast, so a sender and receiver
 that disagree about the four-op FIFO, the skip gate or the generation a block
 belongs to hang or fail instead of agreeing with themselves in one process.
+The consume side calls the real ``GPUModelRunner.update_pp_decode_requests``
+on a stub runner whose only non-production part is the CUDA postprocess kernel.
 
-CPU only: the CUDA stream/event/record_stream calls are stubbed inside the
-child processes. This proves the host-side protocol and generation alignment,
-not NCCL stream safety or device-side masking.
+The happy path runs at two world sizes, including a mixed batch with sampled
+decode rows and a non-final prefill row. CPU only: the CUDA
+stream/event/record_stream calls are stubbed inside the child processes. This
+proves the host-side protocol, per-row masking and generation alignment, not
+NCCL stream safety or device-side masking.
 """
 
 import multiprocessing as mp
 import sys
+import time
 import traceback
 from collections import deque
 from dataclasses import dataclass
@@ -24,48 +29,57 @@ import pytest
 
 from vllm.utils.network_utils import get_file_store_init_method
 
-_PP_SIZE = 2
+_PP_SIZES = (2, 6)
+_MUTATION_PP_SIZE = 2
 _NUM_SPEC = 2
 _MAX_REQS = 4
 _REQ_IDS = tuple(f"r{slot}" for slot in range(_MAX_REQS))
 _JOIN_TIMEOUT_S = 120
+_REPORT_TIMEOUT_S = 5
 _FAIL = "adaptive pp relay"
 
 
 @dataclass(frozen=True)
 class _Step:
-    """One scheduler step: which request slots it runs and how many drafts it
-    schedules for each. A prefill step produces no sample and therefore posts
-    no relay payload. `free` slots are released after the step's consume."""
+    """One scheduler step: the request slots it runs and the draft capacity of
+    each decode row. Slots named in `nonfinal_prefill` are non-final prefill
+    chunks: they produce no sample and schedule no drafts. `free` slots are
+    released after the step's consume."""
 
     slots: tuple[int, ...]
     capacities: tuple[int, ...] = ()
-    prefill: bool = False
+    nonfinal_prefill: tuple[int, ...] = ()
     free: tuple[int, ...] = ()
+
+    def need_sampled(self) -> tuple[bool, ...]:
+        return tuple(slot not in self.nonfinal_prefill for slot in self.slots)
 
 
 _SCRIPT = (
     _Step((0, 1, 2), (2, 2, 2)),
     # Reordered batch and a request whose draft capacity shrank.
     _Step((2, 0, 1), (1, 2, 2)),
-    # No sample this step; slot 0 is freed and reused at the same point.
-    _Step((0, 1, 2), prefill=True, free=(0,)),
+    # Mixed step: slot 1 is a non-final prefill row and schedules no drafts.
+    # Verification rows stay at the front, as production sorts them.
+    _Step((0, 2, 1), (2, 2, 0), nonfinal_prefill=(1,)),
+    # All-prefill step; slot 0 is freed and reused at the same point.
+    _Step((0, 1, 2), nonfinal_prefill=(0, 1, 2), free=(0,)),
+    # Slot 1's first decode row after its prefill chunk.
     _Step((1, 2, 0), (2, 2, 2)),
     _Step((0, 2), (2, 1), free=(1,)),
     _Step((2, 1, 0), (1, 1, 1)),
     _Step((0, 1, 2), (2, 2, 2)),
-    # Drain the last two in-flight generations.
-    _Step(()),
-    _Step(()),
-)
+) + (_Step(()),) * 6
 
-_MUTATIONS = ("drop_confidences", "no_generation_filter")
+_MUTATIONS = ("drop_confidences", "no_generation_filter", "asymmetric_mask_filter")
 
 
 @dataclass(frozen=True)
 class _Proposal:
+    step_index: int
     slots: tuple[int, ...]
     gens: tuple[int, ...]
+    need_sampled: tuple[bool, ...]
     confidences: "object"
     drafts: "object"
     sampled: "object"
@@ -136,7 +150,7 @@ def _cpu_copy(x, out=None, device=None):
     return out.copy_(x)
 
 
-def _make_manager(rank: int):
+def _make_manager(rank: int, pp_size: int):
     import numpy as np
     import torch
 
@@ -148,7 +162,7 @@ def _make_manager(rank: int):
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.num_speculative_steps = _NUM_SPEC
     manager.num_bonus_tokens = 1
-    manager.pp_world_size = _PP_SIZE
+    manager.pp_world_size = pp_size
     manager.pp_rank = rank
     manager._confidence_cpu = np.ones((_MAX_REQS, _NUM_SPEC), dtype=np.float32)
     manager._confidence_probs = torch.ones((_MAX_REQS, _NUM_SPEC), dtype=torch.float32)
@@ -177,14 +191,14 @@ def _make_manager(rank: int):
     return manager
 
 
-def _make_handler(rank: int, pp_utils):
+def _make_handler(rank: int, pp_utils, pp_size: int):
     import torch
     import torch.distributed as dist
 
     pp_group = SimpleNamespace(
-        is_last_rank=rank == _PP_SIZE - 1,
-        last_rank=_PP_SIZE - 1,
-        world_size=_PP_SIZE,
+        is_last_rank=rank == pp_size - 1,
+        last_rank=pp_size - 1,
+        world_size=pp_size,
         make_sibling_device_group=lambda group_desc: dist.group.WORLD,
     )
     pp_utils.get_pp_group = lambda: pp_group
@@ -198,39 +212,41 @@ def _make_batch(step: _Step):
     import torch
 
     num_reqs = len(step.slots)
-    if step.prefill:
-        computed = np.zeros(num_reqs, dtype=np.int32)
-        prefill_len = np.full(num_reqs, 4096, dtype=np.int32)
-        scheduled = np.full(num_reqs, 4, dtype=np.int32)
-    else:
-        computed = np.full(num_reqs, 100, dtype=np.int32)
-        prefill_len = np.full(num_reqs, 100, dtype=np.int32)
-        scheduled = np.array(step.capacities, dtype=np.int32) + 1
+    nonfinal = np.array(
+        [slot in step.nonfinal_prefill for slot in step.slots], dtype=bool
+    )
+    capacities = np.array(step.capacities or (0,) * num_reqs, dtype=np.int32)
     return SimpleNamespace(
         num_reqs=num_reqs,
-        num_computed_tokens_np=computed,
-        prefill_len_np=prefill_len,
-        num_scheduled_tokens=scheduled,
+        num_computed_tokens_np=np.where(nonfinal, 0, 100).astype(np.int32),
+        prefill_len_np=np.where(nonfinal, 4096, 100).astype(np.int32),
+        num_scheduled_tokens=np.where(nonfinal, 4, capacities + 1).astype(np.int32),
         idx_mapping=torch.tensor(step.slots, dtype=torch.int64),
         idx_mapping_np=np.array(step.slots, dtype=np.intp),
     )
 
 
 def _confidence_block(slots: tuple[int, ...], step: int):
-    """Per-slot survival probabilities, all strictly inside [0, 1]."""
+    """Per-slot survival probabilities, all inside [0, 1]."""
     import numpy as np
 
     rows = []
     for slot in slots:
         base = 0.9 - 0.1 * slot - 0.01 * (step % 3)
         rows.append([base - 0.08 * position for position in range(_NUM_SPEC)])
-    return np.array(rows, dtype=np.float32)
+    block = np.array(rows, dtype=np.float32)
+    _check(
+        bool(((block >= 0.0) & (block <= 1.0)).all()),
+        "confidence block left [0, 1]",
+    )
+    return block
 
 
-def _proposal(step_index: int, slot_ids: tuple[int, ...], test_gen):
+def _proposal(step_index: int, step: _Step, test_gen):
     import numpy as np
     import torch
 
+    slot_ids = step.slots
     width = 1 + step_index % (_NUM_SPEC + 1)
     sampled = np.array(
         [
@@ -250,8 +266,10 @@ def _proposal(step_index: int, slot_ids: tuple[int, ...], test_gen):
         dtype=np.int64,
     )
     return _Proposal(
+        step_index=step_index,
         slots=slot_ids,
         gens=tuple(int(test_gen[slot]) for slot in slot_ids),
+        need_sampled=step.need_sampled(),
         confidences=_confidence_block(slot_ids, step_index),
         drafts=drafts,
         sampled=sampled,
@@ -260,53 +278,82 @@ def _proposal(step_index: int, slot_ids: tuple[int, ...], test_gen):
     )
 
 
-def _consume(handler, manager, pending, test_gen, local_draft_table):
+def _consume(
+    runner,
+    GPUModelRunner,
+    manager,
+    pending,
+    test_gen,
+    local_draft_table,
+    order,
+):
     import numpy as np
     import torch
 
-    outputs = handler.get_prev_sampled_outputs(local_draft_table)
-    confidences = outputs.pop("confidences") if outputs is not None else None
-    if confidences is None:
-        confidences = handler.pop_self_confidences()
-
     proposal = pending.popleft()
     pending.append(None)
+    order.events.clear()
+    order.budget_started = False
+    order.installed.clear()
+    postprocess_calls: list[dict] = []
+
+    def postprocess_sampled(**kwargs):
+        _check("confidences" not in kwargs, "postprocess received confidences")
+        postprocess_calls.append(kwargs)
+
+    runner.postprocess_sampled = postprocess_sampled
+    before_confidences = manager._confidence_cpu.copy()
+    before_drafts = local_draft_table.clone()
+    GPUModelRunner.update_pp_decode_requests(runner)
+
     if proposal is None:
-        _check(outputs is None, "postprocess payload without a proposal")
-        _check(confidences is None, "confidence payload without a proposal")
-        return
+        _check(not postprocess_calls, "postprocess ran without an in-flight proposal")
+        _check(
+            not order.installed,
+            "confidence installed without an in-flight proposal",
+        )
+        return None
 
     live = np.array(
         [test_gen[slot] == gen for slot, gen in zip(proposal.slots, proposal.gens)],
         dtype=bool,
     )
-    expected_slots = np.array(proposal.slots, dtype=np.intp)[live]
+    keep = live & np.array(proposal.need_sampled, dtype=bool)
+    expected_slots = np.array(proposal.slots, dtype=np.intp)[keep]
     if expected_slots.size == 0:
-        _check(outputs is None, "a fully freed block still produced a sample payload")
-        _check(confidences is None, "a fully freed block still produced a payload")
-        return
+        _check(not postprocess_calls, "a fully dropped block still ran postprocess")
+        _check(not order.installed, "a fully dropped block still installed confidences")
+        return proposal, keep
 
-    _check(confidences is not None, "missing generation-aligned confidence payload")
+    _check(len(order.installed) == 1, "missing generation-aligned confidence payload")
+    confidences = order.installed[0]
     _check(
         confidences.idx_mapping_np.tolist() == expected_slots.tolist(),
-        "payload rows do not match the still-live proposal slots",
+        "payload rows do not match the live sampled proposal slots",
     )
-    np.testing.assert_allclose(confidences.confidences_np, proposal.confidences[live])
-    manager.install_confidences(confidences)
-
+    np.testing.assert_allclose(confidences.confidences_np, proposal.confidences[keep])
     for row, slot in enumerate(proposal.slots):
-        if live[row]:
+        if keep[row]:
             np.testing.assert_allclose(
                 manager._confidence_cpu[slot], proposal.confidences[row]
             )
         else:
             _check(
-                np.allclose(manager._confidence_cpu[slot], 1.0),
-                "a freed slot inherited an in-flight confidence block",
+                np.allclose(manager._confidence_cpu[slot], before_confidences[slot]),
+                "a masked or freed row overwrote its confidence block",
             )
 
-    if outputs is None:
-        return
+    if not postprocess_calls:
+        # The last rank has no deferred sample queue; its self-ring carries only
+        # confidences, so there is no sample payload to postprocess here.
+        return proposal, keep
+    _check(len(postprocess_calls) == 1, "postprocess ran more than once for a payload")
+    outputs = postprocess_calls[0]
+    expected_idx = np.where(keep, np.array(proposal.slots), -1)
+    _check(
+        outputs["idx_mapping"].numpy().tolist() == expected_idx.tolist(),
+        "postprocess rows do not match the per-row sample mask",
+    )
     width = proposal.sampled.shape[1]
     np.testing.assert_array_equal(
         outputs["sampled_tokens"][:, :width].numpy(), proposal.sampled
@@ -324,24 +371,24 @@ def _consume(handler, manager, pending, test_gen, local_draft_table):
         "num_rejected did not survive the relay",
     )
     for row, slot in enumerate(proposal.slots):
-        if live[row]:
+        if keep[row]:
             np.testing.assert_array_equal(
                 local_draft_table[slot].numpy(), proposal.drafts[row]
             )
         else:
             _check(
-                torch.equal(
-                    local_draft_table[slot],
-                    torch.full_like(local_draft_table[slot], -1),
-                ),
-                "a freed slot inherited an in-flight draft block",
+                torch.equal(local_draft_table[slot], before_drafts[slot]),
+                "a masked or freed slot inherited an in-flight draft block",
             )
+    return proposal, keep
 
 
-def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
+def _drive(pp_utils, adaptive_module, rank: int, pp_size: int, case: str) -> None:
     import numpy as np
     import torch
     import torch.distributed as dist
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     if case == "drop_confidences":
         original_push = pp_utils.AdaptiveConfidenceRing.push
@@ -353,6 +400,24 @@ def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
         pp_utils.AdaptiveConfidenceRing.push = drop_push
     elif case == "no_generation_filter":
         pp_utils.PPHandler.on_req_idx_freed = lambda self, req_idx: None
+    elif case == "asymmetric_mask_filter":
+        original_collect = pp_utils.ConfidenceSlot.collect
+
+        def collect_without_row_mask(slot, req_idx_gen_np):
+            # Break the mask asymmetrically across ranks only on mixed steps:
+            # the receiver keeps every row, the last rank drops every row.
+            mask = slot.need_sampled_mask
+            if not (mask.any() and not mask.all()):
+                return original_collect(slot, req_idx_gen_np)
+            slot.need_sampled_mask = (
+                np.ones_like(mask) if rank != pp_size - 1 else np.zeros_like(mask)
+            )
+            try:
+                return original_collect(slot, req_idx_gen_np)
+            finally:
+                slot.need_sampled_mask = mask
+
+        pp_utils.ConfidenceSlot.collect = collect_without_row_mask
 
     # The eager ranking kernel is the body the compiled wrapper runs, without a
     # CPU torch.compile inside the protocol test.
@@ -360,14 +425,73 @@ def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
         adaptive_module._assign_draft_token_budget
     )
 
-    handler = _make_handler(rank, pp_utils)
-    manager = _make_manager(rank)
-    is_last_rank = rank == _PP_SIZE - 1
+    handler = _make_handler(rank, pp_utils, pp_size)
+    manager = _make_manager(rank, pp_size)
+    is_last_rank = rank == pp_size - 1
     local_draft_table = torch.full((_MAX_REQS, _NUM_SPEC), -1, dtype=torch.int64)
     test_gen = np.zeros(_MAX_REQS, dtype=np.int32)
-    pending = deque([None] * _PP_SIZE)
+    pending = deque([None] * pp_size)
     broadcast_calls: list = []
     real_broadcast = torch.distributed.broadcast
+
+    # Install must run before this step prices its budget.
+    order = SimpleNamespace(events=[], budget_started=False, installed=[])
+    real_install = manager.install_confidences
+
+    def install_confidences(payload):
+        _check(not order.budget_started, "confidence installed after budget pricing")
+        order.events.append("install")
+        order.installed.append(payload)
+        real_install(payload)
+
+    manager.install_confidences = install_confidences
+    for name in ("get_num_tokens", "compact_batch", "reallocate_drafts"):
+        real_budget_step = getattr(manager, name)
+
+        def budget_step(*args, _real=real_budget_step, **kwargs):
+            order.budget_started = True
+            return _real(*args, **kwargs)
+
+        setattr(manager, name, budget_step)
+
+    # The self-ring is only a fallback for a step whose deferred payload did not
+    # carry confidences (always true on the last rank, which has no queue).
+    relay = SimpleNamespace(
+        self_ring_calls=0,
+        deferred_confidences=False,
+        deferred_steps=0,
+        steps=0,
+    )
+    real_get = handler.get_prev_sampled_outputs
+
+    def get_prev_sampled_outputs(draft_tokens):
+        relay.steps += 1
+        outputs = real_get(draft_tokens)
+        relay.deferred_confidences = (
+            outputs is not None and outputs.get("confidences") is not None
+        )
+        if relay.deferred_confidences:
+            relay.deferred_steps += 1
+        return outputs
+
+    handler.get_prev_sampled_outputs = get_prev_sampled_outputs
+    real_pop_self = handler.pop_self_confidences
+
+    def pop_self_confidences():
+        relay.self_ring_calls += 1
+        _check(
+            not relay.deferred_confidences,
+            "self-ring used while the deferred payload carried confidences",
+        )
+        return real_pop_self()
+
+    handler.pop_self_confidences = pop_self_confidences
+
+    runner = SimpleNamespace(
+        pp_handler=handler,
+        adaptive_verification=manager,
+        req_states=SimpleNamespace(draft_tokens=local_draft_table),
+    )
 
     def counted_broadcast(tensor, src, group, **kwargs):
         broadcast_calls.append((tuple(tensor.shape), tensor.dtype))
@@ -375,9 +499,33 @@ def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
 
     torch.distributed.broadcast = counted_broadcast
 
+    used_slots = {slot for step in _SCRIPT for slot in step.slots}
+    kept_steps = {slot: set() for slot in used_slots}
+    masked_slots: set[int] = set()
+    mixed_consumed = False
+    transition_consumed = False
+
     for step_index, step in enumerate(_SCRIPT):
         batch = _make_batch(step)
-        _consume(handler, manager, pending, test_gen, local_draft_table)
+        consumed = _consume(
+            runner,
+            GPUModelRunner,
+            manager,
+            pending,
+            test_gen,
+            local_draft_table,
+            order,
+        )
+        if consumed is not None:
+            proposal, keep = consumed
+            for row, slot in enumerate(proposal.slots):
+                if not proposal.need_sampled[row]:
+                    mixed_consumed = True
+                    masked_slots.add(slot)
+                elif keep[row] and slot in masked_slots:
+                    transition_consumed = True
+                if keep[row]:
+                    kept_steps[slot].add(proposal.step_index)
 
         # Production frees and re-adds before this step's batch is planned, but
         # after the deferred payload was installed.
@@ -387,7 +535,7 @@ def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
             manager.add_request(slot)
             local_draft_table[slot].fill_(-1)
 
-        if step.prefill or not step.slots:
+        if not any(step.need_sampled()):
             if step.slots:
                 before = len(broadcast_calls)
                 if is_last_rank:
@@ -408,23 +556,31 @@ def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
             continue
 
         # The step's plan is priced from the block this generation verifies.
+        manager.req_states.num_computed_tokens_np[batch.idx_mapping_np] = (
+            batch.num_computed_tokens_np
+        )
+        manager.req_states.prefill_len.np[batch.idx_mapping_np] = batch.prefill_len_np
         req_ids = [_REQ_IDS[slot] for slot in step.slots]
         idx_mapping = torch.tensor(step.slots, dtype=torch.int64)
+        nonfinal = np.array(
+            [slot in step.nonfinal_prefill for slot in step.slots], dtype=bool
+        )
         capacity_np = np.array(step.capacities, dtype=np.int32)
+        draft_capacity_np = np.where(nonfinal, 0, capacity_np).astype(np.int32)
+        scheduled_np = np.where(nonfinal, 4, capacity_np + 1).astype(np.int32)
         num_tokens_per_req = {
-            req_id: int(capacity) + 1
-            for req_id, capacity in zip(req_ids, step.capacities)
+            req_id: int(scheduled) for req_id, scheduled in zip(req_ids, scheduled_np)
         }
         draft_tokens = {
             req_id: list(range(int(capacity)))
-            for req_id, capacity in zip(req_ids, step.capacities)
+            for req_id, capacity in zip(req_ids, draft_capacity_np)
         }
         cu_num_logits_np = np.zeros(len(req_ids) + 1, dtype=np.int32)
-        np.cumsum(capacity_np + 1, out=cu_num_logits_np[1:])
+        np.cumsum(scheduled_np, out=cu_num_logits_np[1:])
         num_tokens = manager.get_num_tokens(num_tokens_per_req, draft_tokens)
         compacted, cu_num_logits_cpu = manager.compact_batch(
-            capacity_np,
-            np.array([capacity + 1 for capacity in step.capacities], dtype=np.int32),
+            draft_capacity_np,
+            scheduled_np,
             cu_num_logits_np,
         )
         cu_num_logits, query_start_loc, draft_budget = manager.reallocate_drafts(
@@ -440,19 +596,22 @@ def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
             tuple(int(value) for value in cu_num_logits.tolist()),
             tuple(int(value) for value in query_start_loc.tolist()),
         )
-        gathered: list = [None] * _PP_SIZE
+        gathered: list = [None] * pp_size
         dist.all_gather_object(gathered, plan)
-        _check(gathered[0] == gathered[1], "the two ranks priced different plans")
+        _check(
+            all(other == plan for other in gathered),
+            "the ranks priced different plans",
+        )
         _check(plan[3] == sum(plan[4]), "admitted capacity does not match the budget")
         _check(
             all(
                 admitted_count <= capacity
-                for admitted_count, capacity in zip(plan[4], step.capacities)
+                for admitted_count, capacity in zip(plan[4], draft_capacity_np)
             ),
             "the budget admitted more drafts than the scheduler scheduled",
         )
 
-        proposal = _proposal(step_index, step.slots, test_gen)
+        proposal = _proposal(step_index, step, test_gen)
         before = len(broadcast_calls)
         if is_last_rank:
             sampled = torch.from_numpy(proposal.sampled)
@@ -464,7 +623,10 @@ def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
                 local_draft_table, batch, torch.from_numpy(proposal.confidences)
             )
         else:
-            _check(handler.receive(batch), "receive dropped a row that needed a sample")
+            _check(
+                handler.receive(batch) == all(proposal.need_sampled),
+                "receive return does not match the per-row sample mask",
+            )
         _check(
             len(broadcast_calls) - before == 4,
             "the adaptive relay did not post four broadcasts",
@@ -472,18 +634,35 @@ def _drive(pp_utils, adaptive_module, rank: int, case: str) -> None:
         pending[-1] = proposal
 
     _check(all(proposal is None for proposal in pending), "unconsumed relay payload")
+    _check(mixed_consumed, "no mixed batch exposed a per-row sample mask")
+    _check(transition_consumed, "a masked prefill row never decoded later")
+    _check(
+        all(kept_steps[slot] for slot in used_slots),
+        "a request never consumed a generation",
+    )
+    _check(
+        all(len(kept_steps[slot]) >= 2 for slot in used_slots),
+        "fewer than two request generations were consumed",
+    )
+    _check(
+        relay.self_ring_calls == relay.steps - relay.deferred_steps,
+        "self-ring fallback did not match the missing confidence payloads",
+    )
     torch.distributed.broadcast = real_broadcast
 
 
-def _run_rank(rank: int, case: str, init_method: str, report_conn) -> None:
+def _run_rank(
+    rank: int, pp_size: int, case: str, init_method: str, report_conn
+) -> None:
     import torch.distributed as dist
 
+    expect_failure = case in _MUTATIONS
     try:
         dist.init_process_group(
             backend="gloo",
             init_method=init_method,
             rank=rank,
-            world_size=_PP_SIZE,
+            world_size=pp_size,
         )
         _install_cpu_shims()
         from vllm.v1.worker.gpu import pp_utils
@@ -493,14 +672,12 @@ def _run_rank(rank: int, case: str, init_method: str, report_conn) -> None:
         adaptive_verification.async_copy_to_gpu = _cpu_copy
 
         try:
-            _drive(pp_utils, adaptive_verification, rank, case)
+            _drive(pp_utils, adaptive_verification, rank, pp_size, case)
         except AssertionError as exc:
-            if case not in _MUTATIONS:
-                raise
-            if _FAIL not in str(exc):
+            if not expect_failure or _FAIL not in str(exc):
                 raise
         else:
-            if case in _MUTATIONS:
+            if expect_failure:
                 raise AssertionError(f"{_FAIL}: mutation {case} survived")
     except BaseException:
         report = traceback.format_exc()
@@ -514,38 +691,56 @@ def _run_rank(rank: int, case: str, init_method: str, report_conn) -> None:
             dist.destroy_process_group()
 
 
-def _run_ranks(case: str) -> None:
+def _run_ranks(pp_size: int, case: str) -> None:
     init_method = get_file_store_init_method()
     context = mp.get_context("spawn")
-    pipes = [context.Pipe(duplex=False) for _ in range(_PP_SIZE)]
+    pipes = [context.Pipe(duplex=False) for _ in range(pp_size)]
     processes = [
         context.Process(
             target=_run_rank,
-            args=(rank, case, init_method, pipes[rank][1]),
+            args=(rank, pp_size, case, init_method, pipes[rank][1]),
         )
-        for rank in range(_PP_SIZE)
+        for rank in range(pp_size)
     ]
     for process in processes:
         process.start()
     for _, send_conn in pipes:
         send_conn.close()
+    deadline = time.monotonic() + _JOIN_TIMEOUT_S
     for process in processes:
-        process.join(timeout=_JOIN_TIMEOUT_S)
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
     stuck = [process for process in processes if process.is_alive()]
     for process in stuck:
         process.kill()
-        process.join()
+    for process in stuck:
+        process.join(timeout=_REPORT_TIMEOUT_S)
     reports = []
     for recv_conn, _ in pipes:
-        reports.append(recv_conn.recv() if recv_conn.poll(5) else "")
+        report = ""
+        if recv_conn.poll(_REPORT_TIMEOUT_S):
+            try:
+                report = recv_conn.recv()
+            except (EOFError, OSError):
+                # The child died before it could report; its exit code below is
+                # the only diagnosis we get.
+                report = ""
+        reports.append(report)
         recv_conn.close()
-    failed = [report for report in reports if report]
-    assert not stuck, f"gloo rank did not finish within {_JOIN_TIMEOUT_S}s"
-    assert all(process.exitcode == 0 for process in processes), (
-        "gloo rank failed:\n" + "\n".join(failed)
-    )
+    failures = []
+    if stuck:
+        failures.append(f"ranks did not finish within {_JOIN_TIMEOUT_S}s")
+    for rank, (process, report) in enumerate(zip(processes, reports)):
+        if report:
+            failures.append(f"rank {rank} report:\n{report}")
+        if process.exitcode != 0:
+            failures.append(f"rank {rank} exited with {process.exitcode}")
+    assert not failures, "gloo ranks failed:\n" + "\n".join(failures)
 
 
-@pytest.mark.parametrize("case", ["normal", *_MUTATIONS])
-def test_pp_adaptive_relay_over_gloo(case):
-    _run_ranks(case)
+@pytest.mark.parametrize(
+    ("pp_size", "case"),
+    [(pp_size, "normal") for pp_size in _PP_SIZES]
+    + [(_MUTATION_PP_SIZE, case) for case in _MUTATIONS],
+)
+def test_pp_adaptive_relay_over_gloo(pp_size, case):
+    _run_ranks(pp_size, case)
