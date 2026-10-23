@@ -159,6 +159,7 @@ def _common_metadata(
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
     causal: bool = True,
+    max_query_len: int | None = None,
 ) -> CommonAttentionMetadata:
     device = block_table.device
     query_start_loc = torch.zeros(len(query_lens) + 1, dtype=torch.int32, device=device)
@@ -176,7 +177,7 @@ def _common_metadata(
         _seq_lens_cpu=seq_lens_t.cpu(),
         num_reqs=len(query_lens),
         num_actual_tokens=sum(query_lens),
-        max_query_len=DECODE_QUERY_LEN,
+        max_query_len=max_query_len or DECODE_QUERY_LEN,
         max_seq_len=int(seq_lens_t.max()),
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
@@ -484,6 +485,100 @@ def test_sparse_metadata_is_independent_of_the_cpu_query_lens(compress_ratio, ca
         # The persistent graph buffer is refilled with -1, so rows outside this
         # step's token range cannot keep a stale slot.
         assert not mla_builder.compressed_slot_mapping_buffer[live:].ge(0).any()
+
+
+@GPU
+def test_mixed_batch_keeps_the_decode_prefill_boundary():
+    """Only the CPU decode split is stale; the boundary and prefill rows are exact.
+
+    The CPU copy redistributes the draft budget across decode requests but keeps
+    the batch total, and prefill rows are scheduled exactly. So the number of
+    decode tokens (a cumsum at the decode/prefill boundary) and the prefill query
+    lengths still describe the device batch, which is what lets the eager CPU
+    slicing around a captured decode region stay correct.
+    """
+    device = torch.device("cuda")
+    # Two decode requests plus a chunked prefill long enough to stay clear of the
+    # 6..9 band where the SWA builder (threshold 9) and the indexer (threshold 5)
+    # disagree about what is a decode.
+    query_lens = [3, 1, 12]
+    cpu_query_lens = [1, 3, 12]
+    seq_lens = [131, 96, 200]
+    live = sum(query_lens)
+    num_decodes = 2
+    assert sum(cpu_query_lens) == live
+
+    config = _lane_config(adaptive=True)
+    swa_block_table = _request_blocks(len(query_lens), SWA_BLOCK_SIZE).to(device)
+    width = get_block_table_width(
+        _compressed_spec(1).max_num_blocks_per_req(
+            config, config.model_config.max_model_len
+        ),
+        COMPRESSED_BLOCK_SIZE,
+    )
+    compressed_block_table = _request_blocks(len(query_lens), COMPRESSED_BLOCK_SIZE).to(
+        device
+    )
+    compressed_block_table = torch.cat(
+        [
+            compressed_block_table,
+            torch.zeros(
+                (len(query_lens), width - compressed_block_table.shape[1]),
+                dtype=torch.int32,
+                device=device,
+            ),
+        ],
+        dim=1,
+    )
+    slot_mapping = torch.arange(live, dtype=torch.int64, device=device)
+    max_query_len = max(query_lens)
+
+    swa_meta = DeepseekV41AmpereSparseSWAMetadataBuilder(
+        _swa_spec(), ["swa"], config, device
+    ).build(
+        0,
+        _common_metadata(
+            query_lens,
+            seq_lens,
+            cpu_query_lens,
+            swa_block_table,
+            slot_mapping,
+            max_query_len=max_query_len,
+        ),
+    )
+    indexer_builder = DeepseekV32IndexerMetadataBuilder(
+        _compressed_spec(1), ["indexer"], config, device, block_table_width=width
+    )
+    indexer_meta = indexer_builder.build(
+        0,
+        _common_metadata(
+            query_lens,
+            seq_lens,
+            cpu_query_lens,
+            compressed_block_table,
+            slot_mapping,
+            max_query_len=max_query_len,
+        ),
+    )
+
+    decode_tokens = sum(query_lens[:num_decodes])
+    assert swa_meta.num_decodes == num_decodes
+    assert swa_meta.num_decode_tokens == decode_tokens
+    assert swa_meta.num_prefills == 1
+    assert swa_meta.num_prefill_tokens == live - decode_tokens
+    assert swa_meta.prefill_query_lens_cpu.tolist() == [12]
+    assert swa_meta.prefill_seq_lens.tolist() == [200]
+
+    assert indexer_meta.num_decodes == num_decodes
+    assert indexer_meta.num_decode_tokens == decode_tokens
+    assert indexer_meta.num_prefills == 1
+    assert indexer_meta.prefill is not None
+    (chunk,) = indexer_meta.prefill.chunks
+    # The prefill region starts at the exact decode total, not at the stale CPU
+    # per-request cumsum.
+    assert chunk.token_start == decode_tokens
+    assert chunk.token_end == live
+    assert chunk.total_seq_lens == seq_lens[-1]
 
 
 @GPU
