@@ -137,7 +137,7 @@ struct PersistentTopKParams {
   uint32_t top_k;           // actual k value for output stride
   uint32_t chunk_size;      // large path: elements per CTA
   uint32_t ctas_per_group;  // 1=medium, >1=large
-  uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
+  uint32_t max_seq_len;     // padded row width upper bound (host scalar)
 };
 
 // ============================================================================
@@ -1008,16 +1008,43 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
   // Non-large rows: CTA-0 handles trivial/decode/medium.
   // Large rows: all CTAs in the group cooperate via RadixTopK.
   // ========================================================================
-  const uint32_t ctas_per_group = params.ctas_per_group;
-  const uint32_t group_id = blockIdx.x / ctas_per_group;
-  const uint32_t cta_in_group = blockIdx.x % ctas_per_group;
-  const uint32_t num_groups = gridDim.x / ctas_per_group;
   const uint32_t chunk_size = params.chunk_size;
 
-  if (blockIdx.x >= num_groups * ctas_per_group) return;
+  // The host grid is sized from the padded row width (frozen in the CUDA
+  // graph), but the live context only exists on device. Re-group the same
+  // CTAs over the device lengths so the scan range follows the live length
+  // instead of the padded stride. This only shrinks a group, never the grid:
+  // CTAs the padded partition reserved for columns past the live length
+  // return immediately, and the remaining CTAs cover the same contiguous
+  // chunks, so the selected set and its order are unchanged.
+  uint32_t dev_max_len = 0;
+  for (uint32_t r = 0; r < params.num_rows; ++r) {
+    const int32_t raw_len = params.lengths[r];
+    const uint32_t len = raw_len > 0 ? static_cast<uint32_t>(raw_len) : 0u;
+    dev_max_len = len > dev_max_len ? len : dev_max_len;
+  }
+  const uint32_t row_bound =
+      params.stride < params.max_seq_len ? params.stride : params.max_seq_len;
+  if (dev_max_len > row_bound) dev_max_len = row_bound;
 
-  // Early exit: non-CTA-0 threads are never needed if no large rows exist
-  if (cta_in_group != 0 && params.max_seq_len <= RADIX_THRESHOLD) return;
+  uint32_t dev_ctas_per_group = (dev_max_len + chunk_size - 1) / chunk_size;
+  if (dev_ctas_per_group < 1) dev_ctas_per_group = 1;
+  if (dev_ctas_per_group > params.ctas_per_group) {
+    dev_ctas_per_group = params.ctas_per_group;
+  }
+
+  uint32_t num_groups = gridDim.x / dev_ctas_per_group;
+  if (num_groups > params.num_rows) num_groups = params.num_rows;
+  if (num_groups == 0) return;
+
+  const uint32_t group_id = blockIdx.x / dev_ctas_per_group;
+  const uint32_t cta_in_group = blockIdx.x % dev_ctas_per_group;
+  if (group_id >= num_groups) return;
+
+  // Early exit: non-leader CTAs are never needed when every row takes the
+  // single-CTA path. Use the device max length here: the host scalar is the
+  // padded upper bound and would keep these CTAs resident.
+  if (cta_in_group != 0 && dev_max_len <= RADIX_THRESHOLD) return;
 
   uint32_t* local_histogram = reinterpret_cast<uint32_t*>(smem_raw);
   uint32_t* suffix_sum = local_histogram + RADIX;
@@ -1049,15 +1076,13 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     // would reinterpret as ~4e9 and sail past every threshold below. Any
     // value beyond the row width would also read into the next row.
     //
-    // Clamping to max_seq_len additionally keeps this per-row decision
-    // consistent with the `cta_in_group != 0` early exit above, which is
-    // taken from the host-side scalar: when max_seq_len <= RADIX_THRESHOLD
-    // the non-leader CTAs return immediately, so a leader that reached the
-    // cooperative radix path would wait on the inter-CTA barrier for peers
-    // that no longer exist and spin until the kernel is killed.
+    // Clamping to row_bound additionally keeps this per-row decision
+    // consistent with the `cta_in_group != 0` early exit above: when the
+    // device max length is within RADIX_THRESHOLD the non-leader CTAs return
+    // immediately, so a leader that reached the cooperative radix path would
+    // wait on the inter-CTA barrier for peers that no longer exist and spin
+    // until the kernel is killed.
     const int32_t raw_len = params.lengths[row_idx];
-    const uint32_t row_bound =
-        params.stride < params.max_seq_len ? params.stride : params.max_seq_len;
     const uint32_t non_negative_len =
         raw_len > 0 ? static_cast<uint32_t>(raw_len) : 0u;
     const uint32_t seq_len =
@@ -1086,7 +1111,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     radix_topk<TopK, VEC_SIZE>(
         row_input, row_output, seq_len, my_chunk_start, chunk_size,
         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
-        cta_in_group, ctas_per_group, barrier_phase, radix_iter, tx);
+        cta_in_group, dev_ctas_per_group, barrier_phase, radix_iter, tx);
     radix_iter++;
   }
 }

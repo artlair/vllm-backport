@@ -105,3 +105,115 @@ def test_persistent_topk_across_radix_threshold(n: int, num_rows: int):
             f"row {r} (n={n}): {len(ref - got)} missing / "
             f"{len(got - ref)} extra vs torch.topk"
         )
+
+
+# ---------------------------------------------------------------------------
+# Live length vs padded row width.
+#
+# Production captures the indexer logits at max_model_len columns because the
+# CUDA graph freezes the row width, while the live context is much shorter.
+# The device-side regrouping in topk.cu must select the same indices, in the
+# same order, for the same live length at any padded width, and must keep the
+# single-CTA / T=0 paths intact.
+# ---------------------------------------------------------------------------
+
+
+def _run_persistent_topk(logits, lengths, k, max_seq_len):
+    rows = logits.shape[0]
+    out = torch.full((rows, k), -1, dtype=torch.int32, device=logits.device)
+    ws = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device=logits.device)
+    torch.ops._C.persistent_topk(logits, lengths, out, ws, k, max_seq_len)
+    return out
+
+
+def _assert_matches_torch(logits, lengths, out, k):
+    for r in range(logits.shape[0]):
+        n = int(lengths[r])
+        kk = min(n, k)
+        ref = set(torch.topk(logits[r, :n], kk).indices.tolist()) if kk else set()
+        got_raw = [i for i in out[r].tolist() if i >= 0]
+        assert all(i < n for i in got_raw), f"row {r}: index >= live length"
+        got = set(got_raw)
+        assert len(got) == len(got_raw), f"row {r}: duplicate indices"
+        assert got == ref, (
+            f"row {r} (n={n}): {len(ref - got)} missing / {len(got - ref)} extra"
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_rows", [5, 10, 20])
+@pytest.mark.parametrize("live_len", [40000, 86016, 120000])
+def test_persistent_topk_stride_independent(live_len, num_rows, topk):
+    torch.manual_seed(0)
+    device = "cuda"
+    live = torch.randn(num_rows, live_len, device=device)
+    lengths = torch.full((num_rows,), live_len, dtype=torch.int32, device=device)
+
+    outs = {}
+    for width in (524288, 131072):
+        logits = torch.full((num_rows, width), POISON, device=device)
+        logits[:, :live_len] = live
+        out = _run_persistent_topk(logits, lengths, topk, width)
+        _assert_matches_torch(logits, lengths, out, topk)
+        outs[width] = out.clone()
+        del logits
+
+    assert torch.equal(outs[524288], outs[131072]), (
+        "top-k indices must not depend on the padded row width"
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_persistent_topk_mixed_row_lengths(topk):
+    torch.manual_seed(0)
+    device = "cuda"
+    live_lens = [86016, 1000, 40000, 20, 0]
+    lengths = torch.tensor(live_lens, dtype=torch.int32, device=device)
+    rows = len(live_lens)
+    data = [torch.randn(n, device=device) for n in live_lens]
+
+    outs = {}
+    for width in (524288, 131072):
+        logits = torch.full((rows, width), POISON, device=device)
+        for r, n in enumerate(live_lens):
+            if n:
+                logits[r, :n] = data[r]
+        out = _run_persistent_topk(logits, lengths, topk, width)
+        _assert_matches_torch(logits, lengths, out, topk)
+        outs[width] = out.clone()
+        del logits
+
+    assert torch.equal(outs[524288], outs[131072]), (
+        "mixed row lengths must not depend on the padded row width"
+    )
+
+
+@requires_cuda
+def test_persistent_topk_stride_independent_with_ties():
+    """Tie-heavy data pins the output order, not only the selected set."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_rows, live_len, topk = 5, 86016, 512
+    data = torch.randint(-4, 5, (num_rows, live_len), device=device).float()
+    lengths = torch.full((num_rows,), live_len, dtype=torch.int32, device=device)
+
+    outs = {}
+    for width in (524288, 131072):
+        logits = torch.full((num_rows, width), POISON, device=device)
+        logits[:, :live_len] = data
+        out = _run_persistent_topk(logits, lengths, topk, width)
+        for r in range(num_rows):
+            got_raw = [i for i in out[r].tolist() if i >= 0]
+            assert len(got_raw) == topk, f"row {r}: short output"
+            assert all(i < live_len for i in got_raw), f"row {r}: padded index"
+            assert len(set(got_raw)) == topk, f"row {r}: duplicate indices"
+            selected = data[r][out[r]]
+            assert selected.min() >= torch.topk(data[r], topk).values.min()
+        outs[width] = out.clone()
+        del logits
+
+    assert torch.equal(outs[524288], outs[131072]), (
+        "tie ordering must not depend on the padded row width"
+    )
