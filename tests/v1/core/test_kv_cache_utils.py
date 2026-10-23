@@ -4054,6 +4054,79 @@ def test_deepseek_v4_annotation_requires_model_type():
     assert not any(g.is_eagle_group for g in groups)
 
 
+def _dspark_spec_config(num_speculative_tokens: int = 4):
+    """A DSpark ``SpeculativeConfig`` without loading a draft checkpoint.
+
+    The method is overwritten after construction because a real ``dspark``
+    config resolves a draft model; these predicates only read the method name.
+    """
+    from vllm.config.speculative import SpeculativeConfig
+
+    spec_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=num_speculative_tokens
+    )
+    spec_config.method = "dspark"
+    return spec_config
+
+
+def test_dspark_pp_stage_drops_no_prefix_cache_block():
+    """DSpark must not activate the EAGLE trailing-block drop under PP.
+
+    DFlash/DSpark build a draft position's KV from the target hidden state
+    alone, so no cached block is volatile and no group may be annotated as a
+    draft group. The annotation exists only on the stage that owns the MTP
+    layer, while ``generate_scheduler_kv_cache_config`` hands worker 0's
+    projection to every consumer. A live flag on worker 0 used to project away,
+    leaving the coordinator to fall back to flagging *every* group, which then
+    dropped the last prefix-cache block of every group on every hit.
+    """
+    from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+
+    spec_config = _dspark_spec_config()
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=8192),
+        speculative_config=spec_config,
+    )
+    vllm_config.model_config.hf_config.model_type = "deepseek_v41"
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.cache_config.prefix_cache_retention_interval = None
+
+    kv_cache_specs = _deepseek_v4_specs(model_version=None)
+    groups = get_kv_cache_groups(vllm_config, kv_cache_specs)
+
+    # PP stage 0 owns the first two layers; the MTP layer registers last, so
+    # its group projects to an empty group on this worker.
+    stage0_spec = {
+        name: spec
+        for name, spec in kv_cache_specs.items()
+        if "layers.2." not in name and "layers.3." not in name
+    }
+    projected = kv_cache_utils._project_kv_cache_groups_to_worker(groups, stage0_spec)
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        projected,
+        kv_cache_utils._pool_bytes_per_block(projected) * 100 + 1,
+    )
+    scheduler_config = generate_scheduler_kv_cache_config([kv_cache_config])
+    scheduler_block_size, hash_block_size = kv_cache_utils.resolve_kv_cache_block_sizes(
+        scheduler_config, vllm_config
+    )
+    coordinator = get_kv_cache_coordinator(
+        scheduler_config,
+        max_model_len=8192,
+        max_in_flight_tokens=8192,
+        use_eagle=spec_config.use_eagle_block_drop(),
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        scheduler_block_size=scheduler_block_size,
+        hash_block_size=hash_block_size,
+    )
+    assert coordinator.eagle_group_ids == set()
+    assert not any(group.is_eagle_group for group in groups)
+
+
 def test_pipeline_stages_resolve_a_layout_every_stage_supports(monkeypatch):
     """PP stages hold different layers, so their workers can report different
     supported layouts (e.g. only one stage has FlashInfer layers on SM100)."""
