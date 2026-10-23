@@ -21,6 +21,7 @@ import torch
 from tests.utils import create_new_process_for_each_test
 from vllm.compilation.counter import compilation_counter
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu import async_utils
 from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu import model_runner as mrv2
 
@@ -439,3 +440,154 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     assert runner.model_state._mamba_ctx is None
     assert runner.model_state._mamba_group_ids == []
     assert runner.model_state._mamba_spec is None
+
+
+class _FakeTimingEvent:
+    """Stands in for torch.cuda.Event; unrecorded events are unreadable."""
+
+    def __init__(self) -> None:
+        self.recorded = False
+        self.synced = False
+
+    def record(self) -> None:
+        self.recorded = True
+
+    def synchronize(self) -> None:
+        assert self.recorded, "waited on an event that was never recorded"
+        self.synced = True
+
+    def elapsed_time(self, other: "_FakeTimingEvent") -> float:
+        assert self.recorded and other.recorded, "timed an unrecorded event"
+        return 2.0
+
+
+class _FakeTimingEvents:
+    def __init__(self) -> None:
+        self.forward_start = _FakeTimingEvent()
+        self.forward_end = _FakeTimingEvent()
+        self.drafter_start = _FakeTimingEvent()
+        self.drafter_end = _FakeTimingEvent()
+
+
+def test_step_timing_zeroes_the_draft_cost_of_a_step_without_a_drafter(monkeypatch):
+    # A non-last PP stage runs the target forward only. Its profile sample must
+    # report a zero draft cost without ever timing the unrecorded drafter
+    # events, which would read garbage.
+    monkeypatch.setattr(async_utils, "StepTimingEvents", _FakeTimingEvents)
+    collector = async_utils.StepTimingCollector()
+
+    with collector.collect() as samples:
+        collector.record_batch(SimpleNamespace(num_tokens=5, num_reqs=1), True)
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+        collector.forward_start()
+        collector.forward_end()
+        collector.step_without_drafter()
+
+    assert [(s.forward_ms, s.drafter_ms) for s in samples] == [(2.0, 2.0), (2.0, 0.0)]
+
+
+class _RecordingStepTiming:
+    """Stands in for StepTimingCollector: records the calls, not the events."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def forward_start(self) -> None:
+        self.calls.append("forward_start")
+
+    def forward_end(self) -> None:
+        self.calls.append("forward_end")
+
+    def drafter_start(self) -> None:
+        self.calls.append("drafter_start")
+
+    def drafter_end(self) -> None:
+        self.calls.append("drafter_end")
+
+    def step_without_drafter(self) -> None:
+        self.calls.append("step_without_drafter")
+
+
+def _make_dummy_run_runner(*, is_last_pp_rank: bool) -> Any:
+    runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 5
+    runner.is_first_pp_rank = True
+    runner.is_last_pp_rank = is_last_pp_rank
+    runner.lora_config = None
+    runner.speculator = None
+    runner.step_timing = _RecordingStepTiming()
+    runner.eplb = SimpleNamespace(step=lambda **kwargs: None)
+    runner.kv_connector = SimpleNamespace(set_disabled=lambda disabled: None)
+    runner.maybe_dummy_run_with_lora = lambda *args, **kwargs: contextlib.nullcontext()
+    batches: list[dict[str, int]] = []
+    runner.batches = batches
+
+    def _execute_model(scheduler_output, **kwargs) -> None:
+        batches.append(dict(scheduler_output.num_scheduled_tokens))
+        if not is_last_pp_rank:
+            return
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        runner.execute_model_state = SimpleNamespace(
+            input_batch=SimpleNamespace(
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                logits_indices=torch.arange(num_reqs),
+            ),
+            attn_metadata=None,
+            slot_mappings_by_layer=None,
+            hidden_states=torch.zeros(num_tokens, 4),
+            aux_hidden_states=None,
+            dp_sync=None,
+        )
+
+    runner.execute_model = _execute_model
+    return runner
+
+
+def test_dummy_run_spreads_tokens_over_the_requested_request_count():
+    # Cost profiling asks for decode-shaped batches: a few token rows over a
+    # few requests, not one request per token.
+    runner = _make_dummy_run_runner(is_last_pp_rank=False)
+
+    runner._dummy_run(10, num_reqs=2)
+    assert runner.batches[-1] == {"_dummy_req_0": 5, "_dummy_req_1": 5}
+
+    runner._dummy_run(3, num_reqs=1)
+    assert runner.batches[-1] == {"_dummy_req_0": 3}
+
+    runner._dummy_run(2048, num_reqs=16)
+    lengths = list(runner.batches[-1].values())
+    assert len(lengths) == 16
+    assert sum(lengths) == 2048
+    assert max(lengths) == 128
+
+
+def test_dummy_run_rejects_a_request_count_that_does_not_fit_the_batch():
+    runner = _make_dummy_run_runner(is_last_pp_rank=False)
+
+    with pytest.raises(ValueError, match="does not fit"):
+        runner._dummy_run(3, num_reqs=4)
+    assert runner.batches == []
+
+
+def test_dummy_run_ends_a_nonlast_pp_step_without_a_drafter():
+    # Only the last PP stage runs the drafter; the stage-only step still has to
+    # be closed, or its verify cost never reaches the cost curves.
+    runner = _make_dummy_run_runner(is_last_pp_rank=False)
+
+    runner._dummy_run(5, num_reqs=1)
+
+    assert runner.step_timing.calls == ["forward_end", "step_without_drafter"]
+
+
+def test_dummy_run_keeps_the_last_pp_step_open_for_the_drafter():
+    runner = _make_dummy_run_runner(is_last_pp_rank=True)
+
+    runner._dummy_run(5, num_reqs=1)
+
+    assert runner.step_timing.calls == ["forward_end"]

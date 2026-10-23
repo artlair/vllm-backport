@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
@@ -11,6 +12,7 @@ from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    aggregate_pp_cost_curves,
     maybe_create_adaptive_verification_manager,
 )
 from vllm.v1.worker.gpu.structured_outputs import _build_grammar_mapping
@@ -123,7 +125,7 @@ def test_profiled_batches_seed_cost_curves_via_consumer():
             forward_ms=float(batch["num_tokens"]),
             drafter_ms=1.0,
             num_target_tokens=batch["num_tokens"],
-            num_reqs=batch["num_tokens"] // 8,
+            num_reqs=batch["num_reqs"],
             # Only the captured sizes replay a graph; the tail sizes run eager.
             full_cudagraph=batch["num_tokens"] <= 1024,
         )
@@ -142,7 +144,201 @@ def test_profiled_batches_seed_cost_curves_via_consumer():
     # Eager batches must not contribute to the draft curve: keyed by request
     # count they would land inside the captured range and, once made monotonic,
     # smear that eager cost across every larger request count.
-    assert curves["draft"] == [(1, 1.0), (128, 1.0)]
+    assert curves["draft"] == [(1, 1.0), (64, 1.0)]
+
+
+def make_profile_manager(
+    capture_sizes: list[int],
+    *,
+    max_num_reqs: int = 16,
+    max_num_batched_tokens: int = 2048,
+    num_speculative_steps: int = 4,
+    num_bonus_tokens: int = 1,
+    max_model_len: int | None = None,
+) -> AdaptiveVerificationManager:
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_num_reqs=max_num_reqs,
+    )
+    if max_model_len is not None:
+        manager.req_states.max_model_len = max_model_len
+    manager.num_speculative_steps = num_speculative_steps
+    manager.num_bonus_tokens = num_bonus_tokens
+    manager._cudagraph_limit = 0
+    return manager
+
+
+def profile_samples(
+    batches: list[dict[str, int]],
+    *,
+    forward_scale: float = 1.0,
+    drafter_ms: float = 0.0,
+    full_cudagraph: bool = True,
+) -> list[StepTimingSample]:
+    """One stage's profile samples for a batch program."""
+    return [
+        StepTimingSample(
+            forward_ms=forward_scale * batch["num_tokens"],
+            drafter_ms=drafter_ms,
+            num_target_tokens=batch["num_tokens"],
+            num_reqs=batch["num_reqs"],
+            full_cudagraph=full_cudagraph,
+        )
+        for batch in batches
+    ]
+
+
+def test_profile_batches_are_decode_shaped():
+    # A trimmed verify step shrinks a decode block over a fixed request count,
+    # so each profiled size must be spread over decode-shaped requests: a whole
+    # block per request at most, and no rounding of the sub-block rungs.
+    manager = make_profile_manager([1, 2, 3, 4, 5, 10, 15, 40])
+    decode_query_len = manager.num_speculative_steps + manager.num_bonus_tokens
+
+    batches = list(manager.batches_to_profile([1, 2, 3, 4, 5, 10, 15, 40]))
+    shape = {(batch["num_tokens"], batch["num_reqs"]) for batch in batches}
+
+    # One request per block up to a full decode block, then as many requests as
+    # the size needs, never rounding a small rung up to a full block.
+    assert shape == {
+        (1, 1),
+        (2, 1),
+        (3, 1),
+        (4, 1),
+        (5, 1),
+        (10, 2),
+        (15, 3),
+        (40, 8),
+        # Tail sizes past the capture limit stay mixed/piecewise: 16 requests
+        # carrying more than one block each.
+        (60, 12),
+        (80, 16),
+        (160, 16),
+        (320, 16),
+        (640, 16),
+        (1280, 16),
+        (2048, 16),
+    }
+    for batch in batches:
+        num_reqs = batch["num_reqs"]
+        if batch["num_tokens"] <= manager.req_states.max_num_reqs:
+            assert -(-batch["num_tokens"] // num_reqs) <= decode_query_len
+        context_len = batch["context_len"]
+        assert context_len > 0
+
+
+def test_profile_context_respects_max_model_len():
+    # The context is fabricated from the KV pool, so it must fit the model's
+    # servable length at the profiled query length instead of relying on the
+    # downstream clamp.
+    manager = make_profile_manager(
+        [5, 40], max_model_len=2048, max_num_batched_tokens=2304
+    )
+    batches = {
+        (batch["num_tokens"], batch["num_reqs"]): batch["context_len"]
+        for batch in manager.batches_to_profile([5, 40])
+    }
+    assert batches[(5, 1)] == 2048 - 5
+    # The eager tail spreads the token count evenly over every request, which
+    # shrinks the context by the resulting query length.
+    assert batches[(2304, 16)] == 2048 - 2304 // 16
+
+
+def test_profile_context_keeps_the_configured_value_when_it_fits(monkeypatch):
+    # The knob stays opt-in: a deployment that raises it gets exactly what it
+    # asked for as long as it fits the model length.
+    monkeypatch.setattr(
+        adaptive_module.envs, "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", 131072
+    )
+    manager = make_profile_manager([5, 40], max_model_len=524288)
+    assert {batch["context_len"] for batch in manager.batches_to_profile([5, 40])} == {
+        131072
+    }
+
+
+@pytest.mark.parametrize("num_stages", [1, 2, 6])
+def test_pp_curves_sum_verify_costs_and_keep_the_last_draft_curve(num_stages):
+    # A verify step serializes through the stages, so its cost is the sum of the
+    # stage costs; the drafter only runs on the last stage.
+    capture_sizes = [1, 2, 3, 4, 5, 10]
+    manager = make_profile_manager(capture_sizes)
+    batches = list(manager.batches_to_profile(capture_sizes))
+    stage_samples = [
+        profile_samples(
+            batches,
+            forward_scale=float(stage + 1),
+            drafter_ms=0.0 if stage < num_stages - 1 else 4.0,
+        )
+        for stage in range(num_stages)
+    ]
+
+    draft_curve, verify_curve = aggregate_pp_cost_curves(stage_samples)
+
+    cost_sum = sum(range(1, num_stages + 1))
+    num_tokens_seen = sorted({batch["num_tokens"] for batch in batches})
+    assert verify_curve == [
+        (num_tokens, float(cost_sum * num_tokens)) for num_tokens in num_tokens_seen
+    ]
+    num_reqs_seen = sorted({batch["num_reqs"] for batch in batches})
+    assert draft_curve == [(num_reqs, 4.0) for num_reqs in num_reqs_seen]
+
+
+def test_single_stage_curves_match_the_stage_medians():
+    manager = make_profile_manager([5, 10])
+    batches = list(manager.batches_to_profile([5, 10]))
+    samples = profile_samples(batches, forward_scale=2.0, drafter_ms=3.0)
+
+    assert aggregate_pp_cost_curves([samples]) == adaptive_module.stage_cost_curves(
+        samples
+    )
+
+
+def test_pp_curves_reject_stages_that_profiled_different_sizes():
+    manager = make_profile_manager([1, 2, 3, 4, 5, 10])
+    batches = list(manager.batches_to_profile([1, 2, 3, 4, 5, 10]))
+    complete = profile_samples(batches, drafter_ms=1.0)
+    # A stage that captured a different ladder, or dropped a rung's replays,
+    # would silently under-count the pipeline cost.
+    truncated = profile_samples(batches[:-1], drafter_ms=1.0)
+
+    with pytest.raises(RuntimeError, match="must capture and profile the same"):
+        aggregate_pp_cost_curves([complete, truncated])
+    # A stage with no samples at all is the same failure, not a zero-cost stage.
+    with pytest.raises(RuntimeError, match="must capture and profile the same"):
+        aggregate_pp_cost_curves([complete, []])
+
+
+def test_pp_curves_reject_stages_that_group_tokens_into_other_requests():
+    # Same token counts, different request shapes: the stage priced a batch this
+    # feature never runs, so its cost cannot enter the total.
+    manager = make_profile_manager([1, 2, 3, 4, 5, 10])
+    batches = list(manager.batches_to_profile([1, 2, 3, 4, 5, 10]))
+    decode_shaped = profile_samples(batches, drafter_ms=1.0)
+    one_token_per_request = profile_samples(
+        [{**batch, "num_reqs": batch["num_tokens"]} for batch in batches],
+        drafter_ms=1.0,
+    )
+
+    with pytest.raises(RuntimeError, match="must capture and profile the same"):
+        aggregate_pp_cost_curves([decode_shaped, one_token_per_request])
+
+
+def test_pp_curves_reject_a_last_stage_without_draft_costs():
+    # Only graph-replay samples price the draft curve, so a stage that never
+    # replayed one has no drafter cost to offer.
+    manager = make_profile_manager([5, 10])
+    eager_samples = profile_samples(
+        list(manager.batches_to_profile([5, 10])), full_cudagraph=False
+    )
+
+    with pytest.raises(RuntimeError, match="could not profile draft step costs"):
+        aggregate_pp_cost_curves([eager_samples, eager_samples])
+
+
+def test_pp_curves_reject_an_empty_profile():
+    with pytest.raises(RuntimeError, match="could not profile step costs"):
+        aggregate_pp_cost_curves([])
 
 
 def test_compact_batch_preserves_totals_and_bounds():
