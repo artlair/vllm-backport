@@ -116,6 +116,121 @@ def test_model_without_the_hooks_is_rejected():
         spec._validate_local_argmax_reduction()
 
 
+class _StubMarkovDraft:
+    """The parts of a DSpark draft model the sequential Markov loop reads."""
+
+    def __init__(self, vocab=32, shard=8, rank=4, hidden=6):
+        torch.manual_seed(0)
+        self.w1 = torch.randn(vocab, rank)
+        self.w2 = torch.randn(shard, rank)
+        self.hidden_proj = torch.randn(hidden, shard)
+        self.draft_id_to_target_id = None
+        self.model = SimpleNamespace(confidence_head=object())
+        self.confidence_calls = 0
+        self.last_confidence = None
+
+    def markov_embed(self, prev):
+        return self.w1[prev]
+
+    def compute_draft_logits_shard(self, sample_hidden):
+        return sample_hidden @ self.hidden_proj
+
+    def select_draft_token_shard(self, markov_embed, base_logits):
+        return (markov_embed @ self.w2.T + base_logits).argmax(-1)
+
+    def map_draft_to_target(self, ids):
+        return ids
+
+    def compute_confidence(self, sample_hidden, markov_hidden):
+        self.confidence_calls += 1
+        self.last_confidence = torch.sigmoid(
+            sample_hidden.sum(-1) + markov_hidden.sum(-1)
+        )
+        return self.last_confidence
+
+
+class _StubFusedMarkov:
+    def __init__(self):
+        self.sample_calls = 0
+
+    def sample(self, num_reqs, base_logits, anchor_ids, draft_tokens):
+        self.sample_calls += 1
+        draft_tokens.fill_(7)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("adaptive", [False, True], ids=["fixed", "adaptive"])
+def test_adaptive_verification_keeps_the_confidence_publishing_chain(
+    monkeypatch: pytest.MonkeyPatch, adaptive: bool
+):
+    """Adaptive verification publishes confidences from the eager chain.
+
+    ``record_confidences`` reads ``draft_token_confidence_probs`` after every
+    propose, but the fused Markov step writes ``draft_tokens`` directly and
+    returns before the eager loop accumulates the embeddings the confidence
+    head consumes. Choosing the fused step under adaptive verification would
+    therefore feed the budget uninitialized probabilities, so
+    ``load_draft_model`` must keep the eager chain there -- and only there.
+    """
+    from vllm.v1.worker.gpu.spec_decode.dspark import speculator as speculator_module
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    vocab, shard, hidden, n_spec, batch = 32, 8, 6, 3, 2
+    model = _StubMarkovDraft(vocab, shard, hidden=hidden)
+    fused = _StubFusedMarkov()
+    builds = []
+
+    def build(*_args, **_kwargs):
+        builds.append(1)
+        return fused
+
+    spec = DSparkSpeculator.__new__(DSparkSpeculator)
+    spec.vllm_config = None
+    spec.device = torch.device("cpu")
+    spec.draft_logits = None
+    spec.use_local_argmax_reduction = True
+    spec.enable_adaptive_verification = adaptive
+    spec.max_num_reqs = batch
+    spec.num_speculative_steps = n_spec
+    spec._fused_markov = None  # __init__ initializes it before loading.
+    monkeypatch.setattr(speculator_module, "load_dspark_model", lambda *_: model)
+    monkeypatch.setattr(speculator_module, "build_fused_markov_sampler", build)
+    monkeypatch.setattr(speculator_module.envs, "VLLM_DSPARK_FUSED_MARKOV", True)
+    # Mirrors load_model: the fusion decision is made in load_draft_model.
+    spec.model = spec.load_draft_model(object(), set())
+
+    num_sample = batch * n_spec
+    spec._draft_topk = None
+    spec.sample_indices = torch.arange(num_sample)
+    spec.sample_idx_mapping = torch.zeros(num_sample, dtype=torch.int32)
+    spec.sample_pos = torch.arange(num_sample)
+    spec._anchor_idx = torch.arange(batch, dtype=torch.int64) * n_spec
+    spec.input_buffers = SimpleNamespace(
+        input_ids=torch.arange(num_sample, dtype=torch.int64) % vocab
+    )
+    spec.draft_tokens = torch.zeros(batch, n_spec, dtype=torch.int64)
+    spec.draft_token_confidence_probs = torch.full((batch, n_spec), -1.0)
+
+    spec._sample_sequential(batch, torch.randn(num_sample, hidden))
+
+    if adaptive:
+        assert builds == []
+        assert spec._fused_markov is None
+        # The runner reads the buffer unconditionally on the adaptive path.
+        assert model.confidence_calls == 1
+        torch.testing.assert_close(
+            spec.draft_token_confidence_probs,
+            model.last_confidence.view(batch, n_spec),
+        )
+    else:
+        # Fixed verification keeps the fusion and never needs confidences.
+        assert builds == [1]
+        assert spec._fused_markov is fused
+        assert fused.sample_calls == 1
+        assert (spec.draft_tokens == 7).all()
+        assert (spec.draft_token_confidence_probs == -1.0).all()
+
+
 def _markov_head_for_fusion(monkeypatch, tp=4, soft_cap=None, scale=1.0):
     """A sharded Markov head plus the LogitsProcessor the speculator pairs it
     with, built without an engine."""
