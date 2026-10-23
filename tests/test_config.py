@@ -43,6 +43,7 @@ from vllm.config.speculative import _validate_qwen3_omni_dspark
 from vllm.config.utils import get_field
 from vllm.config.vllm import OPTIMIZATION_LEVEL_TO_CONFIG, OptimizationLevel
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.transformers_utils.config import (
     get_pooling_config,
     try_get_dense_modules,
@@ -408,6 +409,171 @@ def test_v2_model_runner_supports_extract_hidden_states():
     )
 
     assert config._get_v2_model_runner_unsupported_features() == []
+
+
+def _adaptive_pp_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            draft_sample_method="greedy",
+            rejection_sample_method="standard",
+            enable_adaptive_verification=True,
+        ),
+        lora_config=None,
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=6,
+            data_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            enable_expert_parallel=False,
+            use_ubatching=False,
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        ),
+        use_v2_model_runner=True,
+    )
+
+
+_SM86_CAPABILITY = DeviceCapability(8, 6)
+
+
+def _patch_cuda(monkeypatch, is_cuda=True, capability=_SM86_CAPABILITY) -> None:
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: is_cuda)
+    monkeypatch.setattr(
+        current_platform, "get_device_capability", lambda device_id=0: capability
+    )
+
+
+def test_adaptive_verification_pp_supported_route_validates(monkeypatch):
+    _patch_cuda(monkeypatch)
+    config = _adaptive_pp_config()
+
+    VllmConfig._validate_adaptive_verification(config)
+
+
+def test_adaptive_verification_pp1_route_is_unchanged(monkeypatch):
+    """The narrow PP gate must not constrain single-stage configurations."""
+    _patch_cuda(monkeypatch, is_cuda=False, capability=None)
+    config = _adaptive_pp_config()
+    config.parallel_config.pipeline_parallel_size = 1
+    config.use_v2_model_runner = False
+    config.speculative_config.method = "eagle"
+    config.scheduler_config.async_scheduling = False
+
+    VllmConfig._validate_adaptive_verification(config)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda c: setattr(c, "use_v2_model_runner", False),
+            "V1 model runner",
+        ),
+        (
+            lambda c: setattr(c.speculative_config, "method", "eagle"),
+            "only 'dspark'",
+        ),
+        (
+            lambda c: setattr(c.model_config.hf_config, "model_type", "deepseek_v4"),
+            "only 'deepseek_v41'",
+        ),
+        (
+            lambda c: setattr(
+                c.speculative_config, "draft_sample_method", "probabilistic"
+            ),
+            "only 'greedy'",
+        ),
+        (
+            lambda c: setattr(c.speculative_config, "rejection_sample_method", "fly"),
+            "only 'standard'",
+        ),
+        (
+            lambda c: setattr(c.scheduler_config, "async_scheduling", False),
+            "async scheduling",
+        ),
+        (
+            lambda c: setattr(c.parallel_config, "data_parallel_size", 2),
+            "data_parallel_size=2",
+        ),
+        (
+            lambda c: setattr(c.parallel_config, "decode_context_parallel_size", 2),
+            "decode_context_parallel_size=2",
+        ),
+        (
+            lambda c: setattr(c.parallel_config, "prefill_context_parallel_size", 2),
+            "prefill_context_parallel_size=2",
+        ),
+        (
+            lambda c: setattr(c.parallel_config, "enable_expert_parallel", True),
+            "expert parallelism",
+        ),
+        (
+            lambda c: setattr(c.parallel_config, "use_ubatching", True),
+            "microbatching",
+        ),
+        (
+            lambda c: setattr(c, "lora_config", SimpleNamespace()),
+            "not currently compatible with LoRA",
+        ),
+        (
+            lambda c: setattr(
+                c.compilation_config, "cudagraph_mode", CUDAGraphMode.NONE
+            ),
+            "enforce_eager",
+        ),
+    ],
+    ids=[
+        "v1_model_runner",
+        "speculative_method",
+        "target_model_type",
+        "draft_sample_method",
+        "rejection_sample_method",
+        "async_scheduling",
+        "data_parallel_size",
+        "decode_context_parallel_size",
+        "prefill_context_parallel_size",
+        "expert_parallel",
+        "ubatching",
+        "lora",
+        "enforce_eager",
+    ],
+)
+def test_adaptive_verification_pp_rejects_unsupported_setting(
+    monkeypatch, mutate, message
+):
+    _patch_cuda(monkeypatch)
+    config = _adaptive_pp_config()
+    mutate(config)
+
+    with pytest.raises(ValueError, match=message):
+        VllmConfig._validate_adaptive_verification(config)
+
+
+@pytest.mark.parametrize(
+    ("is_cuda", "capability", "message"),
+    [
+        (False, DeviceCapability(8, 6), "a CUDA platform"),
+        (True, None, "compute capability 8"),
+        (True, DeviceCapability(9, 0), "compute capability 8"),
+    ],
+    ids=["not_cuda", "unknown_capability", "newer_major"],
+)
+def test_adaptive_verification_pp_rejects_other_device(
+    monkeypatch, is_cuda, capability, message
+):
+    _patch_cuda(monkeypatch, is_cuda=is_cuda, capability=capability)
+    config = _adaptive_pp_config()
+
+    with pytest.raises(ValueError, match=message):
+        VllmConfig._validate_adaptive_verification(config)
 
 
 def test_dflash2_draft_forces_v2_model_runner():

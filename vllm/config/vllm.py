@@ -2740,14 +2740,80 @@ class VllmConfig:
                 "enforce_eager/cudagraph_mode=none"
             )
 
-        if self.parallel_config.pipeline_parallel_size > 1:
-            # Cost curves and confidences currently only exist on the last PP rank;
-            # earlier ranks would diverge on the trimmed batch shape.
-            # TODO: we should be able to support adaptive verification with PP by
-            # broadcasting the cost curves and confidences to all ranks.
+        if self.parallel_config.pipeline_parallel_size <= 1:
+            return
+
+        # PP support is a deliberately narrow experimental route: every rank
+        # must price the same confidence block from generation-aligned relay
+        # data and reach the same trimmed batch shape. Anything outside this
+        # route is rejected at startup rather than silently diverging.
+        unsupported: list[str] = []
+
+        from vllm.platforms import current_platform
+
+        capability = current_platform.get_device_capability()
+        if not current_platform.is_cuda():
+            unsupported.append("a CUDA platform")
+        elif capability is None or capability.major != 8:
+            found = capability.as_version_str() if capability is not None else "unknown"
+            unsupported.append(f"CUDA compute capability 8.x (found {found})")
+
+        if not self.use_v2_model_runner:
+            unsupported.append("the V1 model runner (set VLLM_USE_V2_MODEL_RUNNER=1)")
+
+        if spec_config.method != "dspark":
+            unsupported.append(
+                f"speculative method {spec_config.method!r} (only 'dspark')"
+            )
+
+        hf_config = getattr(self.model_config, "hf_config", None)
+        model_type = getattr(hf_config, "model_type", None)
+        if model_type != "deepseek_v41":
+            unsupported.append(
+                f"target model type {model_type!r} (only 'deepseek_v41')"
+            )
+
+        if spec_config.draft_sample_method != "greedy":
+            unsupported.append(
+                "draft_sample_method "
+                f"{spec_config.draft_sample_method!r} (only 'greedy')"
+            )
+
+        if spec_config.rejection_sample_method != "standard":
+            unsupported.append(
+                "rejection_sample_method "
+                f"{spec_config.rejection_sample_method!r} (only 'standard')"
+            )
+
+        if self.scheduler_config.async_scheduling is not True:
+            unsupported.append("async scheduling (it must be enabled)")
+
+        parallel_config = self.parallel_config
+        if parallel_config.data_parallel_size != 1:
+            unsupported.append(
+                f"data_parallel_size={parallel_config.data_parallel_size} (only 1)"
+            )
+        if parallel_config.decode_context_parallel_size != 1:
+            unsupported.append(
+                "decode_context_parallel_size="
+                f"{parallel_config.decode_context_parallel_size} (only 1)"
+            )
+        if parallel_config.prefill_context_parallel_size != 1:
+            unsupported.append(
+                "prefill_context_parallel_size="
+                f"{parallel_config.prefill_context_parallel_size} (only 1)"
+            )
+        if parallel_config.enable_expert_parallel:
+            unsupported.append("expert parallelism")
+        if parallel_config.use_ubatching:
+            unsupported.append("microbatching (enable_dbo or ubatch_size > 1)")
+
+        if unsupported:
             raise ValueError(
-                "Adaptive verification is not currently compatible "
-                "with pipeline parallelism"
+                "Adaptive verification with pipeline parallelism is an "
+                "experimental DeepSeek-V4.1 DSpark path and only supports "
+                "the following configuration, but found unsupported setting(s): "
+                f"{'; '.join(unsupported)}."
             )
 
     def _validate_batch_sharded_sampling(self) -> None:
