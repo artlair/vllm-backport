@@ -2047,8 +2047,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # A fresh tensor, so the async activation send cannot observe a
                 # later step rewriting it. The receiving stage pops it before
                 # copying, so the model never sees it.
-                output_tensors.tensors[_PP_ADAPTIVE_PLAN_KEY] = self._pp_adaptive_plan(
-                    input_batch
+                output_tensors = IntermediateTensors(
+                    output_tensors.tensors
+                    | {_PP_ADAPTIVE_PLAN_KEY: self._pp_adaptive_plan(input_batch)}
                 )
             return output_tensors
         return None
