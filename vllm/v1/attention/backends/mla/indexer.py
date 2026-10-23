@@ -437,6 +437,15 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
 class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
     """DeepSeek-V4.1 indexer pages: 64 tokens on SM90 (FlashMLA), else 128."""
 
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # On SM8x adaptive verification puts every decode on the flattened
+        # per-token route (see _use_flattening), which is built from the device
+        # query start locations, so the per-request CPU lengths are never read.
+        return super().supports_device_cpu_query_lens_mismatch() or (
+            _supports_flattened_triton_query_lens()
+        )
+
     @staticmethod
     def get_name() -> str:
         return "DEEPSEEK_V41_INDEXER"
@@ -852,6 +861,17 @@ def _supports_flattened_device_query_lens() -> bool:
     )
 
 
+def _supports_flattened_triton_query_lens() -> bool:
+    """Whether decode can flatten to one row per query token on SM8x.
+
+    The SM8x fallback decodes the flattened rows with the Triton paged-MQA
+    logits kernel instead of DeepGEMM, so it needs no paged-logits scheduler.
+    """
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        86
+    )
+
+
 def _supports_native_decode(next_n: int) -> bool:
     """Whether decode can pass `next_n` Q rows per request to the kernel
     instead of flattening to one single-token row per query, which re-reads
@@ -872,7 +892,10 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
     return not _supports_native_decode(next_n) or (
         speculative_config is not None
         and speculative_config.enable_adaptive_verification
-        and _supports_flattened_device_query_lens()
+        and (
+            _supports_flattened_device_query_lens()
+            or _supports_flattened_triton_query_lens()
+        )
     )
 
 
@@ -1093,6 +1116,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         """Prepare native or per-token flattened decode tensors."""
         spec_config = self.vllm_config.speculative_config
         adaptive = bool(spec_config and spec_config.enable_adaptive_verification)
+        # Adaptive verification decides the per-request decode lengths on the
+        # device, so the native branch's requires_padding flag (computed from the
+        # CPU lengths, frozen at capture) cannot describe a replayed batch. Every
+        # arch that enables adaptive verification takes the flattened path; fail
+        # closed rather than reshape a replay against a stale CPU split.
+        assert not (adaptive and use_native), (
+            "adaptive verification requires the flattened per-token decode path"
+        )
         min_decode_len = int(decode_lens_cpu.min().item())
         if not use_native:
             assert self.decode_seq_lens_buffer.dim() == 1
