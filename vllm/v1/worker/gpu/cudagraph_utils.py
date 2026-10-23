@@ -261,8 +261,23 @@ class CudaGraphManager:
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
         )
+        # Adaptive verification can trim a verify step below the smallest
+        # configured bucket, and every trim below it would replay the same padded
+        # graph. Give the varlen decode ladder one rung per row count up to the
+        # decode query length so the cost model can price the trim. These sizes
+        # are decode-only: the mixed-mode ladder stays exactly as configured.
+        decode_sizes = capture_sizes
+        if capture_varlen_decode:
+            decode_sizes = sorted(
+                set(capture_sizes)
+                | {
+                    num_tokens
+                    for num_tokens in range(1, self.decode_query_len + 1)
+                    if num_tokens <= max_cg_capture_size
+                }
+            )
         for num_tokens, num_active_loras in product(
-            capture_sizes, self.lora_capture_cases
+            decode_sizes, self.lora_capture_cases
         ):
             # Varlen decode graphs take any mix of 1..decode_query_len tokens per
             # request, worst case 1 token per request (or max_num_reqs)
@@ -305,9 +320,13 @@ class CudaGraphManager:
                         descs_by_mode[decode_mode].append(desc)
 
             # recoverSSM cannot capture a dummy query wider than its workspace.
-            if mixed_mode and (
-                not self.vllm_config.cache_config.use_kda_recoverssm
-                or num_tokens <= max_decode_tokens
+            if (
+                mixed_mode
+                and num_tokens in capture_sizes
+                and (
+                    not self.vllm_config.cache_config.use_kda_recoverssm
+                    or num_tokens <= max_decode_tokens
+                )
             ):
                 # for PIECEWISE graphs there is no limit on requests when replaying
                 # i.e. no request padding is needed, so we leave it as None.

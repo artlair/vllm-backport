@@ -208,6 +208,7 @@ def _make_spec_decode_manager(
     dynamic_spec_schedule: list[tuple[int, int, int]] | None = None,
     max_num_seqs: int = 8,
     use_kda_recoverssm: bool = False,
+    varlen_decode: bool = False,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -230,6 +231,7 @@ def _make_spec_decode_manager(
         device=torch.device("cpu"),
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
         decode_query_len=decode_query_len,
+        varlen_decode=varlen_decode,
     )
     manager._graphs_captured = True
     return manager
@@ -399,3 +401,150 @@ def test_divisor_query_len_dispatch_is_unchanged(
         assert desc.cg_mode == CUDAGraphMode.FULL, num_tokens
         assert desc.num_tokens == expected, num_tokens
         assert desc.num_reqs == expected // decode_query_len, num_tokens
+
+
+def _full_decode_token_counts(manager) -> list[int]:
+    return sorted(
+        {
+            desc.num_tokens
+            for desc in manager._capture_descs.get(CUDAGraphMode.FULL, [])
+            if desc.max_query_len is not None
+        }
+    )
+
+
+def test_varlen_decode_stages_a_rung_for_every_trimmed_size(monkeypatch):
+    """A trimmed verify step needs a decode graph of its own.
+
+    Adaptive verification decides the per-request draft split on the device, so a
+    verify step can present 1..decode_query_len rows while the configured ladder
+    starts at 5. Below the smallest bucket every trim replays the same padded
+    graph, and ``build_cost_tables_from_curves`` then prices the trim at the
+    bucket's cost, so the budget can never prefer a smaller verify step.
+    """
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=5,
+        capture_sizes=[5, 10, 15, 20],
+        varlen_decode=True,
+    )
+
+    assert _full_decode_token_counts(manager) == [1, 2, 3, 4, 5, 10, 15, 20]
+    # Each trimmed split lands on its own graph instead of the smallest bucket.
+    for num_tokens in range(1, 6):
+        desc = manager.dispatch(
+            num_reqs=num_tokens,
+            num_tokens=num_tokens,
+            uniform_token_count=None,
+            num_active_loras=0,
+            max_query_len=1,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert desc.num_tokens == num_tokens
+        assert desc.max_query_len == 5
+
+
+def test_varlen_decode_rungs_stay_out_of_the_mixed_and_uniform_ladders(monkeypatch):
+    """The extra rungs are decode-only and bounded by the capture ceiling."""
+    capture_sizes = [5, 10, 20]
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=5,
+        capture_sizes=capture_sizes,
+        varlen_decode=True,
+    )
+
+    assert [
+        desc.num_tokens for desc in manager._capture_descs[CUDAGraphMode.PIECEWISE]
+    ] == sorted(capture_sizes, reverse=True)
+    # No uniform decode graphs and no rung sneaks into the mixed ladder.
+    assert all(
+        desc.uniform_token_count is None
+        for desc in manager._capture_descs[CUDAGraphMode.FULL]
+    )
+
+    capped = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=5,
+        capture_sizes=[1, 2, 3],
+        varlen_decode=True,
+    )
+    assert _full_decode_token_counts(capped) == [1, 2, 3]
+
+
+def test_varlen_decode_rungs_leave_the_standard_ladder_alone(monkeypatch):
+    """With adaptive verification off no extra graphs are staged."""
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=5,
+        capture_sizes=[5, 10, 20],
+        varlen_decode=False,
+    )
+
+    assert {desc.num_tokens for desc in manager._capture_descs[CUDAGraphMode.FULL]} == {
+        5,
+        10,
+        20,
+    }
+    assert {
+        desc.num_tokens for desc in manager._capture_descs[CUDAGraphMode.PIECEWISE]
+    } == {5, 10, 20}
+
+
+@pytest.mark.parametrize("varlen_decode", [False, True])
+def test_dispatch_never_serves_a_batch_from_a_too_small_graph(
+    monkeypatch, varlen_decode
+):
+    """Every dispatchable size gets a graph that covers it, and no graph is dead.
+
+    Sweeping the whole reachable space (1..max captured tokens x 1..max requests)
+    proves the rungs are reachable without any shape silently falling to a graph
+    smaller than the batch.
+    """
+    capture_sizes = [5, 10, 20]
+    max_num_seqs = 8
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=5,
+        capture_sizes=capture_sizes,
+        max_num_seqs=max_num_seqs,
+        varlen_decode=varlen_decode,
+    )
+
+    for num_tokens in range(1, capture_sizes[-1] + 1):
+        for num_reqs in range(1, min(num_tokens, max_num_seqs) + 1):
+            desc = manager.dispatch(
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                uniform_token_count=5 if not varlen_decode else None,
+                num_active_loras=0,
+                max_query_len=5,
+            )
+            assert desc.num_tokens >= num_tokens, (num_tokens, num_reqs)
+            if desc.cg_mode == CUDAGraphMode.NONE:
+                continue
+            assert desc.num_reqs is None or desc.num_reqs >= num_reqs
+            # Nothing smaller than the chosen graph can serve this batch.
+            for smaller in manager._capture_descs[CUDAGraphMode.FULL]:
+                if smaller.num_tokens < desc.num_tokens:
+                    assert not gpu_cudagraph_utils._is_compatible(
+                        smaller,
+                        num_reqs,
+                        num_tokens,
+                        5 if not varlen_decode else None,
+                        0,
+                        5,
+                        1,
+                    ), (num_tokens, num_reqs, smaller)
+
+    if varlen_decode:
+        # Every staged decode graph must be reachable from a real dispatch.
+        for desc in manager._capture_descs[CUDAGraphMode.FULL]:
+            reached = manager.dispatch(
+                num_reqs=desc.num_reqs,
+                num_tokens=desc.num_tokens,
+                uniform_token_count=None,
+                num_active_loras=0,
+                max_query_len=desc.max_query_len,
+            )
+            assert reached == desc
