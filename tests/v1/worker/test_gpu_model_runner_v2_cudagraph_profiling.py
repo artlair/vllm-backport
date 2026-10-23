@@ -24,6 +24,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu import async_utils
 from vllm.v1.worker.gpu import cudagraph_utils as cgu
 from vllm.v1.worker.gpu import model_runner as mrv2
+from vllm.v1.worker.gpu.input_batch import InputBuffers
 
 GLOBAL_POOL = "global-pool"
 THROWAWAY_POOL = "throwaway-pool"
@@ -525,9 +526,12 @@ def _make_dummy_run_runner(*, is_last_pp_rank: bool) -> Any:
     runner.maybe_dummy_run_with_lora = lambda *args, **kwargs: contextlib.nullcontext()
     batches: list[dict[str, int]] = []
     runner.batches = batches
+    execute_model_kwargs: list[dict[str, Any]] = []
+    runner.execute_model_kwargs = execute_model_kwargs
 
     def _execute_model(scheduler_output, **kwargs) -> None:
         batches.append(dict(scheduler_output.num_scheduled_tokens))
+        execute_model_kwargs.append(dict(kwargs))
         if not is_last_pp_rank:
             return
         num_tokens = scheduler_output.total_num_scheduled_tokens
@@ -575,6 +579,43 @@ def test_dummy_run_rejects_a_request_count_that_does_not_fit_the_batch():
     assert runner.batches == []
 
 
+def test_dummy_run_rejects_a_request_count_above_max_num_reqs():
+    # The token count alone does not make a batch runnable: 5 requests cannot fit
+    # a runner configured for 4, whatever the token count.
+    runner = _make_dummy_run_runner(is_last_pp_rank=False)
+    runner.max_num_reqs = 4
+
+    with pytest.raises(ValueError, match="exceeds max_num_reqs"):
+        runner._dummy_run(5, num_reqs=5)
+    assert runner.batches == []
+
+
+def test_dummy_run_forwards_the_profiled_request_count():
+    # A graph descriptor may reserve more requests than the profiled batch has,
+    # so the count has to be passed on explicitly (see
+    # test_dummy_execute_model_batch_keeps_the_profiled_request_count).
+    runner = _make_dummy_run_runner(is_last_pp_rank=False)
+
+    runner._dummy_run(5, num_reqs=1)
+    assert runner.execute_model_kwargs[-1]["dummy_num_reqs"] == 1
+
+
+def test_dummy_run_leaves_the_request_shape_to_the_descriptor_by_default():
+    runner = _make_dummy_run_runner(is_last_pp_rank=False)
+
+    runner._dummy_run(10)
+    assert runner.execute_model_kwargs[-1]["dummy_num_reqs"] is None
+
+
+def test_dummy_run_does_not_forward_a_stale_count_for_uniform_decode():
+    # The uniform decode shape rebuilds the request count, so the caller's count
+    # no longer describes the batch.
+    runner = _make_dummy_run_runner(is_last_pp_rank=False)
+
+    runner._dummy_run(10, num_reqs=2, uniform_decode=True)
+    assert runner.execute_model_kwargs[-1]["dummy_num_reqs"] is None
+
+
 def test_dummy_run_ends_a_nonlast_pp_step_without_a_drafter():
     # Only the last PP stage runs the drafter; the stage-only step still has to
     # be closed, or its verify cost never reaches the cost curves.
@@ -591,3 +632,69 @@ def test_dummy_run_keeps_the_last_pp_step_open_for_the_drafter():
     runner._dummy_run(5, num_reqs=1)
 
     assert runner.step_timing.calls == ["forward_end"]
+
+
+def _make_dummy_batch_runner(max_num_reqs: int = 5) -> Any:
+    runner: Any = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    runner.input_buffers = InputBuffers(max_num_reqs, max_num_reqs, torch.device("cpu"))
+    return runner
+
+
+def test_dummy_execute_model_batch_keeps_the_profiled_request_count():
+    """The 5-row varlen decode descriptor pads to 5 requests; the batch is 1.
+
+    InputBatch.make_dummy would otherwise rebuild the descriptor's request count
+    as 5 requests of 1 token each, which is the shape both the target/drafter
+    forward and the step timing sample would then price.
+    """
+    runner = _make_dummy_batch_runner()
+    desc = cgu.BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=5, num_reqs=5, max_query_len=6
+    )
+
+    batch = runner._make_dummy_input_batch(desc, num_reqs=1, dummy_num_reqs=1)
+
+    assert batch.num_reqs == 1
+    assert batch.num_reqs_after_padding == 5
+    assert batch.num_scheduled_tokens.tolist() == [5]
+    assert batch.seq_lens.tolist() == [5, 0, 0, 0, 0]
+    assert batch.query_start_loc_np.tolist() == [0, 5, 5, 5, 5, 5]
+    assert batch.logits_indices.tolist() == [4]
+
+
+def test_dummy_execute_model_batch_leaves_an_unprofiled_batch_descriptor_shaped():
+    runner = _make_dummy_batch_runner(max_num_reqs=8)
+    desc = cgu.BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=8, num_reqs=5, max_query_len=8
+    )
+
+    batch = runner._make_dummy_input_batch(desc, num_reqs=5, dummy_num_reqs=None)
+
+    assert batch.num_reqs == 5
+    assert batch.num_reqs_after_padding == 5
+    assert batch.num_scheduled_tokens.tolist() == [1, 1, 2, 2, 2]
+    assert batch.query_start_loc_np.tolist() == [0, 1, 2, 4, 6, 8]
+
+
+def test_dummy_execute_model_batch_reserves_no_requests_in_piecewise_mode():
+    # PIECEWISE descriptors carry no request count: there is no request padding.
+    runner = _make_dummy_batch_runner()
+    desc = cgu.BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=5, num_reqs=None
+    )
+
+    batch = runner._make_dummy_input_batch(desc, num_reqs=1, dummy_num_reqs=1)
+
+    assert batch.num_reqs == 1
+    assert batch.num_reqs_after_padding == 1
+    assert batch.query_start_loc_np.tolist() == [0, 5]
+
+
+def test_dummy_execute_model_batch_rejects_a_count_wider_than_the_descriptor():
+    runner = _make_dummy_batch_runner()
+    desc = cgu.BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=5, num_reqs=2
+    )
+
+    with pytest.raises(AssertionError, match="exceeds"):
+        runner._make_dummy_input_batch(desc, num_reqs=2, dummy_num_reqs=3)
