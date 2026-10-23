@@ -14,7 +14,7 @@ The practical effect is that one configuration holds up across the whole load ra
 
 Adaptive verification needs per-position acceptance estimates, so today it is only supported for DSpark with a **confidence head**.
 
-An experimental pipeline-parallel route exists for the DeepSeek-V4.1 DSpark lane. It carries each proposal's confidence block with the existing draft-token payload, generation-aligned, so every rank prices the same block and recomputes the budget locally. The budget and per-request plan are never broadcast. Startup verify costs are summed over all pipeline stages (the draft cost comes from the last stage), which prices verification conservatively. This route is limited to CUDA compute capability 8.x, DSpark with greedy drafting and standard rejection sampling, async scheduling, DP/DCP/PCP size 1, no expert parallelism, microbatching or LoRA, and full cudagraphs. Only the sm86 TP4 x PP6 lane has been exercised; its benefit is unproven until measured, and the standard non-adaptive lane is unchanged.
+This fork has an experimental pipeline-parallel route for DeepSeek-V4.1 DSpark (`model_type=deepseek_v41`). It carries each proposal's confidence block with the existing draft-token payload, generation-aligned, so every rank prices the same block and recomputes the budget locally without a new decision collective. This route requires CUDA compute capability 8.x, the V2 model runner (`VLLM_USE_V2_MODEL_RUNNER=1`), greedy drafting, standard rejection sampling, async scheduling, DP/DCP/PCP size 1, no expert parallelism, microbatching or LoRA, and full cudagraphs. It targets the private sm86 TP4 x PP6 lane, but single-GPU and CPU/gloo tests do not validate PP6/NCCL behavior or establish a performance benefit. It remains off by default.
 
 ## Usage
 
@@ -40,6 +40,7 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 - Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.
 - Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries).
 - Pipeline parallelism only supports the experimental route described above; every other PP configuration is rejected at startup.
+- For a diagnostic PP run, set `VLLM_PP_ADAPTIVE_DEBUG=1` on every stage to compare request order, query/logit boundaries and token totals through the existing activation payload. Missing or mismatched plans fail closed. This adds a host synchronization and is not a performance-measurement setting.
 - Trimming is value-dependent, because the cut depends on the confidence values. For stochastic drafting that needs a non-anticipation proof that the inclusion decision does not depend on the draft token being verified; prefix contiguity alone does not provide it. The PP route therefore requires greedy drafting, and probabilistic drafting remains out of scope.
 
 ## Tuning the cost profile
@@ -53,4 +54,4 @@ export VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN=131072
 
 Each profiled size is measured on a decode-shaped batch: the token rows are spread over as many requests as the size needs, with at most one decode block (`num_speculative_tokens + 1` rows) per request. That prices the smallest capture rungs, which are a single block trimmed to one or two tokens, at one request rather than one request per token. Token counts past that decode range are profiled as mixed/piecewise batches, the shape they actually run as.
 
-When the profile spans more than one pipeline stage (a combination still rejected at startup, see above), the verify curve is the sum of the per-stage costs at the same token count and the draft curve is the one from the stage that runs the drafter. Summing prices a verification step at full pipeline latency instead of at the steady-state microbatch rate, so it over-prices verification and trims at least as much as a single-stage run would; the hand-off between stages and the pipeline fill/drain are not measured. Every stage must capture and profile the same sizes, or startup fails.
+For the experimental PP route, the verify curve is the sum of the per-stage costs at the same token count and the draft curve comes only from the last stage. This uses summed compute latency rather than steady-state pipeline throughput; communication, scheduling and pipeline fill/drain are not measured. It is a conservative modeling choice, not a measured pipeline cost or a guarantee about trimming or speedup. Every stage must capture and profile matching shapes and sizes, or startup fails.
