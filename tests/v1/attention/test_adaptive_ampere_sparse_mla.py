@@ -914,6 +914,15 @@ _REPLAY_BATCHES = {
         ],
         [(2, 1, 206)],
     ],
+    20: [
+        # 16 requests (the slot limit) holding 20 rows: four of them verify two
+        # tokens, the rest are zero-draft.
+        [(r, 1, 100 + 7 * r) for r in range(12)]
+        + [(r, 2, 100 + 7 * r) for r in range(12, 16)],
+        [(15, 5, 212), (0, 3, 102), (7, 1, 152)],
+        [(3, 1, 124), (11, 2, 180), (5, 1, 138)],
+        [(9, 5, 166)],
+    ],
 }
 
 
