@@ -116,8 +116,19 @@ class InputBatch:
         num_tokens: int,
         input_buffers: InputBuffers,
         max_query_len: int | None = None,
+        num_reqs_after_padding: int | None = None,
     ) -> "InputBatch":
+        """Build a synthetic batch; num_reqs counts the requests it actually has.
+
+        A CUDA graph descriptor reserves a worst-case request count, so callers
+        that must replay one can pass num_reqs_after_padding larger than
+        num_reqs and get the same request padding a real batch carries: only the
+        live prefix holds tokens, the padded rows stay zero.
+        """
         assert 0 < num_reqs <= num_tokens
+        if num_reqs_after_padding is None:
+            num_reqs_after_padding = num_reqs
+        assert num_reqs <= num_reqs_after_padding <= input_buffers.max_num_reqs
         device = input_buffers.device
 
         req_ids = [f"req_{i}_{random_uuid()}" for i in range(num_reqs)]
@@ -143,18 +154,21 @@ class InputBatch:
         input_buffers.seq_lens[num_reqs - num_extra : num_reqs] = base_tokens + 1
         # Pad for full CUDA graph mode.
         input_buffers.seq_lens[num_reqs:] = 0
-        seq_lens = input_buffers.seq_lens[:num_reqs]
+        seq_lens = input_buffers.seq_lens[:num_reqs_after_padding]
 
-        query_start_loc_np = np.empty(num_reqs + 1, dtype=np.int32)
+        query_start_loc_np = np.empty(num_reqs_after_padding + 1, dtype=np.int32)
         query_start_loc_np[0] = 0
-        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
+        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
         input_buffers.query_start_loc[:1] = 0
         torch.cumsum(
-            seq_lens, dim=0, out=input_buffers.query_start_loc[1 : num_reqs + 1]
+            input_buffers.seq_lens[:num_reqs],
+            dim=0,
+            out=input_buffers.query_start_loc[1 : num_reqs + 1],
         )
         # Pad for full CUDA graph mode.
         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
-        query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
+        query_start_loc_np[num_reqs + 1 :] = num_tokens
+        query_start_loc = input_buffers.query_start_loc[: num_reqs_after_padding + 1]
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
@@ -162,16 +176,20 @@ class InputBatch:
         input_buffers.is_padding[:num_tokens].fill_(True)
         is_padding = input_buffers.is_padding[:num_tokens]
 
-        logits_indices = query_start_loc[1:] - 1
+        # Logits exist for live requests only; padded rows never sample.
+        logits_indices = query_start_loc[1 : num_reqs + 1] - 1
         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
         # Copy so set_dummy_context can add context in place without touching
-        # num_scheduled_tokens.
-        seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
+        # num_scheduled_tokens. Padded rows stay zero, as in prepare_inputs.
+        seq_lens_cpu_upper_bound = torch.zeros(
+            num_reqs_after_padding, dtype=torch.int32
+        )
+        seq_lens_cpu_upper_bound[:num_reqs] = torch.from_numpy(num_scheduled_tokens)
         return cls(
             req_ids=req_ids,
             num_reqs=num_reqs,
-            num_reqs_after_padding=num_reqs,
+            num_reqs_after_padding=num_reqs_after_padding,
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
             expanded_idx_mapping=expanded_idx_mapping,
@@ -221,13 +239,15 @@ def set_dummy_context(
         return
 
     # Decode-like shape: each request continues after context_len
-    # already-computed tokens.
-    input_batch.seq_lens += context_len
-    input_batch.seq_lens_cpu_upper_bound += context_len
+    # already-computed tokens. Only the live request prefix gets context; rows
+    # reserved by a CUDA graph descriptor stay at seq_len 0, so attention skips
+    # them exactly as it does for a padded real batch.
+    input_batch.seq_lens[:num_reqs] += context_len
+    input_batch.seq_lens_cpu_upper_bound[:num_reqs] += context_len
     input_batch.num_computed_tokens_np.fill(context_len)
     input_batch.num_computed_prefill_tokens_np.fill(context_len)
     local_pos = np.arange(input_batch.num_tokens, dtype=np.int64) - np.repeat(
-        input_batch.query_start_loc_np[:-1], input_batch.num_scheduled_tokens
+        input_batch.query_start_loc_np[:num_reqs], input_batch.num_scheduled_tokens
     )
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
 
