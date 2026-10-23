@@ -158,6 +158,7 @@ def _common_metadata(
     cpu_query_lens: list[int],
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
+    causal: bool = True,
 ) -> CommonAttentionMetadata:
     device = block_table.device
     query_start_loc = torch.zeros(len(query_lens) + 1, dtype=torch.int32, device=device)
@@ -179,7 +180,7 @@ def _common_metadata(
         max_seq_len=int(seq_lens_t.max()),
         block_table_tensor=block_table,
         slot_mapping=slot_mapping,
-        causal=True,
+        causal=causal,
     )
 
 
@@ -344,14 +345,16 @@ def test_adaptive_gate_accepts_the_ampere_group_shape():
 
 
 @GPU
+@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("compress_ratio", [1, 2])
-def test_sparse_metadata_is_independent_of_the_cpu_query_lens(compress_ratio):
+def test_sparse_metadata_is_independent_of_the_cpu_query_lens(compress_ratio, causal):
     """Sparse-MLA, compressed-slot and SWA metadata follow the device split.
 
     Under adaptive verification the CPU query lengths are only exact in total:
     the draft budget is redistributed evenly on the CPU while the device admits
     it best-first. Every per-row decode bound has to come from the device query
-    start locations.
+    start locations. Causal covers the target layers; non-causal covers the
+    DSpark draft block, which shares the same SWA builder.
     """
     device = torch.device("cuda")
     # 10 live tokens in a 16-row bucket. The CPU copy keeps the exact total but
@@ -380,27 +383,34 @@ def test_sparse_metadata_is_independent_of_the_cpu_query_lens(compress_ratio):
         mla_builder = DeepseekV41AmpereMLASparseMetadataBuilder(
             _compressed_spec(compress_ratio), ["compressed"], config, device
         )
+        mla_meta = mla_builder.build(
+            0,
+            _common_metadata(
+                query_lens,
+                seq_lens,
+                cpu_lens,
+                compressed_block_table,
+                slot_mapping,
+            ),
+        )
         return (
             swa_builder.build(
-                0,
-                _common_metadata(
-                    query_lens, seq_lens, cpu_lens, swa_block_table, slot_mapping
-                ),
-            ),
-            mla_builder.build(
                 0,
                 _common_metadata(
                     query_lens,
                     seq_lens,
                     cpu_lens,
-                    compressed_block_table,
+                    swa_block_table,
                     slot_mapping,
+                    causal,
                 ),
             ),
+            mla_meta,
+            mla_builder,
         )
 
-    stale_swa, stale_mla = build(cpu_query_lens)
-    truth_swa, truth_mla = build(query_lens)
+    stale_swa, stale_mla, mla_builder = build(cpu_query_lens)
+    truth_swa, truth_mla, _ = build(query_lens)
 
     expected_req = torch.repeat_interleave(
         torch.arange(num_reqs, device=device), torch.tensor(query_lens, device=device)
@@ -436,12 +446,20 @@ def test_sparse_metadata_is_independent_of_the_cpu_query_lens(compress_ratio):
 
     # Every row's window length follows its own device position, and the
     # graph-padding tail is cleared so a replayed bucket cannot read a previous
-    # step's bounds.
-    expected_lens = [
-        min(seq_len - qlen + j + 1, WINDOW)
-        for seq_len, qlen in zip(seq_lens, query_lens)
-        for j in range(qlen)
-    ]
+    # step's bounds. The DSpark draft block anchors one window per request and
+    # widens it by the whole query block.
+    if causal:
+        expected_lens = [
+            min(seq_len - qlen + j + 1, WINDOW)
+            for seq_len, qlen in zip(seq_lens, query_lens)
+            for j in range(qlen)
+        ]
+    else:
+        expected_lens = [
+            min(seq_len - qlen, WINDOW) + qlen
+            for seq_len, qlen in zip(seq_lens, query_lens)
+            for _ in range(qlen)
+        ]
     assert stale_swa.decode_swa_lens[:live].tolist() == expected_lens
     assert not stale_swa.decode_swa_lens[live:].any()
     ragged_indptr = stale_swa.decode_swa_ragged_indptr
@@ -463,6 +481,9 @@ def test_sparse_metadata_is_independent_of_the_cpu_query_lens(compress_ratio):
         stored_rows = torch.nonzero(compressed >= 0).flatten()
         owner = expected_req[stored_rows.long()]
         assert torch.equal(stored // (SLOTS_PER_REQUEST // compress_ratio), owner)
+        # The persistent graph buffer is refilled with -1, so rows outside this
+        # step's token range cannot keep a stale slot.
+        assert not mla_builder.compressed_slot_mapping_buffer[live:].ge(0).any()
 
 
 @GPU
