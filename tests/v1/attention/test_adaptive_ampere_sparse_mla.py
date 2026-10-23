@@ -49,6 +49,7 @@ from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV4SparseMLAMetadataBuilder
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadataBuilder,
@@ -89,6 +90,17 @@ MAX_SEQ_LEN = SLOTS_PER_REQUEST
 GPU = pytest.mark.skipif(
     not current_platform.is_cuda(), reason="Ampere sparse path needs CUDA"
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_breakable_cudagraph(monkeypatch):
+    """Keep this module from changing the process-wide cudagraph defaults.
+
+    Building a VllmConfig for a DSv4.1 architecture sets
+    VLLM_USE_BREAKABLE_CUDAGRAPH in os.environ, which would silently change how
+    unrelated tests in the same process capture graphs.
+    """
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
 
 
 def _spec_config(adaptive: bool, num_speculative_tokens: int = NUM_SPECULATIVE_TOKENS):
@@ -427,16 +439,25 @@ def test_sparse_metadata_is_independent_of_the_cpu_query_lens(compress_ratio, ca
     )
     assert not stale_swa.is_valid_token[live:].any()
 
-    for field in (
-        "decode_swa_lens",
-        "decode_swa_indices",
-        "decode_swa_ragged_indices",
-        "decode_swa_ragged_indptr",
-    ):
+    for field in ("decode_swa_lens", "decode_swa_indices"):
         stale = getattr(stale_swa, field)
         truth = getattr(truth_swa, field)
         assert stale is not None and truth is not None
         torch.testing.assert_close(stale, truth, rtol=0, atol=0)
+
+    # The ragged pair lives in persistent (uninitialized) graph buffers that are
+    # only written for the live rows, so compare exactly what this step wrote.
+    stale_ragged = stale_swa.decode_swa_ragged_indices
+    truth_ragged = truth_swa.decode_swa_ragged_indices
+    stale_indptr = stale_swa.decode_swa_ragged_indptr
+    truth_indptr = truth_swa.decode_swa_ragged_indptr
+    assert stale_ragged is not None and stale_indptr is not None
+    assert truth_ragged is not None and truth_indptr is not None
+    torch.testing.assert_close(
+        stale_indptr[: live + 1], truth_indptr[: live + 1], rtol=0, atol=0
+    )
+    nnz = int(stale_indptr[live])
+    torch.testing.assert_close(stale_ragged[:nnz], truth_ragged[:nnz], rtol=0, atol=0)
 
     torch.testing.assert_close(
         stale_mla.slot_mapping, truth_mla.slot_mapping, rtol=0, atol=0
@@ -463,9 +484,7 @@ def test_sparse_metadata_is_independent_of_the_cpu_query_lens(compress_ratio, ca
         ]
     assert stale_swa.decode_swa_lens[:live].tolist() == expected_lens
     assert not stale_swa.decode_swa_lens[live:].any()
-    ragged_indptr = stale_swa.decode_swa_ragged_indptr
-    assert ragged_indptr is not None
-    ragged_lens = ragged_indptr[1 : live + 1] - ragged_indptr[:live]
+    ragged_lens = stale_indptr[1 : live + 1] - stale_indptr[:live]
     assert ragged_lens.tolist() == expected_lens
 
     if compress_ratio > 1:
@@ -948,7 +967,10 @@ def test_captured_decode_replay_matches_per_request_reference(bucket):
     # Warm up outside the graph so the Triton kernels are compiled.
     rig.run_decode(capture_metadata)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    # Capture on the process's dedicated stream, as the runner does. Letting
+    # torch.cuda.graph pick a side stream leaves the vllm stream tracker back on
+    # the default stream, which later captures in this process cannot use.
+    with torch.cuda.graph(graph, stream=current_stream()):
         rig.run_decode(capture_metadata)
 
     for batch in [capture_batch, *replay_batches]:
@@ -966,10 +988,10 @@ def test_captured_decode_replay_matches_per_request_reference(bucket):
         assert torch.isfinite(rig.out).all()
         indptr = rig.swa_builder.decode_swa_ragged_indptr_buffer[: bucket + 1]
         assert int(indptr[0]) == 0
-        assert bool((indptr[1:] >= indptr[:-1]).all())
-        # Bounded read: at most a full window per captured row, which is what
-        # the persistent ragged buffer was sized for.
-        assert int(indptr[-1]) <= bucket * WINDOW
+        assert bool((indptr[1 : live + 1] >= indptr[:live]).all())
+        # Bounded read: a dead row re-reads its capture-time entries, each within
+        # one window, which is what the persistent ragged buffer was sized for.
+        assert bool(indptr.le(bucket * WINDOW).all())
         assert (
             bucket * WINDOW <= rig.swa_builder.decode_swa_ragged_indices_buffer.numel()
         )
