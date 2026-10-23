@@ -3,16 +3,17 @@
 """Adaptive verification for DSpark speculative decoding."""
 
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.async_utils import StepTimingSample, stream
@@ -113,6 +114,101 @@ def build_cost_tables_from_curves(
     return draft_table, verify_table
 
 
+_UNPROFILED_COSTS = (
+    "Adaptive verification could not profile step costs. Pass "
+    "`enable_adaptive_verification=false` in the speculative config to "
+    "verify a fixed number of drafts instead."
+)
+
+
+def _median_cost_curve(
+    points: Iterable[tuple[int, float]],
+) -> list[tuple[int, float]]:
+    """Median cost per distinct size, in ascending size order."""
+    grouped: defaultdict[int, list[float]] = defaultdict(list)
+    for size, cost_ms in points:
+        grouped[size].append(cost_ms)
+    return [(size, float(np.median(v))) for size, v in sorted(grouped.items())]
+
+
+def stage_cost_curves(
+    samples: Sequence[StepTimingSample],
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """(draft, verify) cost curves measured by one PP stage.
+
+    Eager-target steps inflate drafter timings (the CPU is still launching
+    kernels, opening gaps between the drafter's events), and request counts,
+    unlike token counts, collide across execution modes, so only graph-replay
+    samples may price the draft curve. A stage that runs no drafter reports 0.0
+    for every step, which only the last stage's curve may be read from.
+    """
+    draft_curve = _median_cost_curve(
+        (s.num_reqs, s.drafter_ms) for s in samples if s.full_cudagraph
+    )
+    verify_curve = _median_cost_curve(
+        (s.num_target_tokens, s.forward_ms) for s in samples
+    )
+    return draft_curve, verify_curve
+
+
+def _profile_signature(
+    samples: Sequence[StepTimingSample],
+) -> tuple[tuple[int, int, bool], ...]:
+    """The shape cases one stage profiled, for cross-stage agreement."""
+    return tuple(
+        sorted((s.num_reqs, s.num_target_tokens, s.full_cudagraph) for s in samples)
+    )
+
+
+def _describe_profile(signature: Sequence[tuple[int, int, bool]]) -> str:
+    token_counts = sorted({num_tokens for _, num_tokens, _ in signature})
+    return f"{len(signature)} dummy steps over token counts {token_counts}"
+
+
+def aggregate_pp_cost_curves(
+    stage_samples: Sequence[Sequence[StepTimingSample]],
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """Combine per-stage profile samples into pipeline cost curves.
+
+    A verification step runs serially through the pipeline stages, so its cost
+    is the sum of the per-stage costs at the same token count. Only the last
+    stage runs the drafter, so only its draft curve prices drafting.
+
+    Summing is deliberately conservative: a steady-state microbatch is bounded
+    by the slowest stage rather than the sum, so this over-prices verification
+    and therefore trims at least as much as single-stage adaptive verification
+    would. It also omits the activation hand-off between stages and the
+    pipeline fill/drain, which dummy runs never issue. Both omissions are
+    performance-only: the budget never exceeds the scheduled draft count.
+    """
+    if not stage_samples:
+        raise RuntimeError(_UNPROFILED_COSTS)
+    signatures = [_profile_signature(samples) for samples in stage_samples]
+    reference = signatures[0]
+    for stage, signature in enumerate(signatures[1:], start=1):
+        if signature != reference:
+            raise RuntimeError(
+                "Adaptive verification sums per-stage verify costs, so every PP "
+                "stage must capture and profile the same shapes, but PP stage "
+                f"{stage} profiled {_describe_profile(signature)} while PP stage "
+                f"0 profiled {_describe_profile(reference)}."
+            )
+    stage_curves = [stage_cost_curves(samples) for samples in stage_samples]
+    draft_curve = stage_curves[-1][0]
+    if not draft_curve:
+        raise RuntimeError(
+            "Adaptive verification could not profile draft step costs on the "
+            "stage that runs the drafter. Pass "
+            "`enable_adaptive_verification=false` in the speculative config to "
+            "verify a fixed number of drafts instead."
+        )
+    verify_costs: dict[int, float] = {}
+    for _, verify_curve in stage_curves:
+        for num_tokens, cost_ms in verify_curve:
+            verify_costs[num_tokens] = verify_costs.get(num_tokens, 0.0) + cost_ms
+    return draft_curve, sorted(verify_costs.items())
+
+
 class AdaptiveVerificationManager:
     def __init__(
         self,
@@ -174,8 +270,17 @@ class AdaptiveVerificationManager:
         """Dummy-run kwargs whose step timings seed the cost tables.
 
         Run these inside StepTimingCollector.collect(), then hand the block's
-        timings to set_initial_cost_curves."""
+        timings to set_initial_cost_curves.
+
+        Batches are decode-shaped: a trimmed verification step is a few token
+        rows spread over its requests, so each batch carries up to
+        decode_query_len rows per request (a single request for the smallest
+        rungs) and only falls back to an even split once the token count no
+        longer fits that many requests.
+        """
+        max_num_reqs = self.req_states.max_num_reqs
         max_num_tokens = self.req_states.max_num_batched_tokens
+        decode_query_len = self.num_speculative_steps + self.num_bonus_tokens
         size = self._cudagraph_limit = capture_sizes[-1] if capture_sizes else 0
         # Also profile beyond the capture limit: real steps run there
         # (piecewise/eager) and linear extrapolation badly underestimates
@@ -188,30 +293,98 @@ class AdaptiveVerificationManager:
                 tail_sizes.add(size)
             tail_sizes -= set(capture_sizes)
         for num_tokens in capture_sizes + sorted(tail_sizes):
+            num_reqs = min(max_num_reqs, cdiv(num_tokens, decode_query_len))
+            context_len = self._profile_context_len(cdiv(num_tokens, num_reqs))
             for _ in range(_PROFILE_REPLAYS):
                 yield {
                     "num_tokens": num_tokens,
-                    "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+                    "num_reqs": num_reqs,
+                    "context_len": context_len,
                 }
 
-    def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
-        def median_curve(
-            points: Iterable[tuple[int, float]],
-        ) -> list[tuple[int, float]]:
-            grouped: defaultdict[int, list[float]] = defaultdict(list)
-            for key, value in points:
-                grouped[key].append(value)
-            return [(k, float(np.median(v))) for k, v in sorted(grouped.items())]
+    def _profile_context_len(self, max_query_len: int) -> int:
+        """Profiled decode context, clamped to what a dummy batch can carry.
 
-        # Draft curve: eager-target steps inflate drafter timings (the CPU is
-        # still launching kernels, opening gaps between the drafter's events),
-        # and request counts — unlike token counts — collide across execution
-        # modes, so only graph-replay samples may price the draft curve.
-        draft_curve = median_curve(
-            (s.num_reqs, s.drafter_ms) for s in samples if s.full_cudagraph
+        set_dummy_context fabricates this much context per request from the KV
+        pool, so the clamp keeps the profiled request inside max_model_len.
+        """
+        context_len = envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN
+        max_model_len = getattr(self.req_states, "max_model_len", 0)
+        if max_model_len:
+            clamped = max(min(context_len, max_model_len - max_query_len), 0)
+            if clamped != context_len:
+                logger.debug_once(
+                    "Clamping the adaptive verification profile context to %d "
+                    "tokens to fit max_model_len=%d at query length %d.",
+                    clamped,
+                    max_model_len,
+                    max_query_len,
+                )
+            context_len = clamped
+        return context_len
+
+    def profile_shape(self, capture_sizes: list[int]) -> dict[str, int | list[int]]:
+        """The shape of this stage's profile program, for stage agreement."""
+        return {
+            "capture_sizes": list(capture_sizes),
+            "decode_query_len": self.num_speculative_steps + self.num_bonus_tokens,
+            "max_num_reqs": self.req_states.max_num_reqs,
+            "max_num_batched_tokens": self.req_states.max_num_batched_tokens,
+            "max_model_len": getattr(self.req_states, "max_model_len", 0),
+            "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+        }
+
+    def _pp_cpu_group(self) -> torch.distributed.ProcessGroup:
+        """This rank's pipeline-stage CPU group, for startup object collectives."""
+        return get_pp_group().cpu_group
+
+    def check_pp_profile_agreement(self, capture_sizes: list[int]) -> None:
+        """Fail unless every PP stage profiles the same batches.
+
+        The verify curve is summed across stages, so a stage that captured a
+        different ladder or schedules different shapes would produce a
+        meaningless total. The gather runs before any check, so no stage can
+        leave its peers waiting inside the profiling loop.
+        """
+        pp_world_size = getattr(self, "pp_world_size", 1)
+        if pp_world_size <= 1:
+            return
+        local = self.profile_shape(capture_sizes)
+        shapes: list[dict[str, int | list[int]]] = [local for _ in range(pp_world_size)]
+        torch.distributed.all_gather_object(shapes, local, group=self._pp_cpu_group())
+        reference = shapes[0]
+        mismatched = [stage for stage, shape in enumerate(shapes) if shape != reference]
+        if mismatched:
+            stage = mismatched[0]
+            raise RuntimeError(
+                "Adaptive verification sums per-stage verify costs, so every PP "
+                "stage must capture and profile the same shapes, but PP stage "
+                f"{stage} profiles {shapes[stage]} while PP stage 0 profiles "
+                f"{reference}."
+            )
+
+    def _gather_stage_samples(
+        self, samples: list[StepTimingSample]
+    ) -> list[list[StepTimingSample]]:
+        """Every PP stage's profile samples, in stage order."""
+        pp_world_size = getattr(self, "pp_world_size", 1)
+        if pp_world_size <= 1:
+            return [samples]
+        stage_samples: list[list[StepTimingSample]] = [[] for _ in range(pp_world_size)]
+        torch.distributed.all_gather_object(
+            stage_samples, samples, group=self._pp_cpu_group()
         )
-        verify_curve = median_curve(
-            (s.num_target_tokens, s.forward_ms) for s in samples
+        return stage_samples
+
+    def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
+        """Turn this startup's profile samples into the cost tables.
+
+        Under pipeline parallelism every stage contributes its curve to the
+        total verify cost, so the stage samples are gathered before the curves
+        are assembled and validated.
+        """
+        draft_curve, verify_curve = aggregate_pp_cost_curves(
+            self._gather_stage_samples(samples)
         )
         self.set_cost_curves(draft_curve, verify_curve)
 

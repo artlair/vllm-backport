@@ -40,8 +40,13 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 
 ## Tuning the cost profile
 
-Step costs are profiled against a synthetic KV context, 8192 tokens by default. Deployments serving much longer contexts may want to raise it so the profiled step reads a more realistic amount of cache (this matters a bit less for sparse attention models like DeepSeek-v4 since the cheap indexer is the main cost that scales with context length).
+Step costs are profiled against a synthetic KV context, 8192 tokens by default. Deployments serving much longer contexts may want to raise it so the profiled step reads a more realistic amount of cache (this matters a bit less for sparse attention models like DeepSeek-v4 since the cheap indexer is the main cost that scales with context length). The context is clamped to `max_model_len` minus the profiled query length, so it never exceeds what the model can serve.
 
 ```bash
+# The default is 8192, not tuned for long-context serving.
 export VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN=131072
 ```
+
+Each profiled size is measured on a decode-shaped batch: the token rows are spread over as many requests as the size needs, with at most one decode block (`num_speculative_tokens + 1` rows) per request. That prices the smallest capture rungs, which are a single block trimmed to one or two tokens, at one request rather than one request per token. Token counts past that decode range are profiled as mixed/piecewise batches, the shape they actually run as.
+
+When the profile spans more than one pipeline stage (a combination still rejected at startup, see above), the verify curve is the sum of the per-stage costs at the same token count and the draft curve is the one from the stage that runs the drafter. Summing prices a verification step at full pipeline latency instead of at the steady-state microbatch rate, so it over-prices verification and trims at least as much as a single-stage run would; the hand-off between stages and the pipeline fill/drain are not measured. Every stage must capture and profile the same sizes, or startup fails.

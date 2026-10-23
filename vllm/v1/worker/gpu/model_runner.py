@@ -744,6 +744,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         *args,
         skip_attn: bool = False,
         uniform_decode: bool = False,
+        # Request count override, e.g. for decode-shaped cost profiling. Defaults
+        # to one token per request.
+        num_reqs: int | None = None,
         context_len: int = 0,
         skip_eplb: bool = False,
         is_profile: bool = False,
@@ -756,7 +759,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Create a dummy scheduler output.
-        num_reqs = min(num_tokens, self.max_num_reqs)
+        if num_reqs is None:
+            num_reqs = min(num_tokens, self.max_num_reqs)
+        elif not 0 < num_reqs <= num_tokens:
+            raise ValueError(
+                f"num_reqs={num_reqs} does not fit a {num_tokens}-token dummy batch."
+            )
         if uniform_decode:
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
             # and for spec-decode with MTP we want to make sure the dummy runs use
@@ -811,6 +819,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
+            # This stage's cost is its forward alone. End the step here so a
+            # timed profile run records it without inventing a drafter timing.
+            self.step_timing.forward_end()
+            self.step_timing.step_without_drafter()
             return None, None
 
         assert self.execute_model_state is not None
@@ -997,9 +1009,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
                     if self.adaptive_verification is not None:
+                        capture_sizes = self.cudagraph_manager.captured_token_counts()
+                        # Every stage must price the same shapes: the verify
+                        # curve is summed across stages.
+                        self.adaptive_verification.check_pp_profile_agreement(
+                            capture_sizes
+                        )
                         with self.step_timing.collect() as timings:
                             for batch in self.adaptive_verification.batches_to_profile(
-                                self.cudagraph_manager.captured_token_counts()
+                                capture_sizes
                             ):
                                 self._dummy_run(**batch)
                         self.adaptive_verification.set_initial_cost_curves(timings)

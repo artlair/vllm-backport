@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class StepTimingSample:
+    """One timed step. `drafter_ms` is 0.0 when the step ran no drafter."""
+
     forward_ms: float
     drafter_ms: float
     num_target_tokens: int
@@ -56,7 +58,8 @@ class StepTimingCollector:
         self._collecting = False
         self._step: StepTimingEvents | None = None
         self._batch = (False, 0, 0)
-        self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
+        # (events, (full_cudagraph, num_target_tokens, num_reqs), has_drafter)
+        self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int], bool]] = []
 
     @contextlib.contextmanager
     def collect(self) -> Iterator[list[StepTimingSample]]:
@@ -75,17 +78,27 @@ class StepTimingCollector:
         if not timed:
             return
         # Same stream, issue order: once the last step is done, so are the rest.
-        timed[-1][0].drafter_end.synchronize()
-        samples.extend(
-            StepTimingSample(
-                events.forward_start.elapsed_time(events.forward_end),
-                events.drafter_start.elapsed_time(events.drafter_end),
-                num_target_tokens,
-                num_reqs,
-                full_cudagraph,
-            )
-            for events, (full_cudagraph, num_target_tokens, num_reqs) in timed
+        # A step with no drafter never recorded its drafter events, so only its
+        # forward events can be resolved.
+        last_events, _, last_has_drafter = timed[-1]
+        terminal_event = (
+            last_events.drafter_end if last_has_drafter else last_events.forward_end
         )
+        terminal_event.synchronize()
+        for events, (full_cudagraph, num_target_tokens, num_reqs), has_drafter in timed:
+            samples.append(
+                StepTimingSample(
+                    events.forward_start.elapsed_time(events.forward_end),
+                    (
+                        events.drafter_start.elapsed_time(events.drafter_end)
+                        if has_drafter
+                        else 0.0
+                    ),
+                    num_target_tokens,
+                    num_reqs,
+                    full_cudagraph,
+                )
+            )
 
     def record_batch(self, input_batch: "InputBatch", full_cudagraph: bool) -> None:
         """Costs from different execution modes must not share a cost curve."""
@@ -108,7 +121,18 @@ class StepTimingCollector:
         """Ends the step: only steps that reach here have a draft cost."""
         if self._step is not None:
             self._step.drafter_end.record()
-            self._timed.append((self._step, self._batch))
+            self._timed.append((self._step, self._batch, True))
+            self._step = None
+
+    def step_without_drafter(self) -> None:
+        """Ends a step whose stage runs no drafter, e.g. a non-last PP stage.
+
+        Its draft cost is a true zero. Only events recorded by the step are
+        resolved on the way out, so this step cannot report an unrecorded event
+        as a duration.
+        """
+        if self._step is not None:
+            self._timed.append((self._step, self._batch, False))
             self._step = None
 
 
