@@ -63,6 +63,7 @@ from vllm.multimodal.encoder_budget import (
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -180,6 +181,9 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+# Key of the debug-only adaptive-verification plan on the PP activation
+# payload (see `_pp_adaptive_plan`).
+_PP_ADAPTIVE_PLAN_KEY = "adaptive_verification_plan"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -231,6 +235,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # PP broadcast/recv helper. Runs the collective on a side stream.
         self.pp_handler: PPHandler | None = None
+        # Compare adjacent stages' adaptive-verification plans (debug only).
+        self._pp_adaptive_debug = False
 
         # Persistent buffer for intermediate tensors (non-first PP ranks).
         self.intermediate_tensors: IntermediateTensors | None = None
@@ -653,6 +659,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pp_handler.set_adaptive_confidences(
                 self.adaptive_verification is not None
             )
+            self._pp_adaptive_debug = (
+                envs.VLLM_PP_ADAPTIVE_DEBUG and self.adaptive_verification is not None
+            )
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -1071,6 +1080,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.encoder_cache is not None:
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
                 self.encoder_cache.free_encoder_cache(mm_hash)
+
+    def _pp_adaptive_plan(self, input_batch: InputBatch) -> torch.Tensor:
+        """Pack this step's trimming decision into one small device tensor.
+
+        Debug only (`VLLM_PP_ADAPTIVE_DEBUG`). The next stage compares it
+        against its own plan: a per-token total alone would miss two stages that
+        trim the same total but different per-request blocks, so this carries the
+        request order, the query boundaries and the logits boundaries.
+        """
+        num_reqs = input_batch.num_reqs
+        plan = torch.zeros(
+            4, self.max_num_reqs + 2, dtype=torch.int32, device=self.device
+        )
+        plan[0, 0] = num_reqs
+        plan[0, 1] = input_batch.num_tokens
+        plan[1, : num_reqs + 1] = input_batch.query_start_loc[: num_reqs + 1]
+        plan[2, : num_reqs + 1] = input_batch.cu_num_logits[: num_reqs + 1]
+        plan[3, :num_reqs] = input_batch.idx_mapping.to(torch.int32)
+        return plan
+
+    def _check_pp_adaptive_plan(
+        self, received: torch.Tensor | None, input_batch: InputBatch
+    ) -> None:
+        """Compare the previous stage's plan against this rank's own plan.
+
+        Ranks that disagree would pad the same step into different graph buckets
+        and read padding rows as real tokens, silently, so this fails closed.
+        """
+        if not self._pp_adaptive_debug or received is None:
+            return
+        local = self._pp_adaptive_plan(input_batch)
+        with gpu_sync_allowed():
+            mismatch = not torch.equal(received, local)
+            if mismatch:
+                previous, own = received.cpu().tolist(), local.cpu().tolist()
+        if mismatch:
+            raise RuntimeError(
+                "Adaptive verification trimmed this PP step differently on "
+                f"adjacent stages (previous stage: {previous}, this stage: {own})"
+            )
 
     def update_pp_decode_requests(self):
         # For non-last PP ranks, update decode requests with sampler output from
@@ -1877,6 +1926,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare the intermediate tensors.
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
+            if not dummy_run:
+                # The previous stage's trimming decision rides its activation
+                # payload; it must match this stage's plan exactly.
+                self._check_pp_adaptive_plan(
+                    intermediate_tensors.tensors.pop(_PP_ADAPTIVE_PLAN_KEY, None),
+                    input_batch,
+                )
             n = input_batch.num_tokens_after_padding
             new_tensors = {
                 k: v[:n]
@@ -1984,9 +2040,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None
-            return self.pp_handler.relay_aux_hidden_states(
+            output_tensors = self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
+            if self._pp_adaptive_debug and not dummy_run:
+                # A fresh tensor, so the async activation send cannot observe a
+                # later step rewriting it. The receiving stage pops it before
+                # copying, so the model never sees it.
+                output_tensors.tensors[_PP_ADAPTIVE_PLAN_KEY] = self._pp_adaptive_plan(
+                    input_batch
+                )
+            return output_tensors
         return None
 
     @torch.inference_mode()
