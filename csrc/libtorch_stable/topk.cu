@@ -177,11 +177,22 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
       return;
     }
 
-    size_t state_bytes = num_groups * sizeof(P::RadixRowState);
-    STD_TORCH_CHECK(workspace.size(0) >= static_cast<int64_t>(state_bytes),
-                    "workspace too small, need ", state_bytes, " bytes");
+    // The device regroups the host grid over the live lengths and can spread
+    // it over up to one group per row, so every row needs a RadixRowState
+    // slot. A short workspace would silently drop rows, so require the full
+    // reservation instead of clamping the group count.
+    const size_t state_capacity =
+        static_cast<size_t>(workspace.size(0)) / sizeof(P::RadixRowState);
+    const size_t state_bytes =
+        static_cast<size_t>(num_rows) * sizeof(P::RadixRowState);
+    STD_TORCH_CHECK(state_capacity >= static_cast<size_t>(num_rows),
+                    "workspace too small for ", num_rows,
+                    " RadixRowState slots: need ", state_bytes, " bytes, got ",
+                    workspace.size(0));
 
-    // Zero the per-group RadixRowState region before launch.
+    // Zero every possible per-group RadixRowState slot before launch.
+    // The device clamps its group count to num_rows, so state_bytes covers
+    // every slot the regrouping can index.
     //
     // Issued UNCONDITIONALLY so the memset is captured as its own node in
     // the cudagraph (a separate cudaMemsetAsync node, sequenced before the
@@ -194,8 +205,8 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     // radix path, and removes one variable while debugging hangs in the
     // decode/medium paths.
     //
-    // Cost is sub-microsecond: state_bytes = num_groups * sizeof(RadixRowState)
-    // is ~3 KB per group, ~100 KB for the largest grids on this hardware.
+    // Cost is sub-microsecond: state_bytes = num_rows * sizeof(RadixRowState)
+    // is ~3 KB per row, up to ~250 KB for the largest decode batches.
     //
     // Why the memset is required (regardless of which path the kernel takes):
     //   1. arrival_counter accumulates within a launch and is never reset,
