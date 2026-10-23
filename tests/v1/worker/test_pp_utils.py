@@ -742,7 +742,7 @@ def test_confidence_relay_snapshots_before_the_side_stream_stalls(monkeypatch):
     async_outputs.append(runner.sample_tokens(None))
     payload = handler.pop_self_confidences()
     torch.accelerator.synchronize()
-    assert async_outputs
+    assert all(output is not None for output in async_outputs)
 
     assert len(sent) == 2
     for got, want in zip(sent, expected):

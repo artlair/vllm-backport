@@ -8,13 +8,15 @@ budget. The payload crosses a real gloo broadcast, so a sender and receiver
 that disagree about the four-op FIFO, the skip gate or the generation a block
 belongs to hang or fail instead of agreeing with themselves in one process.
 The consume side calls the real ``GPUModelRunner.update_pp_decode_requests``
-on a stub runner whose only non-production part is the CUDA postprocess kernel.
+on a stub runner with a hand-built manager. CUDA postprocessing is replaced,
+and budgeting uses its eager kernel body rather than the compiled wrapper;
+the send side drives the relay directly instead of running the sampler.
 
 The happy path runs at two world sizes, including a mixed batch with sampled
 decode rows and a non-final prefill row. CPU only: the CUDA
 stream/event/record_stream calls are stubbed inside the child processes. This
-proves the host-side protocol, per-row masking and generation alignment, not
-NCCL stream safety or device-side masking.
+checks cross-rank plans, payload FIFO alignment and per-row generation/mask
+filtering, not NCCL stream safety or device-side masking.
 """
 
 import multiprocessing as mp
@@ -456,29 +458,20 @@ def _drive(pp_utils, adaptive_module, rank: int, pp_size: int, case: str) -> Non
 
     # The self-ring is only a fallback for a step whose deferred payload did not
     # carry confidences (always true on the last rank, which has no queue).
-    relay = SimpleNamespace(
-        self_ring_calls=0,
-        deferred_confidences=False,
-        deferred_steps=0,
-        steps=0,
-    )
+    relay = SimpleNamespace(deferred_confidences=False)
     real_get = handler.get_prev_sampled_outputs
 
     def get_prev_sampled_outputs(draft_tokens):
-        relay.steps += 1
         outputs = real_get(draft_tokens)
         relay.deferred_confidences = (
             outputs is not None and outputs.get("confidences") is not None
         )
-        if relay.deferred_confidences:
-            relay.deferred_steps += 1
         return outputs
 
     handler.get_prev_sampled_outputs = get_prev_sampled_outputs
     real_pop_self = handler.pop_self_confidences
 
     def pop_self_confidences():
-        relay.self_ring_calls += 1
         _check(
             not relay.deferred_confidences,
             "self-ring used while the deferred payload carried confidences",
@@ -500,7 +493,7 @@ def _drive(pp_utils, adaptive_module, rank: int, pp_size: int, case: str) -> Non
     torch.distributed.broadcast = counted_broadcast
 
     used_slots = {slot for step in _SCRIPT for slot in step.slots}
-    kept_steps = {slot: set() for slot in used_slots}
+    kept_proposals = {slot: set() for slot in used_slots}
     masked_requests: set[tuple[int, int]] = set()
     mixed_consumed = False
     transition_consumed = False
@@ -526,7 +519,7 @@ def _drive(pp_utils, adaptive_module, rank: int, pp_size: int, case: str) -> Non
                 elif keep[row] and identity in masked_requests:
                     transition_consumed = True
                 if keep[row]:
-                    kept_steps[slot].add(proposal.step_index)
+                    kept_proposals[slot].add((proposal.gens[row], proposal.step_index))
 
         # Production frees and re-adds before this step's batch is planned, but
         # after the deferred payload was installed.
@@ -638,16 +631,16 @@ def _drive(pp_utils, adaptive_module, rank: int, pp_size: int, case: str) -> Non
     _check(mixed_consumed, "no mixed batch exposed a per-row sample mask")
     _check(transition_consumed, "a masked prefill row never decoded later")
     _check(
-        all(kept_steps[slot] for slot in used_slots),
-        "a request never consumed a generation",
+        all(kept_proposals[slot] for slot in used_slots),
+        "a request slot never consumed a proposal",
     )
     _check(
-        all(len(kept_steps[slot]) >= 2 for slot in used_slots),
-        "fewer than two request generations were consumed",
+        all(len(kept_proposals[slot]) >= 2 for slot in used_slots),
+        "fewer than two proposal blocks were consumed per request slot",
     )
     _check(
-        relay.self_ring_calls == relay.steps - relay.deferred_steps,
-        "self-ring fallback did not match the missing confidence payloads",
+        any(epoch == 1 for epoch, _ in kept_proposals[0]),
+        "the reused slot never consumed its new request's proposal",
     )
     torch.distributed.broadcast = real_broadcast
 
