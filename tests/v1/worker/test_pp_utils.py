@@ -163,6 +163,82 @@ def send_step(handler, input_batch, *, width: int, with_draft: bool):
         handler.broadcast_drafts(draft_tokens, input_batch)
 
 
+def make_snapshot_runner(handler, input_batch, speculator):
+    """A GPUModelRunner stub carrying only what ``sample_tokens`` reads on the
+    last PP rank, so the confidence snapshot runs in its real call site."""
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    num_reqs = input_batch.num_reqs
+    sampled = torch.zeros(num_reqs, 1, dtype=torch.int64, device="cuda")
+    num_sampled = torch.ones(num_reqs, dtype=torch.int32, device="cuda")
+    num_rejected = torch.zeros(num_reqs, dtype=torch.int32, device="cuda")
+    sampler_output = SamplerOutput(
+        sampled_token_ids=sampled,
+        logprobs_tensors=None,
+        num_nans=None,
+        num_sampled=num_sampled,
+        num_rejected=num_rejected,
+    )
+
+    runner = object.__new__(model_runner.GPUModelRunner)
+    runner.device = torch.device("cuda")
+    runner.is_last_pp_rank = True
+    runner.pcp_manager = None
+    runner.model = SimpleNamespace(compute_logits=Mock())
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.pp_handler = handler
+    runner.speculator = speculator
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(gpu=torch.ones(8, device="cuda")),
+            seeds=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int64, device="cuda")),
+        )
+    )
+    runner.req_states = SimpleNamespace(
+        draft_tokens=torch.zeros(8, 3, dtype=torch.int64, device="cuda"),
+        last_sampled_tokens=torch.zeros(8, dtype=torch.int64, device="cuda"),
+        next_prefill_tokens=torch.zeros(1, 8, dtype=torch.int64, device="cuda"),
+        all_token_ids=SimpleNamespace(
+            gpu=torch.zeros(8, dtype=torch.int64, device="cuda")
+        ),
+        num_computed_tokens=SimpleNamespace(
+            gpu=torch.zeros(8, dtype=torch.int32, device="cuda")
+        ),
+        prompt_len=SimpleNamespace(np=np.zeros(8, dtype=np.int32)),
+    )
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        compute_prompt_logprobs=lambda *args: {}
+    )
+    runner.main_stream = torch.cuda.current_stream()
+    runner.output_copy_stream = torch.cuda.Stream()
+    runner.check_ep_fault = False
+    runner.postprocess_sampled = Mock()
+    runner.adaptive_verification = SimpleNamespace(record_confidences=Mock())
+    runner.num_speculative_steps = 3
+    runner.draft_tokens_handler = Mock()
+    runner.kv_connector = Mock()
+    runner.eplb = Mock()
+    runner._draft_workspace_lane = 0
+    runner.sample = Mock(return_value=(sampler_output, num_sampled, num_rejected))
+
+    def make_execute_model_state():
+        return SimpleNamespace(
+            input_batch=input_batch,
+            attn_metadata=None,
+            slot_mappings_by_layer=None,
+            hidden_states=torch.zeros(1, 1, device="cuda"),
+            aux_hidden_states=None,
+            dp_sync=None,
+            finished_req_ids=set(),
+            ec_connector_output=None,
+            routed_experts=None,
+            cudagraph_stats=None,
+        )
+
+    runner.make_execute_model_state = make_execute_model_state
+    return runner
+
+
 @requires_cuda
 @pytest.mark.parametrize("width,num_spec", [(1, 1), (1, 3), (2, 3)])
 def test_broadcast_pads_sampled_tokens_to_max_sample_len(monkeypatch, width, num_spec):
@@ -595,6 +671,119 @@ def test_last_rank_self_ring_returns_the_payload_pushed_pp_size_steps_ago(
             input_batch,
             confidence_payload(handler, input_batch, float(step)),
         )
+
+
+def stall_fourth_broadcast(monkeypatch) -> list[torch.Tensor]:
+    """Clone each step's confidence op after a side-stream stall.
+
+    The confidence payload is the fourth broadcast of a step, so stalling only
+    that op leaves the sampled-token sends ahead of it unaffected."""
+    sent: list[torch.Tensor] = []
+    ops: list[torch.Tensor] = []
+
+    def stalling_broadcast(tensor, src, group):
+        ops.append(tensor)
+        if len(ops) % 4 == 0:
+            assert tensor.dtype == torch.float32
+            torch.cuda._sleep(100_000_000)
+            sent.append(tensor.clone())
+
+    monkeypatch.setattr(torch.distributed, "broadcast", stalling_broadcast)
+    return sent
+
+
+@requires_cuda
+def test_confidence_relay_snapshots_before_the_side_stream_stalls(monkeypatch):
+    """The speculator reuses its confidence buffer next step, while this step's
+    confidence broadcast can still be waiting on the side stream. The runner
+    must relay a snapshot, not the live buffer, or earlier stages price the
+    wrong generation. This drives the real ``sample_tokens`` snapshot path, not
+    a test-side clone, and checks both the broadcast and the last rank's
+    self-ring payload."""
+    num_reqs, num_spec = 3, 3
+    handler = make_adaptive_handler(
+        monkeypatch, is_last_rank=True, num_speculative_steps=num_spec, world_size=2
+    )
+    input_batch = make_input_batch(num_reqs=num_reqs)
+    input_batch.req_ids = [f"req-{i}" for i in range(num_reqs)]
+    input_batch.query_start_loc = torch.arange(
+        num_reqs + 1, dtype=torch.int32, device="cuda"
+    )
+
+    probs = torch.full((8, num_spec), -1.0, dtype=torch.float32, device="cuda")
+    draft_tokens = torch.zeros(8, num_spec, dtype=torch.int64, device="cuda")
+    expected: list[torch.Tensor] = []
+
+    def propose(*args, **kwargs):
+        values = torch.arange(
+            num_reqs * num_spec, dtype=torch.float32, device="cuda"
+        ).view(num_reqs, num_spec) + 100 * len(expected)
+        probs[:num_reqs] = values
+        expected.append(values)
+        return draft_tokens[:num_reqs]
+
+    speculator = SimpleNamespace(
+        supports_mm_inputs=False,
+        draft_token_confidence_probs=probs,
+        propose=propose,
+    )
+    runner = make_snapshot_runner(handler, input_batch, speculator)
+
+    sent = stall_fourth_broadcast(monkeypatch)
+
+    runner.execute_model_state = runner.make_execute_model_state()
+    async_outputs = [runner.sample_tokens(None)]
+    # The speculator reuses the live buffer before the side-stream send and its
+    # host copy can finish.
+    probs.fill_(-1.0)
+    assert handler.pop_self_confidences() is None
+
+    runner.execute_model_state = runner.make_execute_model_state()
+    async_outputs.append(runner.sample_tokens(None))
+    payload = handler.pop_self_confidences()
+    torch.accelerator.synchronize()
+    assert async_outputs
+
+    assert len(sent) == 2
+    for got, want in zip(sent, expected):
+        assert got.shape == (num_reqs, num_spec)
+        torch.testing.assert_close(got, want)
+
+    assert payload is not None
+    assert payload.idx_mapping_np.tolist() == input_batch.idx_mapping_np.tolist()
+    assert payload.confidences.shape == (num_reqs, num_spec)
+    torch.testing.assert_close(payload.confidences, expected[0])
+    torch.testing.assert_close(
+        torch.from_numpy(payload.confidences_np), expected[0].cpu()
+    )
+
+
+@requires_cuda
+def test_live_confidence_buffer_would_alias_the_next_step(monkeypatch):
+    """Negative control for the snapshot test: relaying the live buffer is not
+    safe, because the side-stream send and host copy observe next step's rewrite.
+    Kept separate so the snapshot test can assert the positive behaviour."""
+    handler = make_adaptive_handler(
+        monkeypatch, is_last_rank=True, num_speculative_steps=3, world_size=2
+    )
+    input_batch = make_input_batch(num_reqs=3)
+    sent = stall_fourth_broadcast(monkeypatch)
+    live = torch.arange(9, dtype=torch.float32, device="cuda").view(3, 3)
+
+    send_step(handler, input_batch, width=1, with_draft=False)
+    handler.broadcast_drafts(
+        torch.zeros(8, 3, dtype=torch.int64, device="cuda"), input_batch, live
+    )
+    assert handler.pop_self_confidences() is None
+    live.fill_(-1.0)
+    torch.accelerator.synchronize()
+
+    assert len(sent) == 1
+    assert (sent[0] == -1.0).all()
+    payload = handler.pop_self_confidences()
+    assert payload is not None
+    assert (payload.confidences == -1.0).all()
+    assert (payload.confidences_np == -1.0).all()
 
 
 @requires_cuda
