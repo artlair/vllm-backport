@@ -63,6 +63,7 @@ from vllm.multimodal.encoder_budget import (
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -180,6 +181,21 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+# Key of the debug-only adaptive-verification plan on the PP activation
+# payload (see `_pp_adaptive_plan`).
+_PP_ADAPTIVE_PLAN_KEY = "adaptive_verification_plan"
+
+
+def broadcast_pp_adaptive_verification_flag(enabled: bool) -> bool:
+    """Agree on the effective adaptive-verification flag across PP stages.
+
+    Only the last stage loads the draft model, so only it can confirm that the
+    checkpoint ships a confidence head. `broadcast_object` expects a local group
+    rank, and the last local rank is `world_size - 1` even when the PP group's
+    global ranks are not contiguous (e.g. [2, 6, 10, 14, 18, 22]).
+    """
+    pp_group = get_pp_group()
+    return pp_group.broadcast_object(enabled, src=pp_group.world_size - 1)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -231,6 +247,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # PP broadcast/recv helper. Runs the collective on a side stream.
         self.pp_handler: PPHandler | None = None
+        # Compare adjacent stages' adaptive-verification plans (debug only).
+        self._pp_adaptive_debug = False
 
         # Persistent buffer for intermediate tensors (non-first PP ranks).
         self.intermediate_tensors: IntermediateTensors | None = None
@@ -624,12 +642,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
-        # The speculator clears the flag at load time when the checkpoint has
-        # no confidence head, so it holds the effective value.
+        # The speculator raises at load time when the checkpoint has no
+        # confidence head, so the flag it holds is the effective value. Only the
+        # last PP rank loads the draft model, so every rank has to agree with it
+        # on whether the confidence payload rides the PP relay. Gated on the
+        # config flag so a default-off PP startup adds no collective.
+        enable_adaptive_verification = getattr(
+            self.speculator, "enable_adaptive_verification", False
+        )
+        if (
+            self.use_pp
+            and self.speculative_config is not None
+            and self.speculative_config.enable_adaptive_verification
+        ):
+            enable_adaptive_verification = broadcast_pp_adaptive_verification_flag(
+                enable_adaptive_verification
+            )
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
-            enable_adaptive_verification=getattr(
-                self.speculator, "enable_adaptive_verification", False
-            ),
+            enable_adaptive_verification=enable_adaptive_verification,
             attn_groups=self.attn_groups,
             attn_cg_support=attn_cg_support,
             req_states=self.req_states,
@@ -639,7 +669,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vllm_config=self.vllm_config,
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
+            pp_world_size=self.parallel_config.pipeline_parallel_size,
+            pp_rank=get_pp_group().rank_in_group,
         )
+        if self.use_pp and self.pp_handler is not None:
+            self.pp_handler.set_adaptive_confidences(
+                self.adaptive_verification is not None
+            )
+            self._pp_adaptive_debug = (
+                envs.VLLM_PP_ADAPTIVE_DEBUG and self.adaptive_verification is not None
+            )
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -1077,15 +1116,71 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
+    def _pp_adaptive_plan(self, input_batch: InputBatch) -> torch.Tensor:
+        """Pack this step's trimming decision into one small device tensor.
+
+        Debug only (`VLLM_PP_ADAPTIVE_DEBUG`). The next stage compares it
+        against its own plan: a per-token total alone would miss two stages that
+        trim the same total but different per-request blocks, so this carries the
+        request order, the query boundaries and the logits boundaries.
+        """
+        num_reqs = input_batch.num_reqs
+        plan = torch.zeros(
+            4, self.max_num_reqs + 2, dtype=torch.int32, device=self.device
+        )
+        plan[0, 0] = num_reqs
+        plan[0, 1] = input_batch.num_tokens
+        plan[1, : num_reqs + 1] = input_batch.query_start_loc[: num_reqs + 1]
+        plan[2, : num_reqs + 1] = input_batch.cu_num_logits[: num_reqs + 1]
+        plan[3, :num_reqs] = input_batch.idx_mapping.to(torch.int32)
+        return plan
+
+    def _check_pp_adaptive_plan(
+        self, received: torch.Tensor | None, input_batch: InputBatch
+    ) -> None:
+        """Compare the previous stage's plan against this rank's own plan.
+
+        Ranks that disagree would pad the same step into different graph buckets
+        and read padding rows as real tokens, silently, so this fails closed.
+        """
+        if not self._pp_adaptive_debug:
+            return
+        if received is None:
+            raise RuntimeError(
+                "VLLM_PP_ADAPTIVE_DEBUG is set but the previous PP stage sent no "
+                "adaptive verification plan for this step"
+            )
+        local = self._pp_adaptive_plan(input_batch)
+        with gpu_sync_allowed():
+            mismatch = not torch.equal(received, local)
+            if mismatch:
+                previous, own = received.cpu().tolist(), local.cpu().tolist()
+        if mismatch:
+            raise RuntimeError(
+                "Adaptive verification trimmed this PP step differently on "
+                f"adjacent stages (previous stage: {previous}, this stage: {own})"
+            )
+
     def update_pp_decode_requests(self):
         # For non-last PP ranks, update decode requests with sampler output from
         # the prior step in which they were scheduled (pp_size steps ago).
-        if self.pp_handler is not None:
-            outputs = self.pp_handler.get_prev_sampled_outputs(
-                self.req_states.draft_tokens
-            )
-            if outputs is not None:
-                self.postprocess_sampled(**outputs)
+        if self.pp_handler is None:
+            return
+        outputs = self.pp_handler.get_prev_sampled_outputs(self.req_states.draft_tokens)
+        confidences = None
+        if outputs is not None:
+            confidences = outputs.pop("confidences")
+            self.postprocess_sampled(**outputs)
+        if confidences is None:
+            # The last rank has no deferred queue: its own confidences ride a
+            # self-ring of the same depth so it prices the generation its peers
+            # price instead of the one it just proposed.
+            confidences = self.pp_handler.pop_self_confidences()
+        if confidences is not None:
+            assert self.adaptive_verification is not None
+            # Before this step's budget is priced and before a reused slot can
+            # be reset by add_request.
+            self.adaptive_verification.install_confidences(confidences)
 
     def warmup_pp_decode_update(self) -> None:
         """JIT-compile the kernel behind ``update_pp_decode_requests``.
@@ -1871,6 +1966,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare the intermediate tensors.
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
+            if not dummy_run:
+                # The previous stage's trimming decision rides its activation
+                # payload; it must match this stage's plan exactly.
+                self._check_pp_adaptive_plan(
+                    intermediate_tensors.tensors.pop(_PP_ADAPTIVE_PLAN_KEY, None),
+                    input_batch,
+                )
             n = input_batch.num_tokens_after_padding
             new_tensors = {
                 k: v[:n]
@@ -1978,9 +2080,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None
-            return self.pp_handler.relay_aux_hidden_states(
+            output_tensors = self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
+            if self._pp_adaptive_debug and not dummy_run:
+                # A fresh tensor, so the async activation send cannot observe a
+                # later step rewriting it. The receiving stage pops it before
+                # copying, so the model never sees it.
+                output_tensors = IntermediateTensors(
+                    output_tensors.tensors
+                    | {_PP_ADAPTIVE_PLAN_KEY: self._pp_adaptive_plan(input_batch)}
+                )
+            return output_tensors
         return None
 
     @torch.inference_mode()
@@ -2136,9 +2247,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if self.pp_handler is not None:
                     # Earlier stages never run the speculator; ship the
                     # drafts so their next verification step embeds the real
-                    # draft tokens instead of stale buffer contents.
+                    # draft tokens instead of stale buffer contents. The
+                    # confidences that score that block ride the same payload.
+                    confidences = None
+                    if self.adaptive_verification is not None:
+                        assert self.speculator is not None
+                        # Snapshot on the main stream: the speculator reuses
+                        # this buffer next step, before the side-stream send and
+                        # host copy complete.
+                        confidences = self.speculator.draft_token_confidence_probs[
+                            : input_batch.num_reqs
+                        ].clone()
                     self.pp_handler.broadcast_drafts(
-                        self.req_states.draft_tokens, input_batch
+                        self.req_states.draft_tokens, input_batch, confidences
                     )
             if draft_tokens is not None and self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(

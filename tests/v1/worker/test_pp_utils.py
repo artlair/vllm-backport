@@ -3,6 +3,7 @@
 """Which rows the PP sampled-token broadcast must carry, and the PPHandler
 sampled-token / draft-token relay under spec decode."""
 
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -354,3 +355,319 @@ def test_draft_relay_snapshots_before_the_side_stream_stalls(monkeypatch):
 
     assert len(sent) == 3
     assert (sent[2] == 7).all()
+
+
+# ---------------------------------------------------------------------------
+# Adaptive-verification confidence payload: the ring and its filtering
+# ---------------------------------------------------------------------------
+
+
+def make_confidence_ring(depth: int, num_spec: int = 2, max_num_reqs: int = 4):
+    """A CPU ring: the slot bookkeeping is device-independent."""
+    return pp_utils.AdaptiveConfidenceRing(
+        depth, max_num_reqs, num_spec, torch.device("cpu")
+    )
+
+
+def confidence_block(num_rows: int, num_spec: int, value: float) -> torch.Tensor:
+    return torch.full((num_rows, num_spec), value, dtype=torch.float32)
+
+
+def push_block(ring, value, idx_mapping_np, req_idx_gen_np, mask=None):
+    num_rows = len(idx_mapping_np)
+    if mask is None:
+        mask = np.ones(num_rows, dtype=bool)
+    return ring.push(
+        confidence_block(num_rows, ring._slots[0].host.shape[1], value),
+        idx_mapping_np,
+        req_idx_gen_np[idx_mapping_np],
+        mask,
+    )
+
+
+@pytest.mark.parametrize("depth", [1, 2, 6])
+def test_confidence_ring_keeps_every_in_flight_step_alive(depth):
+    """Each in-flight step owns its pinned block: writing step T+depth must not
+    disturb the payloads of the `depth` steps still in flight."""
+    ring = make_confidence_ring(depth)
+    req_idx_gen_np = np.zeros(4, dtype=np.int32)
+    idx_mapping_np = np.arange(4, dtype=np.intp)
+
+    slots = [
+        push_block(ring, float(step), idx_mapping_np, req_idx_gen_np)
+        for step in range(depth)
+    ]
+    assert len({id(slot) for slot in slots}) == depth
+
+    # One more push reuses the oldest slot only.
+    push_block(ring, -1.0, idx_mapping_np, req_idx_gen_np)
+    for step, slot in enumerate(slots):
+        payload = slot.collect(req_idx_gen_np)
+        assert payload is not None
+        # Only the oldest slot was reused by the extra push.
+        expected = -1.0 if step == 0 else float(step)
+        assert (payload.confidences_np == expected).all()
+        assert (payload.confidences == expected).all()
+
+
+@pytest.mark.parametrize("depth", [1, 2, 6])
+def test_confidence_ring_reads_the_payload_pushed_depth_steps_earlier(depth):
+    """The consumer of step S must see the block proposed at S-depth, which is
+    the whole alignment argument for carrying confidences on the relay."""
+    ring = make_confidence_ring(depth)
+    req_idx_gen_np = np.zeros(4, dtype=np.int32)
+    idx_mapping_np = np.arange(2, dtype=np.intp)
+    queue: deque = deque([None] * depth)
+
+    for step in range(3 * depth + 2):
+        slot = queue.popleft()
+        queue.append(None)
+        payload = ring.collect(slot, req_idx_gen_np)
+        expected = step - depth
+        if expected < 0:
+            assert payload is None
+        else:
+            assert payload is not None
+            assert (payload.confidences_np == float(expected)).all()
+        queue[-1] = push_block(ring, float(step), idx_mapping_np, req_idx_gen_np)
+
+
+def test_confidence_ring_drops_rows_freed_or_unsampled_since_push():
+    """A slot freed and reused must not receive the old request's block, and a
+    row that produces no sample must not overwrite its slot either."""
+    ring = make_confidence_ring(2)
+    req_idx_gen_np = np.zeros(4, dtype=np.int32)
+    idx_mapping_np = np.array([3, 1, 2], dtype=np.intp)
+    gen_np = req_idx_gen_np[idx_mapping_np]
+    slot = ring.push(
+        confidence_block(3, 2, 0.5),
+        idx_mapping_np,
+        gen_np,
+        np.array([True, False, True]),
+    )
+
+    # Slot 1 finishes and is reused between push and consume.
+    req_idx_gen_np[1] += 1
+    payload = slot.collect(req_idx_gen_np)
+
+    assert payload is not None
+    # Row 1 needs no sample, so it is dropped before its generation matters.
+    assert payload.idx_mapping_np.tolist() == [3, 2]
+    assert payload.confidences.shape == (2, 2)
+    assert payload.confidences_np.shape == (2, 2)
+
+    # A freed row that also needed a sample is dropped by the generation check.
+    gen_np = req_idx_gen_np[idx_mapping_np]
+    slot = ring.push(
+        confidence_block(3, 2, 0.5), idx_mapping_np, gen_np, np.ones(3, dtype=bool)
+    )
+    req_idx_gen_np[3] += 1
+    payload = slot.collect(req_idx_gen_np)
+    assert payload is not None
+    assert payload.idx_mapping_np.tolist() == [1, 2]
+
+
+def test_confidence_ring_collects_nothing_when_every_row_is_gone():
+    ring = make_confidence_ring(2)
+    req_idx_gen_np = np.zeros(4, dtype=np.int32)
+    idx_mapping_np = np.array([0, 1], dtype=np.intp)
+    slot = ring.push(
+        confidence_block(2, 2, 0.5),
+        idx_mapping_np,
+        req_idx_gen_np[idx_mapping_np],
+        np.zeros(2, dtype=bool),
+    )
+    assert slot.collect(req_idx_gen_np) is None
+
+
+# ---------------------------------------------------------------------------
+# Adaptive-verification confidence payload: on the wire
+# ---------------------------------------------------------------------------
+
+
+def make_adaptive_handler(
+    monkeypatch,
+    *,
+    is_last_rank: bool,
+    num_speculative_steps: int = 3,
+    world_size: int = 2,
+) -> PPHandler:
+    handler = make_handler(
+        monkeypatch,
+        is_last_rank=is_last_rank,
+        num_speculative_steps=num_speculative_steps,
+        world_size=world_size,
+    )
+    handler.set_adaptive_confidences(True)
+    return handler
+
+
+def confidence_payload(handler, input_batch, value: float = 0.5) -> torch.Tensor:
+    return torch.full(
+        (input_batch.num_reqs, handler.num_speculative_steps),
+        value,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+
+@requires_cuda
+def test_adaptive_confidence_payload_is_the_fourth_broadcast(monkeypatch):
+    """The confidences ride the same FIFO as the block they score, so the ops
+    must line up strictly by order on both sides."""
+    input_batch = make_input_batch(num_reqs=2)
+    sender = make_adaptive_handler(monkeypatch, is_last_rank=True)
+    calls = record_broadcasts(monkeypatch, fill_value=7)
+    sampled = torch.zeros(2, 1, dtype=torch.int64, device="cuda")
+    counts = torch.zeros(2, dtype=torch.int32, device="cuda")
+    sender.broadcast(sampled, counts, counts, input_batch)
+    sender.broadcast_drafts(
+        torch.zeros(8, 3, dtype=torch.int64, device="cuda"),
+        input_batch,
+        confidence_payload(sender, input_batch),
+    )
+    assert len(calls) == 4
+    assert calls[3].shape == (2, sender.num_speculative_steps)
+    assert calls[3].dtype == torch.float32
+
+    receiver = make_adaptive_handler(monkeypatch, is_last_rank=False)
+    calls.clear()
+    assert receiver.receive(input_batch)
+    assert len(calls) == 4
+    assert calls[3].shape == (2, sender.num_speculative_steps)
+
+    # The first consume is the pre-seeded placeholder; the second one is this
+    # step's payload.
+    assert receiver.get_prev_sampled_outputs() is None
+    outputs = receiver.get_prev_sampled_outputs()
+    assert outputs is not None
+    confidences = outputs.pop("confidences")
+    assert confidences is not None
+    assert confidences.idx_mapping_np.tolist() == input_batch.idx_mapping_np.tolist()
+    assert (confidences.confidences_np == 7.0).all()
+    assert (confidences.confidences == 7.0).all()
+
+
+@requires_cuda
+def test_adaptive_confidence_payload_follows_the_skip_gate(monkeypatch):
+    """No sample this step means no payload either; a rank that posted the
+    extra broadcast would desynchronize the pp_broadcast FIFO."""
+    input_batch = make_input_batch(needs_sample=False)
+
+    sender = make_adaptive_handler(monkeypatch, is_last_rank=True)
+    calls = record_broadcasts(monkeypatch, fill_value=7)
+    sender.broadcast_drafts(
+        torch.zeros(8, 3, dtype=torch.int64, device="cuda"),
+        input_batch,
+        confidence_payload(sender, input_batch),
+    )
+    assert calls == []
+    assert sender.pop_self_confidences() is None
+
+    receiver = make_adaptive_handler(monkeypatch, is_last_rank=False)
+    calls.clear()
+    assert not receiver.receive(input_batch)
+    assert calls == []
+
+
+@requires_cuda
+def test_last_rank_self_ring_returns_the_payload_pushed_pp_size_steps_ago(
+    monkeypatch,
+):
+    """The last rank has no deferred queue, so it must replay its own payload
+    through a ring of the same depth rather than read the fresh one."""
+    pp_size = 3
+    handler = make_adaptive_handler(
+        monkeypatch, is_last_rank=True, num_speculative_steps=2, world_size=pp_size
+    )
+    record_broadcasts(monkeypatch, fill_value=None)
+    input_batch = make_input_batch(num_reqs=2)
+
+    for step in range(2 * pp_size + 1):
+        payload = handler.pop_self_confidences()
+        if step < pp_size:
+            assert payload is None
+        else:
+            assert payload is not None
+            assert (payload.confidences_np == float(step - pp_size)).all()
+        handler.broadcast_drafts(
+            torch.zeros(8, 2, dtype=torch.int64, device="cuda"),
+            input_batch,
+            confidence_payload(handler, input_batch, float(step)),
+        )
+
+
+@requires_cuda
+def test_adaptive_confidences_fail_closed_without_a_payload(monkeypatch):
+    """A draft block without its confidences would let the ranks price
+    different generations, so the relay refuses to post it."""
+    handler = make_adaptive_handler(monkeypatch, is_last_rank=True)
+    record_broadcasts(monkeypatch)
+    with pytest.raises(AssertionError):
+        handler.broadcast_drafts(
+            torch.zeros(8, 3, dtype=torch.int64, device="cuda"), make_input_batch()
+        )
+
+
+def test_pp_adaptive_plan_debug_compare_covers_per_request_boundaries():
+    """A total-token check alone would miss stages that trim the same total into
+    different per-request blocks, so the debug plan carries the request order,
+    the query boundaries and the logits boundaries."""
+    runner = object.__new__(model_runner.GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.max_num_reqs = 4
+    runner._pp_adaptive_debug = True
+
+    def batch(query_start_loc, cu_num_logits, idx_mapping, num_tokens=5):
+        return SimpleNamespace(
+            num_reqs=len(query_start_loc) - 1,
+            num_tokens=num_tokens,
+            query_start_loc=torch.tensor(query_start_loc, dtype=torch.int32),
+            cu_num_logits=torch.tensor(cu_num_logits, dtype=torch.int32),
+            idx_mapping=torch.tensor(idx_mapping, dtype=torch.int64),
+        )
+
+    batch_state = batch([0, 3, 5], [0, 2, 3], [1, 0])
+    plan = runner._pp_adaptive_plan(batch_state)
+    assert plan[0, :2].tolist() == [2, 5]
+    assert plan[3, :2].tolist() == [1, 0]
+
+    # Same total, different per-request split.
+    runner._check_pp_adaptive_plan(plan, batch_state)
+    with pytest.raises(RuntimeError):
+        runner._check_pp_adaptive_plan(plan, batch([0, 2, 5], [0, 2, 3], [1, 0]))
+
+    # A stage that forgot to send the plan must not pass silently.
+    with pytest.raises(RuntimeError):
+        runner._check_pp_adaptive_plan(None, batch_state)
+
+    # The flag is required; without it the payload is neither sent nor checked.
+    runner._pp_adaptive_debug = False
+    runner._check_pp_adaptive_plan(plan, batch([0, 2, 5], [0, 2, 3], [1, 0]))
+    runner._check_pp_adaptive_plan(None, batch_state)
+
+
+def test_pp_adaptive_flag_broadcast_uses_the_last_local_rank(monkeypatch):
+    """`GroupCoordinator.broadcast_object` takes a local group rank, while
+    `PPHandler` needs the global last rank for its NCCL broadcast. On a
+    non-contiguous PP group (TP4 x PP6) the two differ, and passing the global
+    rank here trips the coordinator's `src < world_size` assert."""
+
+    class FakePPGroup:
+        world_size = 6
+        ranks = [2, 6, 10, 14, 18, 22]
+        last_rank = 22
+
+        def broadcast_object(self, obj, src):
+            assert 0 <= src < self.world_size, f"invalid local src rank ({src})"
+            self.src_global_rank = self.ranks[src]
+            # Only the last stage knows the effective value.
+            return obj if src != self.world_size - 1 else False
+
+    pp_group = FakePPGroup()
+    monkeypatch.setattr(model_runner, "get_pp_group", lambda: pp_group)
+
+    # A non-last stage sees the last stage's answer.
+    assert model_runner.broadcast_pp_adaptive_verification_flag(True) is False
+    assert pp_group.src_global_rank == 22
+    assert model_runner.broadcast_pp_adaptive_verification_flag(False) is False

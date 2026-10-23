@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
     from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.pp_utils import PendingConfidences
     from vllm.v1.worker.gpu.states import RequestState
     from vllm.v1.worker.utils import AttentionGroup
 
@@ -216,6 +217,8 @@ class AdaptiveVerificationManager:
         query_start_loc: torch.Tensor,
         num_bonus_tokens: int,
         max_total_logits: int,
+        pp_world_size: int = 1,
+        pp_rank: int = 0,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -245,6 +248,18 @@ class AdaptiveVerificationManager:
         self._num_non_draft_tokens = torch.empty_like(query_start_loc[:-1])
         self._cu_num_logits = torch.empty_like(query_start_loc)
 
+        # Under PP every rank prices the generation this step verifies, which
+        # arrives through the relay's confidence payload. That payload is the
+        # only writer of this per-request host table, so all ranks read the same
+        # values for the same generation.
+        self.pp_world_size = pp_world_size
+        self.pp_rank = pp_rank
+        self._confidence_cpu: np.ndarray | None = None
+        if pp_world_size > 1:
+            self._confidence_cpu = np.ones(
+                (max_num_reqs, self.num_speculative_steps), dtype=np.float32
+            )
+
         # Two D2H slots preserve stale inputs for budget selection.
         self._stale_confidences = [
             CpuGpuBuffer(
@@ -262,9 +277,49 @@ class AdaptiveVerificationManager:
             slot.np.fill(1.0)
 
     def add_request(self, req_idx: int) -> None:
-        self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
-        self._pending_resets.append(req_idx)
+        if self._confidence_cpu is not None:
+            # The install runs before requests are added, so a slot reused by a
+            # new request never inherits its predecessor's block.
+            self._confidence_cpu[req_idx] = 1.0
+        else:
+            self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
+            self._pending_resets.append(req_idx)
         self._confidence_probs[req_idx].fill_(1.0)
+
+    def install_confidences(self, payload: "PendingConfidences") -> None:
+        """Adopt the confidences of the generation this step verifies.
+
+        Called on every PP rank with the payload the draft relay carried, before
+        the budget prices it and before requests can be added or freed.
+        """
+        assert self._confidence_cpu is not None
+        assert payload.confidences.shape[1] == self.num_speculative_steps
+        assert payload.confidences_np.shape == payload.confidences.shape
+        assert payload.idx_mapping_np.shape == (payload.confidences.shape[0],)
+        if payload.confidences.shape[0] == 0:
+            return
+        # Fail closed on rows that cannot be survival probabilities: a NaN or an
+        # out-of-range value would silently collapse the budget.
+        assert np.isfinite(payload.confidences_np).all(), (
+            "adaptive verification received non-finite draft confidences"
+        )
+        assert (payload.confidences_np >= 0.0).all(), (
+            "adaptive verification received negative draft confidences"
+        )
+        assert (payload.confidences_np <= 1.0).all(), (
+            "adaptive verification received draft confidences above one"
+        )
+        idx_mapping_np = payload.idx_mapping_np
+        if self._confidence_probs.is_cuda:
+            # A NumPy index would stage an unpinned H2D copy, which the GPU sync
+            # checker flags in the middle of the step.
+            idx_mapping = async_copy_to_gpu(
+                idx_mapping_np, device=self.req_states.device
+            )
+        else:
+            idx_mapping = idx_mapping_np
+        self._confidence_probs[idx_mapping] = payload.confidences
+        self._confidence_cpu[idx_mapping_np] = payload.confidences_np
 
     def batches_to_profile(self, capture_sizes: list[int]) -> Iterator[dict[str, int]]:
         """Dummy-run kwargs whose step timings seed the cost tables.
@@ -419,6 +474,13 @@ class AdaptiveVerificationManager:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
         num_reqs = input_batch.num_reqs
+        if self._confidence_cpu is not None:
+            # Under PP the relay payload is the only writer of both tables: this
+            # step's block reaches every rank, this one included, when the step
+            # that verifies it runs. Publishing it here would leave this rank a
+            # generation ahead of its peers on any step that proposes without
+            # shipping a payload.
+            return
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()
@@ -466,8 +528,12 @@ class AdaptiveVerificationManager:
             dtype=np.int32,
             count=len(req_ids),
         )
-        stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
-        survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+        host_confidences = (
+            self._confidence_cpu[slots]
+            if self._confidence_cpu is not None
+            else self._stale_confidences[self._stale_idx].np[slots]
+        )
+        survival_probability = np.cumprod(host_confidences.astype(np.float64), axis=1)
         steps = np.arange(self.num_speculative_steps)
         valid = steps[None, :] < scheduled_drafts[:, None]
         scores = np.sort(survival_probability[valid])[::-1]
@@ -622,6 +688,8 @@ def maybe_create_adaptive_verification_manager(
     vllm_config: "VllmConfig",
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
+    pp_world_size: int = 1,
+    pp_rank: int = 0,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -666,4 +734,6 @@ def maybe_create_adaptive_verification_manager(
         query_start_loc,
         num_bonus_tokens,
         max_total_logits=max_total_logits,
+        pp_world_size=pp_world_size,
+        pp_rank=pp_rank,
     )
