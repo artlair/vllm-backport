@@ -129,11 +129,14 @@ class DSparkSpeculator(DFlashSpeculator):
         # fused step covers -- it reduces the logit row instead of emitting it.
         # `_validate_local_argmax_reduction` rejects the other combination
         # outright, but it runs after this method, so the condition is spelled
-        # out here rather than assumed.
+        # out here rather than assumed. Adaptive verification's budget reads the
+        # per-position confidences the eager loop publishes, and the fused step
+        # returns before that write, so it is built only when nothing reads them.
         if (
             self.use_local_argmax_reduction
             and self.draft_logits is None
             and envs.VLLM_DSPARK_FUSED_MARKOV
+            and not self.enable_adaptive_verification
         ):
             self._fused_markov = build_fused_markov_sampler(
                 model, self.max_num_reqs, self.num_speculative_steps, self.device
