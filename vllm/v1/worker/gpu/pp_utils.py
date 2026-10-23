@@ -541,6 +541,7 @@ class PPHandler:
                 torch.distributed.broadcast(
                     confidences, src=self.last_rank, group=self.broadcast_group
                 )
+                confidences.record_stream(self.broadcast_stream)
                 gen_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
                 self._self_confidences[-1] = self._conf_ring.push(
                     confidences,
