@@ -784,7 +784,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn: bool = False,
         uniform_decode: bool = False,
         # Request count override, e.g. for decode-shaped cost profiling. Defaults
-        # to one token per request.
+        # to the widest batch the token count and max_num_reqs allow.
         num_reqs: int | None = None,
         context_len: int = 0,
         skip_eplb: bool = False,
@@ -798,11 +798,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Create a dummy scheduler output.
+        # An explicit request count is a profiling shape, e.g. a decode-shaped cost
+        # batch. A graph descriptor may reserve more requests than that, so pass
+        # the count through to execute_model instead of letting the descriptor
+        # overwrite it.
+        actual_num_reqs = num_reqs
         if num_reqs is None:
             num_reqs = min(num_tokens, self.max_num_reqs)
         elif not 0 < num_reqs <= num_tokens:
             raise ValueError(
                 f"num_reqs={num_reqs} does not fit a {num_tokens}-token dummy batch."
+            )
+        elif num_reqs > self.max_num_reqs:
+            raise ValueError(
+                f"num_reqs={num_reqs} exceeds max_num_reqs={self.max_num_reqs}."
             )
         if uniform_decode:
             # HACK(lucas): for now since the worker is shared between MRV1 and MRV2,
@@ -812,6 +821,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens = max(num_tokens, self.decode_query_len)
             num_reqs = num_tokens // self.decode_query_len
             assert num_tokens % self.decode_query_len == 0
+            # The uniform decode shape replaces the caller's request count.
+            actual_num_reqs = None
         # Distribute the remainder evenly so no dummy request exceeds
         # ceil(num_tokens / num_reqs) <= max_model_len tokens.
         num_tokens_per_request = [
@@ -853,6 +864,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_profile=is_profile,
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
+                dummy_num_reqs=actual_num_reqs,
             )
         self.kv_connector.set_disabled(False)
 
@@ -1582,7 +1594,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def prepare_dummy_attn(
         self, input_batch: InputBatch, valid_state_slots: bool = False
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        block_tables = self.block_tables.get_dummy_block_tables(input_batch.num_reqs)
+        # Request padding is invisible to every consumer: padded rows stay zeroed,
+        # so reserving them costs nothing but keeps descriptor-shaped metadata
+        # (e.g. FULL replay) backed by real rows.
+        block_tables = self.block_tables.get_dummy_block_tables(
+            input_batch.num_reqs_after_padding
+        )
         if valid_state_slots:
             state_slots = torch.arange(
                 1,
@@ -1596,6 +1613,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, self.block_tables, input_batch.num_tokens
         )
         return block_tables, slot_mappings
+
+    def _make_dummy_input_batch(
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        num_reqs: int,
+        dummy_num_reqs: int | None,
+    ) -> InputBatch:
+        """Build the request state of a dummy execute_model call.
+
+        A varlen graph descriptor reserves the worst-case request count for its
+        token count, so an explicit dummy_num_reqs keeps the batch's real request
+        count and pads only the request axis, the way prepare_inputs does. The
+        step timing and the drafter both read num_reqs, so they must see the real
+        count. Without the override the descriptor's padded count is the batch's
+        own, which is how prompt and memory-profile dummy runs are shaped.
+        """
+        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        if dummy_num_reqs is None:
+            num_reqs_padded = max(num_reqs_padded, num_reqs)
+            dummy_num_reqs = num_reqs_padded
+        else:
+            assert dummy_num_reqs <= num_reqs_padded, (
+                f"dummy_num_reqs={dummy_num_reqs} exceeds the "
+                f"{num_reqs_padded}-request batch descriptor."
+            )
+        return InputBatch.make_dummy(
+            dummy_num_reqs,
+            batch_desc.num_tokens,
+            self.input_buffers,
+            max_query_len=batch_desc.max_query_len,
+            num_reqs_after_padding=num_reqs_padded,
+        )
 
     def sample(
         self,
@@ -1728,6 +1777,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
+        # Actual request count of a dummy batch. A graph descriptor pads the
+        # request axis to its worst case, so profiling a small decode-shaped batch
+        # through a wider descriptor needs this to keep the shape it asked for.
+        dummy_num_reqs: int | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
@@ -1835,12 +1888,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
-            dummy_num_reqs = batch_desc.num_reqs or num_reqs
-            input_batch = InputBatch.make_dummy(
-                dummy_num_reqs,
-                batch_desc.num_tokens,
-                self.input_buffers,
-                max_query_len=batch_desc.max_query_len,
+            input_batch = self._make_dummy_input_batch(
+                batch_desc, num_reqs, dummy_num_reqs
             )
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(

@@ -9,9 +9,18 @@ import torch
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.gpu import cp_utils
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
 
 DEVICE = current_platform.device_type
+
+
+class _FakeBlockTables:
+    """The attributes set_dummy_context reads, with CPU tensors."""
+
+    def __init__(self, num_rows: int, num_blocks: int, block_size: int = 16) -> None:
+        self.input_block_tables = [torch.zeros(num_rows, num_blocks, dtype=torch.int32)]
+        self.kernel_block_sizes = [block_size]
+        self.blocks_per_kv_block = [1]
 
 
 @pytest.mark.parametrize(
@@ -54,6 +63,72 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     assert torch.equal(
         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
     )
+
+
+def test_make_dummy_reserves_descriptor_requests_without_filling_them():
+    """A varlen decode descriptor reserves one request slot per token.
+
+    A 5-row graph reserves 5 request slots, so the cost profiler's 1 request x
+    5 tokens batch has to replay it with padding. Only the live request may hold
+    tokens; the padded rows stay zero, exactly as for a padded real batch, or
+    attention reads rows the profiled batch never filled.
+    """
+    buffers = InputBuffers(max_num_reqs=5, max_num_tokens=5, device=torch.device("cpu"))
+    batch = InputBatch.make_dummy(
+        1, 5, buffers, max_query_len=6, num_reqs_after_padding=5
+    )
+
+    assert batch.num_reqs == 1
+    assert batch.num_reqs_after_padding == 5
+    assert batch.num_scheduled_tokens.tolist() == [5]
+    assert batch.seq_lens.tolist() == [5, 0, 0, 0, 0]
+    assert batch.seq_lens_cpu_upper_bound.tolist() == [5, 0, 0, 0, 0]
+    # The padded query slot repeats the token total.
+    assert batch.query_start_loc_np.tolist() == [0, 5, 5, 5, 5, 5]
+    # Logits and sample ids cover the live request only.
+    assert batch.logits_indices.tolist() == [4]
+    assert batch.cu_num_logits_np.tolist() == [0, 1]
+    assert batch.num_tokens == 5
+    assert batch.num_tokens_after_padding == 5
+
+
+def test_make_dummy_rejects_request_padding_wider_than_the_buffers():
+    """Request padding cannot exceed the configured request slots."""
+    buffers = InputBuffers(max_num_reqs=4, max_num_tokens=5, device=torch.device("cpu"))
+
+    with pytest.raises(AssertionError):
+        InputBatch.make_dummy(1, 5, buffers, num_reqs_after_padding=5)
+
+
+@pytest.mark.parametrize("num_reqs_after_padding", [1, 5])
+def test_set_dummy_context_applies_context_to_live_requests_only(
+    num_reqs_after_padding: int,
+):
+    """Profiled context must not leak into graph-reserved request rows.
+
+    seq_len 0 is what makes attention skip a row, so adding context to the
+    padded rows would make a 1-request profiling batch attend on 5.
+    """
+    buffers = InputBuffers(max_num_reqs=5, max_num_tokens=5, device=torch.device("cpu"))
+    batch = InputBatch.make_dummy(
+        1, 5, buffers, max_query_len=5, num_reqs_after_padding=num_reqs_after_padding
+    )
+    block_tables = _FakeBlockTables(num_rows=5, num_blocks=8)
+
+    set_dummy_context(batch, block_tables, 32, num_kv_blocks=64, max_model_len=1024)
+
+    padded_rows = num_reqs_after_padding - 1
+    assert batch.seq_lens.tolist() == [37] + [0] * padded_rows
+    assert batch.seq_lens_cpu_upper_bound.tolist() == [37] + [0] * padded_rows
+    assert batch.num_computed_tokens_np.tolist() == [32]
+    assert batch.num_computed_prefill_tokens_np.tolist() == [32]
+    # Every live token row is positioned after the context.
+    assert batch.positions.tolist() == [32, 33, 34, 35, 36]
+    assert batch.query_start_loc_np.tolist() == [0, 5] + [5] * padded_rows
+    assert batch.logits_indices.tolist() == [4]
+    block_table = block_tables.input_block_tables[0]
+    assert block_table[0].tolist() == [0, 1, 2] + [0] * 5
+    assert block_table[1:].count_nonzero() == 0
 
 
 def test_maybe_prepare_dcp_local_seq_lens_uses_shared_buffer(monkeypatch):
