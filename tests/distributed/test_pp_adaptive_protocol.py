@@ -59,14 +59,14 @@ _SCRIPT = (
     _Step((0, 1, 2), (2, 2, 2)),
     # Reordered batch and a request whose draft capacity shrank.
     _Step((2, 0, 1), (1, 2, 2)),
-    # Mixed step: slot 1 is a non-final prefill row and schedules no drafts.
-    # Verification rows stay at the front, as production sorts them.
-    _Step((0, 2, 1), (2, 2, 0), nonfinal_prefill=(1,)),
+    # Keep slots 1 and 2 alive through the six-step relay, so the mixed
+    # payload retains a sampled row and a masked prefill row on consumption.
+    _Step((0, 1, 2), (2, 2, 0), nonfinal_prefill=(2,)),
     # All-prefill step; slot 0 is freed and reused at the same point.
     _Step((0, 1, 2), nonfinal_prefill=(0, 1, 2), free=(0,)),
-    # Slot 1's first decode row after its prefill chunk.
+    # Slot 2's first decode row after its prefill chunk.
     _Step((1, 2, 0), (2, 2, 2)),
-    _Step((0, 2), (2, 1), free=(1,)),
+    _Step((0, 2), (2, 1)),
     _Step((2, 1, 0), (1, 1, 1)),
     _Step((0, 1, 2), (2, 2, 2)),
 ) + (_Step(()),) * 6
@@ -219,7 +219,7 @@ def _make_batch(step: _Step):
     return SimpleNamespace(
         num_reqs=num_reqs,
         num_computed_tokens_np=np.where(nonfinal, 0, 100).astype(np.int32),
-        prefill_len_np=np.where(nonfinal, 4096, 100).astype(np.int32),
+        prefill_len_np=np.full(num_reqs, 100, dtype=np.int32),
         num_scheduled_tokens=np.where(nonfinal, 4, capacities + 1).astype(np.int32),
         idx_mapping=torch.tensor(step.slots, dtype=torch.int64),
         idx_mapping_np=np.array(step.slots, dtype=np.intp),
@@ -501,7 +501,7 @@ def _drive(pp_utils, adaptive_module, rank: int, pp_size: int, case: str) -> Non
 
     used_slots = {slot for step in _SCRIPT for slot in step.slots}
     kept_steps = {slot: set() for slot in used_slots}
-    masked_slots: set[int] = set()
+    masked_requests: set[tuple[int, int]] = set()
     mixed_consumed = False
     transition_consumed = False
 
@@ -519,10 +519,11 @@ def _drive(pp_utils, adaptive_module, rank: int, pp_size: int, case: str) -> Non
         if consumed is not None:
             proposal, keep = consumed
             for row, slot in enumerate(proposal.slots):
-                if not proposal.need_sampled[row]:
-                    mixed_consumed = True
-                    masked_slots.add(slot)
-                elif keep[row] and slot in masked_slots:
+                identity = (slot, proposal.gens[row])
+                if not proposal.need_sampled[row] and test_gen[slot] == identity[1]:
+                    mixed_consumed = bool(keep.any()) or mixed_consumed
+                    masked_requests.add(identity)
+                elif keep[row] and identity in masked_requests:
                     transition_consumed = True
                 if keep[row]:
                     kept_steps[slot].add(proposal.step_index)
