@@ -770,6 +770,7 @@ def test_decode_cadence_is_per_request_under_pp(pp_size: int):
 
     # The requests keep different phases, so the spacing is per request rather
     # than a gate on the scheduler as a whole.
+    assert appearances[second.request_id][0] < appearances[first.request_id][-1]
     assert (appearances[second.request_id][0] - first_step) % pp_size != 0
 
 
