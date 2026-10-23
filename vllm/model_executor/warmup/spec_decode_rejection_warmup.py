@@ -43,6 +43,9 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
     rejection_method = getattr(spec_config, "rejection_sample_method", None)
     use_block_verification = rejection_method == "block"
     use_synthetic = rejection_method == "synthetic"
+    fly_window_size = (
+        (spec_config.fly_window_size or 0) if rejection_method == "fly" else 0
+    )
 
     device = worker.device
     num_reqs = 1
@@ -103,6 +106,9 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
                 synthetic_conditional_rates=synthetic_rates,
                 use_fp64=False,
                 use_block_verification=use_block_verification,
+                fly_window_size=fly_window_size,
+                fly_entropy_threshold=spec_config.fly_entropy_threshold,
+                fly_entropy_top_k=spec_config.fly_entropy_top_k,
             )
         except Exception:
             logger.warning(
