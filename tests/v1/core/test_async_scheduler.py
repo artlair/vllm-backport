@@ -685,6 +685,94 @@ def test_reset_prefix_cache_with_inflight_output_under_kv_pressure(pp_size: int)
         assert getattr(req, "num_stale_output_tokens", 0) == 0
 
 
+@pytest.mark.parametrize("pp_size", [2, 6])
+def test_decode_cadence_is_per_request_under_pp(pp_size: int):
+    """Grant a request a decode step once per pp_size global scheduler steps.
+
+    Records which requests the real AsyncScheduler.schedule actually grants
+    while PipelinedEngine runs pp_size+1 concurrent batches. A request must not
+    recur before its pp_size boundary, must return exactly at that boundary,
+    and zero-token engine iterations in between must not shift it. Two
+    staggered requests hold different phases, so the spacing is per request,
+    not a batch-wide gate.
+
+    The worker-side sampled-token broadcast ring has pp_size slots, so a
+    request scheduled sooner would reuse a slot still holding its previous
+    generation. Fails if Scheduler.schedule's eligibility check or
+    AsyncScheduler._update_after_schedule's next_decode_eligible_step
+    assignment is removed: every request then decodes every step. CPU-only
+    scheduler test; no worker or GPU is constructed.
+    """
+    num_spec = 1
+    prompt_len = 4
+    max_tokens = 8
+    scheduler = _create_async_pp_scheduler(num_spec=num_spec, pp_size=pp_size)
+    requests = create_requests(
+        num_requests=2, num_tokens=prompt_len, max_tokens=max_tokens, ignore_eos=True
+    )
+    first, second = requests
+    scheduler.add_request(first)
+
+    # Observe scheduling decisions through the public schedule() output, not
+    # the internal eligibility field.
+    scheduled: dict[int, dict[str, int]] = {}
+    schedule = scheduler.schedule
+
+    def recording_schedule(*args, **kwargs):
+        output = schedule(*args, **kwargs)
+        scheduled[scheduler.current_step] = dict(output.num_scheduled_tokens)
+        return output
+
+    scheduler.schedule = recording_schedule
+
+    # Admit the second request one step off the first request's decode phase,
+    # after a few already-scheduled empty steps.
+    second_added = False
+
+    def stagger_arrival(step: int, engine: PipelinedEngine) -> None:
+        nonlocal second_added
+        if not second_added and scheduler.current_step == 2 * pp_size + 1:
+            second_added = True
+            scheduler.add_request(second)
+
+    engine = PipelinedEngine(scheduler, queue_size=pp_size + 1)
+    engine.run(before_step=stagger_arrival)
+
+    assert second_added
+    appearances: dict[str, list[int]] = {}
+    for req in requests:
+        steps = sorted(
+            step for step, tokens in scheduled.items() if req.request_id in tokens
+        )
+        # Full prefill, then at least four decode generations.
+        assert len(steps) >= 5, (req.request_id, steps)
+        assert scheduled[steps[0]][req.request_id] == prompt_len
+        # Scheduled exactly at each pp_size boundary and on no step before it.
+        assert steps == [steps[0] + k * pp_size for k in range(len(steps))], (
+            req.request_id,
+            steps,
+        )
+        appearances[req.request_id] = steps
+        assert req.is_finished()
+        assert req.num_output_tokens == max_tokens
+
+    # Zero-token iterations occur while the first request is mid-cadence and do
+    # not pull its next decode forward or delay it.
+    first_step, last_step = (
+        appearances[first.request_id][0],
+        appearances[first.request_id][-1],
+    )
+    assert any(
+        not tokens
+        for step, tokens in scheduled.items()
+        if first_step < step < last_step
+    )
+
+    # The requests keep different phases, so the spacing is per request rather
+    # than a gate on the scheduler as a whole.
+    assert (appearances[second.request_id][0] - first_step) % pp_size != 0
+
+
 def test_requires_kv_delivery_defaults_to_producer_role():
     # No connector: nothing is handed off, so keep the lossless deliver-stale
     # path on preemption.
