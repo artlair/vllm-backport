@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from multiprocessing import connection
+from queue import Queue
 from threading import Event
 from types import SimpleNamespace
 
@@ -144,6 +145,62 @@ def test_freeze_gc_after_clean_rocm_engine_core_shutdown(
         EngineCoreProc.run_engine_core(vllm_config=vllm_config)
 
     assert calls == expected_calls
+
+
+def test_run_engine_core_reports_engine_dead_on_cancelled_step(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[str] = []
+    output_queue: Queue = Queue()
+
+    class _StoppedOutputThread:
+        def join(self, timeout: float | None = None) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return False
+
+    def run_busy_loop():
+        raise RuntimeError("cancelled")
+
+    def shutdown():
+        calls.append("shutdown")
+
+    def fake_init(self, *args, **kwargs):
+        self.output_queue = output_queue
+        self.output_thread = _StoppedOutputThread()
+        self.run_busy_loop = run_busy_loop
+        self.shutdown = shutdown
+
+    vllm_config = SimpleNamespace(
+        shutdown_timeout=0,
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            numa_bind=False,
+            reconfigure_for_independent_dp_rank=lambda: None,
+        ),
+    )
+
+    for name in (
+        "maybe_register_config_serialize_by_value",
+        "set_process_title",
+        "maybe_init_worker_tracer",
+        "decorate_logs",
+    ):
+        monkeypatch.setattr(core_module, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(core_module.EngineCoreProc, "__init__", fake_init)
+    monkeypatch.setattr(
+        core_module,
+        "SignalCallback",
+        lambda callback: SimpleNamespace(trigger=lambda: None, stop=lambda: None),
+    )
+    monkeypatch.setattr(core_module.signal, "signal", lambda *args: None)
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        EngineCoreProc.run_engine_core(vllm_config=vllm_config)
+
+    assert output_queue.get_nowait() == EngineCoreProc.ENGINE_CORE_DEAD
+    assert calls == ["shutdown"]
 
 
 class _FinishedProcess:
