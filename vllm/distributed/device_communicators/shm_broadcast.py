@@ -647,6 +647,8 @@ class MessageQueue:
         start_time = time.monotonic()
         n_warning = 1
         while True:
+            if self.shutting_down:
+                raise RuntimeError("cancelled")
             with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
 
                 def check():
@@ -666,6 +668,9 @@ class MessageQueue:
 
                     # Release the processor to other threads
                     sched_yield()
+
+                    if self.shutting_down:
+                        raise RuntimeError("cancelled")
 
                     # if we time out, raise an exception
                     elapsed = time.monotonic() - start_time
@@ -820,6 +825,8 @@ class MessageQueue:
     def enqueue(self, obj, timeout: float | None = None):
         """Write to message queue with optional timeout (in seconds)"""
         assert self._is_writer, "Only writers can enqueue"
+        if self.shutting_down:
+            raise RuntimeError("cancelled")
         all_buffers: list[SizedBuffer] = [b""]
         total_bytes = 6  # 2 bytes for oob buffer count, 4 for main buffer size
 
@@ -850,6 +857,8 @@ class MessageQueue:
             pickler.dispatch_table = dispatch_table
             pickler.dump(obj)
             all_buffers[0] = bio.getvalue()
+        if self.shutting_down:
+            raise RuntimeError("cancelled")
         if self.n_local_reader > 0:
             if total_bytes + len(all_buffers[0]) >= self.buffer.max_chunk_bytes:
                 with self.acquire_write(timeout) as buf:

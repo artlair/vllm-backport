@@ -633,6 +633,97 @@ def test_acquire_read_releases_slot_when_reader_raises():
         reader.shutdown()
 
 
+def test_acquire_write_unblocks_on_shutdown():
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    result = {}
+    blocked = threading.Event()
+    write_thread = None
+
+    def acquire_write_in_thread():
+        try:
+            with writer.acquire_write(timeout=2):
+                result["acquired"] = True
+        except Exception as exc:
+            result["exc"] = exc
+
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        writer.enqueue({"payload": "first"})
+
+        # The full ring still reports a timeout before shutdown.
+        with pytest.raises(TimeoutError), writer.acquire_write(timeout=0.01):
+            pass
+
+        with mock.patch.object(shm_broadcast, "sched_yield", side_effect=blocked.set):
+            write_thread = threading.Thread(target=acquire_write_in_thread, daemon=True)
+            write_thread.start()
+            assert blocked.wait(timeout=5)
+            writer.shutdown()
+            write_thread.join(timeout=5)
+
+        assert not write_thread.is_alive()
+        assert "acquired" not in result
+        assert isinstance(result.get("exc"), RuntimeError)
+        assert "cancelled" in str(result["exc"])
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+        if write_thread is not None:
+            write_thread.join(timeout=5)
+
+
+def test_enqueue_after_shutdown_rejects_local_writes():
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=2,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+        writer.shutdown()
+
+        # The ring is writable, but shutdown still rejects new writes.
+        with pytest.raises(RuntimeError, match="cancelled"):
+            writer.enqueue({"payload": "after shutdown"})
+        with (
+            pytest.raises(RuntimeError, match="cancelled"),
+            writer.acquire_write(timeout=0.1),
+        ):
+            pass
+        with pytest.raises(RuntimeError, match="cancelled"):
+            writer.enqueue({"payload": "after shutdown"}, timeout=0.1)
+    finally:
+        reader.shutdown()
+        writer.shutdown()
+
+
+def test_enqueue_after_shutdown_rejects_remote_only_writes():
+    """The socket-only writer path must also reject writes after shutdown.
+
+    A writer already blocked inside zmq send is outside this fix's scope.
+    """
+    writer = MessageQueue(n_reader=1, n_local_reader=0)
+    try:
+        writer.shutdown()
+        with mock.patch.object(writer.remote_socket, "send_multipart") as send:
+            with pytest.raises(RuntimeError, match="cancelled"):
+                writer.enqueue("after shutdown")
+            send.assert_not_called()
+    finally:
+        writer.shutdown()
+        writer.remote_socket.close(linger=0)
+
+
 def test_warning_logs(caplog_vllm):
     """
     Test that warning logs are emitted at VLLM_RINGBUFFER_WARNING_INTERVAL intervals
