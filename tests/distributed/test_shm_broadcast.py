@@ -724,6 +724,24 @@ def test_enqueue_after_shutdown_rejects_remote_only_writes():
         writer.remote_socket.close(linger=0)
 
 
+def test_remote_enqueue_cancelled_during_serialization():
+    writer = MessageQueue(n_reader=1, n_local_reader=0)
+
+    class ShutdownOnPickle:
+        def __reduce__(self):
+            writer.shutdown()
+            return str, ("after shutdown",)
+
+    try:
+        with mock.patch.object(writer.remote_socket, "send_multipart") as send:
+            with pytest.raises(RuntimeError, match="cancelled"):
+                writer.enqueue(ShutdownOnPickle())
+            send.assert_not_called()
+    finally:
+        writer.shutdown()
+        writer.remote_socket.close(linger=0)
+
+
 def test_warning_logs(caplog_vllm):
     """
     Test that warning logs are emitted at VLLM_RINGBUFFER_WARNING_INTERVAL intervals
