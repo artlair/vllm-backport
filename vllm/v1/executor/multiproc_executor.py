@@ -1106,6 +1106,11 @@ class WorkerProc:
                 # on a poisoned context, which is exactly the wedge this
                 # exit exists to avoid.
                 os._exit(1)
+            if output_rank is not None and self.rank != output_rank:
+                # A skipped PP send offsets downstream receives, even when
+                # consecutive steps have equal shapes. Kill the worker so the
+                # parent tears down the engine with the original traceback.
+                raise
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
