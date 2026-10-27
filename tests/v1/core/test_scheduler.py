@@ -1411,14 +1411,18 @@ def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
 @pytest.mark.parametrize("running", [False, True])
 @pytest.mark.parametrize("adaptive_verification", [False, True])
 @pytest.mark.parametrize(
-    "num_requests,num_tokens,sample_from_anchor,expected",
+    "num_requests,num_tokens,sample_from_anchor,num_decoding,expected",
     [
-        (2, 8, True, {"0": 8, "1": 8}),
-        (5, 1, True, {"0": 1, "1": 1, "2": 1, "3": 1}),
-        (5, 1, False, {"0": 1, "1": 1, "2": 1}),
+        (2, 8, True, 0, {"0": 8, "1": 8}),
+        (5, 1, True, 0, {"0": 1, "1": 1, "2": 1, "3": 1}),
+        (5, 1, False, 0, {"0": 1, "1": 1, "2": 1}),
+        (3, 8, True, 3, {"0": 5, "1": 5}),
+        (3, 8, False, 3, {"0": 5, "1": 3}),
+        (2, 12, True, 1, {"0": 5, "1": 8}),
+        (2, 12, False, 1, {"0": 5, "1": 7}),
     ],
 )
-def test_dspark_uses_separate_draft_input_budget(
+def test_dspark_bounds_combined_inputs_without_charging_prefills(
     tmp_path,
     monkeypatch,
     async_scheduling,
@@ -1427,9 +1431,10 @@ def test_dspark_uses_separate_draft_input_budget(
     num_requests,
     num_tokens,
     sample_from_anchor,
+    num_decoding,
     expected,
 ):
-    """Target capacity is independent, but draft queries still bound admission."""
+    """Only decodes reserve extra slots; mixed batches and query stages stay bounded."""
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     (tmp_path / "config.json").write_text(
         '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
@@ -1452,7 +1457,12 @@ def test_dspark_uses_separate_draft_input_budget(
         hf_config=SimpleNamespace(sample_from_anchor=sample_from_anchor)
     )
 
-    for request in create_requests(num_requests=num_requests, num_tokens=num_tokens):
+    requests = create_requests(num_requests=num_requests, num_tokens=num_tokens)
+    decoding_ids = {request.request_id for request in requests[:num_decoding]}
+    for request in requests:
+        if request.request_id in decoding_ids:
+            request.num_computed_tokens = request.num_prompt_tokens
+            request.append_output_token_ids([1] * 5)
         if running:
             scheduler.requests[request.request_id] = request
             scheduler.running.append(request)
@@ -1460,7 +1470,23 @@ def test_dspark_uses_separate_draft_input_budget(
         else:
             scheduler.add_request(request)
 
-    assert scheduler.schedule().num_scheduled_tokens == expected
+    output = scheduler.schedule()
+    query_slots = spec.num_speculative_tokens + (not sample_from_anchor)
+    # The scheduled decode already includes the anchor query slot.
+    additional_slots = sum(
+        query_slots - 1
+        for request_id in output.num_scheduled_tokens
+        if request_id in decoding_ids
+    )
+    assert (
+        sum(output.num_scheduled_tokens.values()) + additional_slots
+        <= scheduler.scheduler_config.max_num_batched_tokens
+    )
+    assert (
+        len(output.num_scheduled_tokens) * query_slots
+        <= scheduler.scheduler_config.max_num_batched_tokens
+    )
+    assert output.num_scheduled_tokens == expected
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
