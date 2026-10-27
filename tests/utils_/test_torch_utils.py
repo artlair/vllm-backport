@@ -5,6 +5,7 @@ import torch
 
 from vllm.utils.torch_utils import (
     OMP_NUM_THREADS_SET_BY_VLLM,
+    LayerName,
     available_cpu_count,
     common_broadcastable_dtype,
     current_stream,
@@ -14,7 +15,40 @@ from vllm.utils.torch_utils import (
     set_default_torch_dtype,
     set_torch_threads_for_runtime,
     startup_omp_num_threads,
+    weak_ref_tensors,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("container", [list, tuple])
+def test_weak_ref_tensors_does_not_keep_nested_tensors_alive(container) -> None:
+    """Nested graph outputs must not pin CUDA graph pool slots."""
+    hidden, aux, deep_aux = (
+        torch.empty(1 << 20, dtype=torch.float32, device="cuda") for _ in range(3)
+    )
+    out = weak_ref_tensors(container((hidden, [aux, (deep_aux,)])))
+    assert isinstance(out, container)
+    assert isinstance(out[1], list)
+    assert isinstance(out[1][1], tuple)
+    assert out[0].data_ptr() == hidden.data_ptr()
+    assert out[1][0].data_ptr() == aux.data_ptr()
+    assert out[1][1][0].data_ptr() == deep_aux.data_ptr()
+    nbytes = hidden.nbytes + aux.nbytes + deep_aux.nbytes
+    allocated = torch.accelerator.memory_allocated()
+    del hidden, aux, deep_aux
+    assert torch.accelerator.memory_allocated() == allocated - nbytes
+
+
+@pytest.mark.parametrize("value", [1000, LayerName("model.layers.0.self_attn.attn")])
+def test_weak_ref_tensors_preserves_hoisted_values_by_identity(value) -> None:
+    assert weak_ref_tensors(value) is value
+    assert weak_ref_tensors([(value,)])[0][0] is value
+
+
+@pytest.mark.parametrize("value", [None, {}, "unsupported", 1.5])
+def test_weak_ref_tensors_rejects_unknown_nested_types(value) -> None:
+    with pytest.raises(ValueError, match=f"Invalid type for tensors: {type(value)}"):
+        weak_ref_tensors((1, [value]))
 
 
 def test_nvfp4_4over6_cache_dtype() -> None:
