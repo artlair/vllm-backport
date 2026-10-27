@@ -4,6 +4,7 @@
 sampled-token / draft-token relay under spec decode."""
 
 from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -11,12 +12,131 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.distributed.parallel_state import GroupCoordinator, _split_tensor_dict
+from vllm.sequence import IntermediateTensors
+from vllm.v1.worker import gpu_worker
 from vllm.v1.worker.gpu import model_runner, pp_utils
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="PPHandler drives a side CUDA stream"
 )
+
+
+@pytest.fixture
+def pp_worker(monkeypatch):
+    """Run Worker.execute_model without initializing a device or process group."""
+    worker = object.__new__(gpu_worker.Worker)
+    worker._pp_step_id = 0
+    worker._pp_send_work = []
+    worker.use_v2_model_runner = False
+    worker.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            pass_config=SimpleNamespace(enable_sp=False)
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2, distributed_executor_backend="mp"
+        ),
+    )
+    worker.model_runner = Mock(execute_model=Mock(return_value=None))
+    worker.annotate_profile = lambda _: nullcontext()
+    group = Mock(is_first_rank=False, is_last_rank=True)
+    monkeypatch.setattr(gpu_worker, "get_pp_group", lambda: group)
+    monkeypatch.setattr(gpu_worker, "get_tp_group", lambda: None)
+    return worker, group
+
+
+@pytest.mark.parametrize("sender_step", [0, 2, None])
+def test_pp_step_skew_fails_before_forward(pp_worker, sender_step):
+    """Even equal-shaped steps must fail closed on missing or skewed metadata."""
+    worker, group = pp_worker
+    tensors = {"hidden_states": torch.zeros(4, 2)}
+    if sender_step is not None:
+        tensors["__pp_step_id__"] = sender_step
+    group.irecv_tensor_dict.return_value = (tensors, [], [])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=4))
+
+    message = str(exc_info.value)
+    assert "PP step 1" in message
+    assert f"PP step {sender_step}" in message
+    assert "num_scheduled_tokens=4" in message
+    assert "skipped or double-sent" in message
+    worker.model_runner.execute_model.assert_not_called()
+
+
+def test_pp_step_metadata_is_removed_without_waiting(pp_worker, monkeypatch):
+    """The integer survives transport but never enters the lazy tensor wrapper."""
+    worker, group = pp_worker
+    payload = {
+        "__pp_step_id__": 1,
+        "hidden_states": torch.empty(4, 2),
+        "relay_attn_input.0": torch.empty(4, 2),
+        model_runner._PP_ADAPTIVE_PLAN_KEY: torch.empty(4, 2),
+    }
+    metadata, tensors = _split_tensor_dict(payload)
+    assert metadata[0] == ("__pp_step_id__", 1)
+    assert len(tensors) == 3
+
+    receiver = GroupCoordinator.__new__(GroupCoordinator)
+    receiver.world_size = 2
+    receiver.rank_in_group = 1
+    receiver.ranks = [0, 1]
+    receiver.use_cpu_custom_send_recv = False
+    receiver.device_group = receiver.cpu_group = None
+    receiver.recv_object = Mock(return_value=metadata)
+    work = Mock()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "irecv", Mock(return_value=work))
+    received, handles, postprocess = receiver.irecv_tensor_dict()
+    assert received["__pp_step_id__"] == 1
+    postprocess.append(Mock())
+    group.irecv_tensor_dict.return_value = (received, handles, postprocess)
+
+    worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=4))
+
+    intermediate = worker.model_runner.execute_model.call_args.args[1]
+    assert isinstance(intermediate, gpu_worker.AsyncIntermediateTensors)
+    assert set(vars(intermediate)["tensors"]) == set(payload) - {"__pp_step_id__"}
+    work.wait.assert_not_called()
+    postprocess[0].assert_not_called()
+    assert intermediate.tensors is received
+    assert work.wait.call_count == len(tensors)
+    postprocess[0].assert_called_once_with()
+
+
+def test_pp_step_ids_ignore_zero_token_steps(pp_worker):
+    """All stages count scheduled forwards, not rank-local work or idle steps."""
+    worker, group = pp_worker
+    group.is_first_rank = True
+    group.is_last_rank = False
+    output = IntermediateTensors({"hidden_states": torch.zeros(4, 2)})
+    worker.model_runner.execute_model.side_effect = [output, None, output]
+    metadata_work, tensor_work = Mock(), Mock()
+    group.isend_tensor_dict.return_value = [metadata_work, tensor_work]
+
+    for num_tokens in (4, 0, 4):
+        worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=num_tokens))
+
+    sent = [call.args[0] for call in group.isend_tensor_dict.call_args_list]
+    assert [payload["__pp_step_id__"] for payload in sent] == [1, 2]
+    assert "__pp_step_id__" not in output.tensors
+    group.irecv_tensor_dict.assert_not_called()
+    metadata_work.wait.assert_not_called()
+    tensor_work.wait.assert_called_once_with()
+
+    group.is_first_rank = False
+    group.is_last_rank = True
+    worker._pp_step_id = 0
+    worker.model_runner.execute_model.side_effect = [None, None, None]
+    group.irecv_tensor_dict.side_effect = [
+        ({"__pp_step_id__": step}, [], []) for step in (1, 2)
+    ]
+    for num_tokens in (4, 0, 4):
+        worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=num_tokens))
+    assert group.irecv_tensor_dict.call_count == 2
+    assert worker._pp_step_id == 2
 
 
 def _batch(num_computed, prefill_len, num_scheduled):
