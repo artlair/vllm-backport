@@ -596,10 +596,27 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        scheduled_draft_slots: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+        dspark_draft_tokens = 0
+        if spec is not None and spec.use_dspark() and spec.num_speculative_tokens > 0:
+            draft_hf_config = (
+                spec.draft_model_config.hf_config
+                if spec.draft_model_config is not None
+                else None
+            )
+            # DSpark runs context-KV precompute and query drafting separately.
+            # Fill-in checkpoints add a bonus anchor to the K prediction queries.
+            dspark_draft_tokens = spec.num_speculative_tokens + (
+                not getattr(draft_hf_config, "sample_from_anchor", True)
+            )
+            draft_slots = dspark_draft_tokens - 1
+        # The combined input budget is authoritative. The query-stage budget
+        # also bounds the separate DSpark forward for every admitted request.
         input_budget = self.scheduler_config.max_num_batched_tokens
+        draft_input_budget = input_budget
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -629,7 +646,16 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-            if input_budget <= draft_slots:
+            request_draft_slots = draft_slots
+            if (
+                dspark_draft_tokens
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                request_draft_slots = 0
+            if (
+                input_budget <= request_draft_slots
+                or draft_input_budget < dspark_draft_tokens
+            ):
                 break
 
             if (
@@ -679,7 +705,7 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
-                num_new_tokens, token_budget, input_budget - draft_slots
+                num_new_tokens, token_budget, input_budget - request_draft_slots
             )
 
             # Make sure the input position does not exceed the max model len.
@@ -776,7 +802,10 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
-                            input_budget += restored + draft_slots
+                            input_budget += restored + scheduled_draft_slots.pop(
+                                preempted_req_id
+                            )
+                            draft_input_budget += dspark_draft_tokens
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
@@ -814,7 +843,9 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
-            input_budget -= num_new_tokens + draft_slots
+            scheduled_draft_slots[request_id] = request_draft_slots
+            input_budget -= num_new_tokens + request_draft_slots
+            draft_input_budget -= dspark_draft_tokens
             req_index += 1
 
             # Speculative decode related.
@@ -865,7 +896,10 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if input_budget <= draft_slots:
+                if (
+                    input_budget <= (0 if dspark_draft_tokens else draft_slots)
+                    or draft_input_budget < dspark_draft_tokens
+                ):
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -1027,6 +1061,15 @@ class Scheduler(SchedulerInterface):
                         step_skipped_waiting.prepend_request(request)
                         continue
 
+                request_draft_slots = draft_slots
+                if (
+                    dspark_draft_tokens
+                    and num_computed_tokens < request.num_prompt_tokens
+                ):
+                    request_draft_slots = 0
+                if input_budget <= request_draft_slots:
+                    break
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -1041,7 +1084,9 @@ class Scheduler(SchedulerInterface):
                     # compute to a cadence-aligned step.
                     break
                 else:
-                    request_token_budget = min(token_budget, input_budget - draft_slots)
+                    request_token_budget = min(
+                        token_budget, input_budget - request_draft_slots
+                    )
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -1277,7 +1322,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
-                input_budget -= num_new_tokens + draft_slots
+                scheduled_draft_slots[request_id] = request_draft_slots
+                input_budget -= num_new_tokens + request_draft_slots
+                draft_input_budget -= dspark_draft_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
@@ -1319,6 +1366,11 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert input_budget >= 0
+        assert (
+            total_num_scheduled_tokens + sum(scheduled_draft_slots.values())
+            <= self.scheduler_config.max_num_batched_tokens
+        )
+        assert draft_input_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
