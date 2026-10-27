@@ -8,6 +8,7 @@ import pytest
 
 from vllm.config.cache import CacheConfig
 from vllm.config.scheduler import SchedulerConfig
+from vllm.config.speculative import SpeculativeConfig, SpeculativeMethod
 from vllm.config.utils import get_hash_factors, hash_factors, normalize_value
 
 # Helpers
@@ -233,6 +234,68 @@ def test_scheduler_config_hash_includes_max_num_seqs():
     ).compute_hash()
 
     assert larger_batch_hash != base_hash
+
+
+def _speculative_config_for_hash(
+    method: SpeculativeMethod,
+    num_speculative_tokens: int,
+    *,
+    parallel_drafting: bool = False,
+) -> SpeculativeConfig:
+    # Isolate hashing from model loading and config validation.
+    config = object.__new__(SpeculativeConfig)
+    config.method = method
+    config.num_speculative_tokens = num_speculative_tokens
+    config.parallel_drafting = parallel_drafting
+    config.enable_adaptive_verification = False
+    config.draft_model_config = None
+    return config
+
+
+@pytest.mark.parametrize(
+    "method, parallel_drafting",
+    [
+        ("dspark", True),
+        ("dflash", True),
+        ("eagle3", True),
+        ("draft_model", True),
+        ("mtp", False),
+        ("eagle", False),
+        ("ngram", False),
+    ],
+)
+@pytest.mark.parametrize("shallow, deep", [(4, 5), (1, 128)])
+def test_speculative_hash_tracks_depth(method, parallel_drafting, shallow, deep):
+    """Draft and target verification widths must isolate compiled artifacts."""
+    base = _speculative_config_for_hash(
+        method, shallow, parallel_drafting=parallel_drafting
+    )
+    identical = _speculative_config_for_hash(
+        method, shallow, parallel_drafting=parallel_drafting
+    )
+    deeper = _speculative_config_for_hash(
+        method, deep, parallel_drafting=parallel_drafting
+    )
+
+    assert base.compute_hash() == identical.compute_hash()
+    assert base.compute_hash() != deeper.compute_hash()
+
+
+@pytest.mark.parametrize(
+    "method, field, value",
+    [
+        ("dspark", "enable_adaptive_verification", True),
+        ("dspark", "method", "dflash"),
+        ("eagle3", "parallel_drafting", False),
+    ],
+)
+def test_speculative_hash_tracks_graph_selection(method, field, value):
+    """Graph selectors must be hashed even with identical draft model configs."""
+    base = _speculative_config_for_hash(method, 4, parallel_drafting=True)
+    changed = _speculative_config_for_hash(method, 4, parallel_drafting=True)
+    setattr(changed, field, value)
+
+    assert base.compute_hash() != changed.compute_hash()
 
 
 def test_cache_config_hash_ignores_prefix_cache_retention_interval():
