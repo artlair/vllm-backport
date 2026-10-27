@@ -809,6 +809,35 @@ class TestTritonTopkTopp:
             f"{kept_topk_topp.tolist()}"
         )
 
+    @pytest.mark.parametrize("batch_size", [4, 64], ids=["split", "split-boundary"])
+    @pytest.mark.parametrize(
+        "forced_logit", [1e9, 1e9 / 0.6], ids=["1e9", "1e9_over_temp0.6"]
+    )
+    def test_topp_keeps_forced_huge_logit(self, batch_size: int, forced_logit: float):
+        """Huge forced logits must survive top-p without producing NaN softmax.
+
+        At 1e9 (also after temperature=0.6), the logit-space pivot rounds
+        to the row maximum in fp32. Both batch sizes use the split pipeline.
+        """
+        from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+        vocab_size, forced_token = 131072, 13
+        logits = torch.randn(
+            batch_size, vocab_size, generator=self.generator, dtype=torch.float32
+        )
+        logits[:, forced_token] = forced_logit
+        p = torch.full((batch_size,), 0.95, dtype=torch.float32)
+
+        result = apply_top_k_top_p_triton(logits.clone(), None, p)
+
+        assert (result[:, forced_token] == forced_logit).all()
+        probs = result.softmax(dim=-1)
+        assert not probs.isnan().any()
+        assert (probs.argmax(dim=-1) == forced_token).all()
+        if current_platform.is_cuda_alike():
+            # The monolithic kernel leaves this row unmasked on other devices.
+            assert ((result != float("-inf")).sum(-1) == 1).all()
+
     def test_topp_tie_break_deterministic(self):
         """Boundary-duplicate trimming must be deterministic across calls.
 
