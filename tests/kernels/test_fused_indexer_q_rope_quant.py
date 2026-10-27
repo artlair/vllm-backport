@@ -26,7 +26,7 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
 from vllm.platforms import current_platform
-from vllm.utils.import_utils import is_cutedsl_supported
+from vllm.utils.import_utils import has_cutedsl, is_cutedsl_supported
 
 HEAD_DIM = 128
 ROPE_DIM = 64
