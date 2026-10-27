@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -56,6 +57,7 @@ def _make_runner(
     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
     runner.decode_query_len = decode_query_len
     runner.adaptive_verification = None
+    runner.pcp_manager = None
     runner.req_states = SimpleNamespace(
         req_id_to_index={req_id: i for i, req_id in enumerate(req_states)},
         # The runner keeps this as min(num_computed_tokens, prefill_len).
@@ -128,6 +130,241 @@ def test_prompt_chunk_of_decode_query_len_is_not_uniform_decode():
     assert _uniform_token_count({"p0": (0, 8)}, 8) is None
 
 
+def test_one_new_prompt_token_over_context_runs_as_decode():
+    batch = {"d0": (16, 16), "tail": (128, 129), "mid": (64, 129)}
+    batch.update({"fresh": (0, 1), "chunk": (120, 129)})
+    runner = _make_runner(batch, decode_query_len=5)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"d0": 5, "tail": 5, "mid": 1, "fresh": 1, "chunk": 5},
+        total_num_scheduled_tokens=17,
+        scheduled_spec_decode_tokens={"d0": [1, 2, 3, 4], "tail": [-1] * 4},
+    )
+    state, uniform = runner.gather_batch_req_state(scheduler_output, False)
+    assert state is not None
+    assert dict(zip(state.req_ids, state.prefill_runs_as_decode_np)) == {
+        "d0": False,
+        "tail": True,
+        "mid": True,
+        "fresh": False,
+        "chunk": False,
+    }
+    assert state.has_prefill and not state.decode_graph_eligible
+    assert uniform is None
+
+
+def test_one_token_prompt_tail_with_prior_context_is_uniform_decode():
+    batch = {"d0": (16, 16), "d1": (16, 16), "p0": (128, 129)}
+    assert _uniform_token_count(batch, 1) == 1
+    batch["p1"] = (0, 1)
+    assert _uniform_token_count(batch, 1) is None
+    assert _uniform_token_count({"d0": (16, 16), "p0": (120, 129)}, 5) is None
+
+
+def test_padded_prompt_tail_with_prior_context_is_uniform_decode():
+    batch = {"d0": (16, 16), "d1": (16, 16), "p0": (128, 129)}
+    runner = _make_runner(batch, decode_query_len=5)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={req_id: 5 for req_id in batch},
+        total_num_scheduled_tokens=15,
+        scheduled_spec_decode_tokens={req_id: [-1] * 4 for req_id in batch},
+    )
+    state, uniform = runner.gather_batch_req_state(scheduler_output, False)
+    assert state.has_prefill and state.decode_graph_eligible
+    assert uniform == 5
+
+    del scheduler_output.scheduled_spec_decode_tokens["p0"]
+    state, uniform = runner.gather_batch_req_state(scheduler_output, False)
+    assert not state.decode_graph_eligible
+    assert uniform is None
+
+
+def test_pcp_prompt_tail_keeps_prefill_classification():
+    runner = _make_runner({"tail": (128, 129)}, decode_query_len=5)
+    runner.pcp_manager = object()
+    state, uniform = runner.gather_batch_req_state(
+        SimpleNamespace(
+            num_scheduled_tokens={"tail": 5},
+            total_num_scheduled_tokens=5,
+            scheduled_spec_decode_tokens={"tail": [-1] * 4},
+        ),
+        False,
+    )
+    assert state.has_prefill and not state.decode_graph_eligible
+    assert state.prefill_runs_as_decode_np is None
+    assert uniform is None
+
+
+def test_prompt_tail_draft_counts_are_saved_before_adaptive_trimming():
+    """Trimming scheduler lists must not change the prompt-token classification."""
+    runner = _make_runner({"tail": (128, 129), "decode": (16, 16)}, 5)
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"decode": 5, "tail": 5},
+        total_num_scheduled_tokens=10,
+        scheduled_spec_decode_tokens={"decode": [1, 2, 3, 4], "tail": [-1] * 4},
+    )
+
+    def trim_drafts(num_tokens_per_req, draft_tokens):
+        for req_id, drafts in draft_tokens.items():
+            del drafts[2:]
+            num_tokens_per_req[req_id] = 3
+        return 6
+
+    runner.adaptive_verification = SimpleNamespace(get_num_tokens=trim_drafts)
+    state, uniform = runner.gather_batch_req_state(scheduler_output, False)
+    assert state.decode_graph_eligible and state.has_prefill
+    assert state.num_tokens == 6
+    assert uniform is None
+    assert state.req_ids == ["decode", "tail"]
+    assert state.num_draft_tokens_np.tolist() == [4, 4]
+    assert state.num_scheduled_tokens.tolist() == [5, 5]
+    assert state.prefill_runs_as_decode_np.tolist() == [False, True]
+    assert len(scheduler_output.scheduled_spec_decode_tokens["tail"]) == 2
+
+
+@pytest.mark.parametrize("varlen_decode", [False, True])
+@pytest.mark.parametrize(
+    ("computed", "prompt_len", "query_len", "num_drafts", "eligible"),
+    [
+        (128, 129, 5, 4, True),
+        (64, 129, 1, 0, True),
+        (0, 1, 1, 0, False),
+        (120, 129, 5, 0, False),
+        (120, 129, 3, 0, False),
+        (120, 129, 2, 0, False),
+        (128, 128, 5, 4, True),
+    ],
+)
+def test_execute_model_prompt_tail_dispatch(
+    monkeypatch, varlen_decode, computed, prompt_len, query_len, num_drafts, eligible
+):
+    """Exercise gather and dispatch without launching the model or capturing graphs."""
+    from tests.v1.spec_decode.test_dynamic_sd_cug import _create_vllm_config_for_dsd
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
+    )
+    manager = cudagraph_utils.CudaGraphManager(
+        _create_vllm_config_for_dsd(16, 4),
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=5,
+        varlen_decode=varlen_decode,
+    )
+    manager._graphs_captured = True
+    runner = _make_runner({"r": (computed, prompt_len)}, decode_query_len=5)
+    for method in (
+        "update_pp_decode_requests",
+        "finish_requests",
+        "free_states",
+        "add_requests",
+        "update_requests",
+    ):
+        monkeypatch.setattr(runner, method, lambda *args: None)
+    runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None)
+    runner.lora_config = None
+    runner.is_encoder_decoder = False
+    runner.cudagraph_manager = manager
+    runner.dp_size, runner.dp_rank = 1, 0
+    runner.parallel_config = manager.vllm_config.parallel_config
+    runner.ubatch_runner = None
+    runner.observability_config = SimpleNamespace(cudagraph_metrics=False)
+    result = []
+
+    class Dispatched(Exception):
+        pass
+
+    def stop_after_dispatch(_output, state, desc):
+        result.append((state, desc))
+        raise Dispatched
+
+    monkeypatch.setattr(runner, "prepare_inputs", stop_after_dispatch)
+    with pytest.raises(Dispatched):
+        runner.execute_model(
+            SimpleNamespace(
+                num_scheduled_tokens={"r": query_len},
+                total_num_scheduled_tokens=query_len,
+                scheduled_spec_decode_tokens={"r": [-1] * num_drafts},
+            )
+        )
+    state, desc = result[0]
+    assert state.has_prefill == (computed < prompt_len)
+    assert state.decode_graph_eligible == eligible
+    assert desc.cg_mode == (CUDAGraphMode.FULL if eligible else CUDAGraphMode.PIECEWISE)
+
+    if varlen_decode and computed == prompt_len and num_drafts:
+        runner.adaptive_verification = SimpleNamespace(
+            get_num_tokens=lambda *_args: query_len - 2
+        )
+        with pytest.raises(Dispatched):
+            runner.execute_model(
+                SimpleNamespace(
+                    num_scheduled_tokens={"r": query_len},
+                    total_num_scheduled_tokens=query_len,
+                    scheduled_spec_decode_tokens={"r": [-1] * num_drafts},
+                )
+            )
+        adaptive_state, adaptive_desc = result[-1]
+        assert adaptive_state.num_tokens == query_len - 2
+        assert adaptive_desc.cg_mode == CUDAGraphMode.FULL
+
+
+def test_cached_tails_reuse_existing_width_five_captures(monkeypatch):
+    """K=4 tails fit the lane's capture grid without adding capture shapes."""
+    from tests.v1.spec_decode.test_dynamic_sd_cug import _create_vllm_config_for_dsd
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.worker.gpu import cudagraph_utils
+    from vllm.v1.worker.gpu.pp_utils import compute_need_sampled_mask
+
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=False),
+    )
+    monkeypatch.setattr(
+        cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
+    )
+    config = _create_vllm_config_for_dsd(16, 4, use_dynamic_sd=False)
+    capture_sizes = [5, 10, 15, 20, 30, 40, 60, 80]
+    config.compilation_config.cudagraph_capture_sizes = capture_sizes.copy()
+    config.compilation_config.post_init_cudagraph_sizes()
+    manager = cudagraph_utils.CudaGraphManager(
+        config, torch.device("cpu"), CUDAGraphMode.FULL_AND_PIECEWISE, 5
+    )
+    manager._graphs_captured = True
+    captures = manager._capture_descs[CUDAGraphMode.FULL].copy()
+    assert {desc.num_tokens for desc in captures} == set(capture_sizes)
+    for num_reqs in range(1, 17):
+        runner = _make_runner({f"r{i}": (128, 129) for i in range(num_reqs)}, 5)
+        req_ids = list(runner.req_states.req_id_to_index)
+        state, uniform = runner.gather_batch_req_state(
+            SimpleNamespace(
+                num_scheduled_tokens=dict.fromkeys(req_ids, 5),
+                total_num_scheduled_tokens=num_reqs * 5,
+                scheduled_spec_decode_tokens={req_id: [-1] * 4 for req_id in req_ids},
+            ),
+            False,
+        )
+        desc = manager.dispatch(num_reqs, state.num_tokens, uniform, 0)
+        assert state.has_prefill and state.decode_graph_eligible
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert desc.num_tokens == next(n for n in capture_sizes if n >= num_reqs * 5)
+        # Graph selection must not change whether PP relays a sample and drafts.
+        relay_batch = SimpleNamespace(
+            num_computed_tokens_np=state.num_computed_prefill_tokens_np,
+            prefill_len_np=state.prefill_len_np,
+            num_scheduled_tokens=state.num_scheduled_tokens,
+        )
+        assert compute_need_sampled_mask(relay_batch).all()
+    assert manager._capture_descs[CUDAGraphMode.FULL] == captures
+
+
 def test_dummy_batches_stay_uniform_decode():
     # Dummy batches have no request state to consult and must stay classified
     # by shape alone; rejecting them would make capture and replay disagree.
@@ -185,6 +422,7 @@ def test_uniform_decode_uses_state_index_not_batch_position():
     runner: Any = GPUModelRunner.__new__(GPUModelRunner)
     runner.decode_query_len = 8
     runner.adaptive_verification = None
+    runner.pcp_manager = None
     # State arrays in state-index order: a prefilling request, then two decodes.
     runner.req_states = SimpleNamespace(
         req_id_to_index={"prefilling": 0, "decode_a": 1, "decode_b": 2},
@@ -214,11 +452,11 @@ def test_uniform_decode_uses_state_index_not_batch_position():
 
 
 def test_uniform_decode_predicate():
-    # Shape and prefill state must both pass.
-    assert get_uniform_decode_token_count(2, 16, 8, False) == 8
-    assert get_uniform_decode_token_count(2, 16, 8, True) is None
+    # Shape and decode-graph eligibility must both pass.
+    assert get_uniform_decode_token_count(2, 16, 8, True) == 8
+    assert get_uniform_decode_token_count(2, 16, 8, False) is None
     # 12 tokens over 2 requests is no shared query length.
-    assert get_uniform_decode_token_count(2, 12, 8, False) is None
+    assert get_uniform_decode_token_count(2, 12, 8, True) is None
 
 
 def test_no_speculator_dispatches_on_query_length_alone():
