@@ -31,6 +31,7 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import FinishReason
@@ -1411,18 +1412,24 @@ def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
 @pytest.mark.parametrize("running", [False, True])
 @pytest.mark.parametrize("adaptive_verification", [False, True])
 @pytest.mark.parametrize(
-    "num_requests,num_tokens,sample_from_anchor,num_decoding,expected",
+    "num_requests,num_tokens,sample_from_anchor,num_decoding,"
+    "num_speculative_tokens,batch_limit,expected",
     [
-        (2, 8, True, 0, {"0": 8, "1": 8}),
-        (5, 1, True, 0, {"0": 1, "1": 1, "2": 1, "3": 1}),
-        (5, 1, False, 0, {"0": 1, "1": 1, "2": 1}),
-        (3, 8, True, 3, {"0": 5, "1": 5}),
-        (3, 8, False, 3, {"0": 5, "1": 3}),
-        (2, 12, True, 1, {"0": 5, "1": 8}),
-        (2, 12, False, 1, {"0": 5, "1": 7}),
+        (2, 8, True, 0, 4, 16, {"0": 8, "1": 8}),
+        (2, 8, False, 0, 4, 16, {"0": 8, "1": 8}),
+        (5, 1, True, 0, 4, 16, {"0": 1, "1": 1, "2": 1, "3": 1}),
+        (5, 1, False, 0, 4, 16, {"0": 1, "1": 1, "2": 1}),
+        (3, 8, True, 3, 4, 16, {"0": 5, "1": 5, "2": 5}),
+        (3, 8, False, 3, 4, 16, {"0": 5, "1": 5, "2": 5}),
+        (2, 12, True, 1, 4, 16, {"0": 5, "1": 11}),
+        (2, 12, False, 1, 4, 16, {"0": 5, "1": 11}),
+        (3, 8, True, 3, 15, 32, {"0": 16, "1": 16}),
+        (3, 8, False, 3, 15, 32, {"0": 16, "1": 16}),
+        (2, 8, True, 2, 15, 16, {"0": 16}),
+        (2, 8, False, 2, 15, 16, {"0": 16}),
     ],
 )
-def test_dspark_bounds_combined_inputs_without_charging_prefills(
+def test_dspark_uses_independent_target_and_query_budgets(
     tmp_path,
     monkeypatch,
     async_scheduling,
@@ -1432,17 +1439,19 @@ def test_dspark_bounds_combined_inputs_without_charging_prefills(
     num_tokens,
     sample_from_anchor,
     num_decoding,
+    num_speculative_tokens,
+    batch_limit,
     expected,
 ):
-    """Only decodes reserve extra slots; mixed batches and query stages stay bounded."""
+    """Verification drafts consume target rows, not a combined forward's buffer."""
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     (tmp_path / "config.json").write_text(
         '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
     )
     scheduler = create_scheduler(
         model=str(tmp_path),
-        max_num_batched_tokens=16,
-        num_speculative_tokens=4,
+        max_num_batched_tokens=batch_limit,
+        num_speculative_tokens=num_speculative_tokens,
         speculative_method="ngram_gpu",
         parallel_drafting=True,
         skip_tokenizer_init=True,
@@ -1450,7 +1459,7 @@ def test_dspark_bounds_combined_inputs_without_charging_prefills(
     )
     spec = scheduler.vllm_config.speculative_config
     assert spec is not None
-    assert spec.max_num_new_slots_for_drafting == 3
+    assert spec.max_num_new_slots_for_drafting == num_speculative_tokens - 1
     spec.method = "dspark"
     spec.enable_adaptive_verification = adaptive_verification
     spec.draft_model_config = SimpleNamespace(
@@ -1462,7 +1471,8 @@ def test_dspark_bounds_combined_inputs_without_charging_prefills(
     for request in requests:
         if request.request_id in decoding_ids:
             request.num_computed_tokens = request.num_prompt_tokens
-            request.append_output_token_ids([1] * 5)
+            request.append_output_token_ids([1])
+            request.spec_token_ids = [2] * num_speculative_tokens
         if running:
             scheduler.requests[request.request_id] = request
             scheduler.running.append(request)
@@ -1470,23 +1480,92 @@ def test_dspark_bounds_combined_inputs_without_charging_prefills(
         else:
             scheduler.add_request(request)
 
+    uncomputed_tokens = {
+        request.request_id: request.num_tokens - request.num_computed_tokens
+        for request in requests
+    }
     output = scheduler.schedule()
-    query_slots = spec.num_speculative_tokens + (not sample_from_anchor)
-    # The scheduled decode already includes the anchor query slot.
-    additional_slots = sum(
-        query_slots - 1
-        for request_id in output.num_scheduled_tokens
-        if request_id in decoding_ids
+    # Reconstruct the target query rows from prompt/anchor rows and the actual
+    # verification drafts emitted to the worker, including waiting-path padding.
+    target_query_tokens = sum(
+        min(uncomputed_tokens[req_id], num_tokens)
+        + len(output.scheduled_spec_decode_tokens.get(req_id, ()))
+        for req_id, num_tokens in output.num_scheduled_tokens.items()
     )
-    assert (
-        sum(output.num_scheduled_tokens.values()) + additional_slots
-        <= scheduler.scheduler_config.max_num_batched_tokens
-    )
-    assert (
-        len(output.num_scheduled_tokens) * query_slots
-        <= scheduler.scheduler_config.max_num_batched_tokens
-    )
+    assert target_query_tokens == output.total_num_scheduled_tokens
+    assert target_query_tokens <= batch_limit
+    if num_decoding:
+        assert sum(map(len, output.scheduled_spec_decode_tokens.values())) == (
+            len(decoding_ids & output.num_scheduled_tokens.keys())
+            * num_speculative_tokens
+        )
+    # DFlashSpeculator.propose uses num_reqs * num_query_per_req for the
+    # separate draft forward, regardless of verification length or prefill size.
+    query_slots = num_speculative_tokens + (not sample_from_anchor)
+    assert len(output.num_scheduled_tokens) * query_slots <= batch_limit
     assert output.num_scheduled_tokens == expected
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("sample_from_anchor", [False, True])
+def test_dspark_priority_preemption_refunds_both_stage_budgets(
+    tmp_path, monkeypatch, async_scheduling, sample_from_anchor
+):
+    """Real KV pressure removes a scheduled victim before filling both stages."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=16,
+        max_model_len=64,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        parallel_drafting=True,
+        skip_tokenizer_init=True,
+        async_scheduling=async_scheduling,
+        block_size=4,
+        num_blocks=13,
+    )
+    scheduler.policy = SchedulingPolicy.PRIORITY
+    spec = scheduler.vllm_config.speculative_config
+    assert spec is not None
+    spec.method = "dspark"
+    spec.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(sample_from_anchor=sample_from_anchor)
+    )
+    scheduler.num_lookahead_tokens = scheduler.vllm_config.num_lookahead_tokens
+    # The victim needs 10 blocks including lookahead; the next request needs
+    # four. They cannot coexist in 12 usable blocks, unlike the survivors.
+    requests = []
+    for req_id, prompt_tokens in enumerate([29, 4, 1, 1, 1]):
+        request = create_requests(
+            num_requests=1, num_tokens=prompt_tokens, req_ids=[str(req_id)]
+        )[0]
+        request.priority = 10 if req_id == 0 else 0
+        if req_id < 4:
+            request.num_computed_tokens = request.num_prompt_tokens
+            request.append_output_token_ids([1])
+            request.spec_token_ids = [2] * 4
+        scheduler.requests[request.request_id] = request
+        scheduler.running.append(request)
+        request.status = RequestStatus.RUNNING
+        requests.append(request)
+
+    output = scheduler.schedule()
+    assert output.preempted_req_ids == {"0"}
+    assert requests[0].status == RequestStatus.PREEMPTED
+    assert "0" not in output.scheduled_spec_decode_tokens
+    expected = {"1": 5, "2": 5, "3": 5}
+    if sample_from_anchor:
+        expected["4"] = 1
+    assert output.num_scheduled_tokens == expected
+    target_rows = len(expected) + sum(
+        map(len, output.scheduled_spec_decode_tokens.values())
+    )
+    assert target_rows == output.total_num_scheduled_tokens <= 16
+    assert len(expected) * (4 + (not sample_from_anchor)) <= 16
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
