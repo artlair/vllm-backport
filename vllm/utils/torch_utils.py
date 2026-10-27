@@ -867,16 +867,17 @@ def weak_ref_tensors(
     | tuple[torch.Tensor]
     | IntermediateTensors,
 ) -> torch.Tensor | list[Any] | tuple[Any] | Any:
-    """
-    Convenience function to create weak references to tensors,
-    for single tensor, list of tensors or tuple of tensors.
+    """Create weak references for a tensor, nested list/tuple of tensors,
+    or IntermediateTensors. Ints and LayerNames are returned as is.
     """
     if isinstance(tensors, torch.Tensor):
         return weak_ref_tensor(tensors)
     if isinstance(tensors, list):
-        return [weak_ref_tensor(t) for t in tensors]
+        return [weak_ref_tensors(t) for t in tensors]
     if isinstance(tensors, tuple):
-        return tuple(weak_ref_tensor(t) for t in tensors)
+        return tuple(weak_ref_tensors(t) for t in tensors)
+    if isinstance(tensors, (int, LayerName)):
+        return tensors
 
     # For IntermediateTensors used in pipeline parallelism
     from vllm.sequence import IntermediateTensors
@@ -886,7 +887,7 @@ def weak_ref_tensors(
             {key: weak_ref_tensor(val) for key, val in tensors.tensors.items()}
         )
         return ret
-    raise ValueError("Invalid type for tensors")
+    raise ValueError(f"Invalid type for tensors: {type(tensors)}")
 
 
 def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tensor:
