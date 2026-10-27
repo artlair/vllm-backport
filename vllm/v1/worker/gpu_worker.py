@@ -91,7 +91,7 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import _PP_STEP_KEY, is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -142,10 +142,6 @@ if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-
-# Non-tensor values ride the existing PP metadata without device work.
-_PP_STEP_KEY = "__pp_step_id__"
 
 
 class AsyncIntermediateTensors(IntermediateTensors):
@@ -1252,6 +1248,8 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
+            if not self.use_v2_model_runner:
+                self.model_runner._pp_step_id = self._pp_step_id
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )

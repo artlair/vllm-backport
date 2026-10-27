@@ -229,6 +229,7 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.utils import (
+    _PP_STEP_KEY,
     EncoderTimingStats,
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
@@ -982,6 +983,9 @@ class GPUModelRunner(
         # Model weight offloader
         # Make sure this is called before any get_offloader call
         set_offloader(create_offloader(self.offload_config))
+
+        # Worker publishes its forward-step counter before execute_model.
+        self._pp_step_id = 0
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -4517,7 +4521,7 @@ class GPUModelRunner(
                         )
                     }
                     get_pp_group().send_tensor_dict(
-                        hidden_states.tensors,
+                        {_PP_STEP_KEY: self._pp_step_id, **hidden_states.tensors},
                         all_gather_group=get_tp_group(),
                         all_gather_tensors=all_gather_tensors,
                     )

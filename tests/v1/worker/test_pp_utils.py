@@ -14,7 +14,7 @@ import torch
 
 from vllm.distributed.parallel_state import GroupCoordinator, _split_tensor_dict
 from vllm.sequence import IntermediateTensors
-from vllm.v1.worker import gpu_worker
+from vllm.v1.worker import gpu_model_runner, gpu_worker
 from vllm.v1.worker.gpu import model_runner, pp_utils
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 
@@ -38,7 +38,9 @@ def pp_worker(monkeypatch):
             pipeline_parallel_size=2, distributed_executor_backend="mp"
         ),
     )
-    worker.model_runner = Mock(execute_model=Mock(return_value=None))
+    worker.model_runner = Mock(
+        execute_model=Mock(return_value=None), is_pooling_model=False
+    )
     worker.annotate_profile = lambda _: nullcontext()
     group = Mock(is_first_rank=False, is_last_rank=True)
     monkeypatch.setattr(gpu_worker, "get_pp_group", lambda: group)
@@ -106,9 +108,11 @@ def test_pp_step_metadata_is_removed_without_waiting(pp_worker, monkeypatch):
     postprocess[0].assert_called_once_with()
 
 
-def test_pp_step_ids_ignore_zero_token_steps(pp_worker):
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
+def test_pp_step_ids_ignore_zero_token_steps(pp_worker, use_v2_model_runner):
     """All stages count scheduled forwards, not rank-local work or idle steps."""
     worker, group = pp_worker
+    worker.use_v2_model_runner = use_v2_model_runner
     group.is_first_rank = True
     group.is_last_rank = False
     output = IntermediateTensors({"hidden_states": torch.zeros(4, 2)})
@@ -118,6 +122,10 @@ def test_pp_step_ids_ignore_zero_token_steps(pp_worker):
 
     for num_tokens in (4, 0, 4):
         worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=num_tokens))
+        if use_v2_model_runner:
+            assert "_pp_step_id" not in vars(worker.model_runner)
+        else:
+            assert worker.model_runner._pp_step_id == worker._pp_step_id
 
     sent = [call.args[0] for call in group.isend_tensor_dict.call_args_list]
     assert [payload["__pp_step_id__"] for payload in sent] == [1, 2]
@@ -137,6 +145,100 @@ def test_pp_step_ids_ignore_zero_token_steps(pp_worker):
         worker.execute_model(SimpleNamespace(total_num_scheduled_tokens=num_tokens))
     assert group.irecv_tensor_dict.call_count == 2
     assert worker._pp_step_id == 2
+
+
+def test_v1_rare_pp_send_carries_worker_step(pp_worker, monkeypatch):
+    """Local-logits PP sends must pass the same strict check as async sends."""
+    worker, group = pp_worker
+    worker._pp_step_id = 6
+    worker.vllm_config.compilation_config.pass_config.enable_sp = True
+    worker.vllm_config.compilation_config.use_inductor_graph_partition = True
+    worker.vllm_config.parallel_config.tensor_parallel_size = 2
+    group.is_first_rank = True
+    group.is_last_rank = False
+    group.ranks = [0, 1]
+    logits = torch.zeros(1, 2)
+    group.broadcast_tensor_dict.return_value = {"logits": logits}
+    hidden_states = IntermediateTensors({"hidden_states": torch.zeros(4, 2)})
+    batch_desc = SimpleNamespace(num_tokens=4, num_reqs=1)
+    runner = Mock(
+        execute_model_state=None,
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            kv_sharing_fast_prefill=False, mamba_cache_mode="none"
+        ),
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req"]),
+        cascade_attn_enabled=False,
+        parallel_config=SimpleNamespace(num_ubatches=1),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+        model_config=SimpleNamespace(is_encoder_decoder=False),
+        eplb_state=None,
+        use_aux_hidden_state_outputs=False,
+        broadcast_pp_output=True,
+        is_pooling_model=False,
+        vllm_config=worker.vllm_config,
+    )
+    runner.synchronize_input_prep.side_effect = nullcontext
+    runner.maybe_get_kv_connector_output.side_effect = lambda *a, **kw: nullcontext()
+    runner._update_states.return_value = None
+    runner._prepare_inputs.return_value = (torch.tensor([0]), None, 1)
+    runner._determine_batch_execution_and_padding.return_value = (
+        gpu_model_runner.CUDAGraphMode.NONE,
+        batch_desc,
+        False,
+        None,
+        None,
+    )
+    runner._get_slot_mappings.return_value = ({}, None)
+    runner._build_attention_metadata.return_value = (None, None)
+    runner._preprocess.return_value = (None, None, None, None, {}, None)
+    runner._model_forward.return_value = hidden_states
+    runner.execute_model = gpu_model_runner.GPUModelRunner.execute_model.__get__(runner)
+    worker.model_runner = runner
+    monkeypatch.setattr(gpu_model_runner, "get_pp_group", lambda: group)
+    monkeypatch.setattr(gpu_model_runner, "get_tp_group", lambda: None)
+    monkeypatch.setattr(gpu_model_runner, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(gpu_model_runner, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(
+        gpu_model_runner, "set_forward_context", lambda *a, **kw: nullcontext()
+    )
+    monkeypatch.setattr(
+        gpu_model_runner, "maybe_create_ubatch_slices", lambda *a: (None, None)
+    )
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=4,
+        num_scheduled_tokens={"req": 4},
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+    )
+
+    assert worker.execute_model(scheduler_output) is None
+
+    group.send_tensor_dict.assert_called_once()
+    payload = group.send_tensor_dict.call_args.args[0]
+    assert payload["__pp_step_id__"] == 7
+    assert payload["hidden_states"] is hidden_states.tensors["hidden_states"]
+    assert "__pp_step_id__" not in hidden_states.tensors
+    assert runner.execute_model_state.logits is logits
+    group.isend_tensor_dict.assert_not_called()
+
+    group.is_first_rank = False
+    group.is_last_rank = True
+    group.irecv_tensor_dict.return_value = (payload.copy(), [], [])
+    worker._pp_step_id = 6
+    worker.model_runner = Mock(execute_model=Mock(return_value=None))
+    worker.model_runner._determine_batch_execution_and_padding.return_value = (
+        None,
+        batch_desc,
+        None,
+        None,
+        None,
+    )
+
+    worker.execute_model(scheduler_output)
+
+    received = worker.model_runner.execute_model.call_args.args[1]
+    assert set(received.tensors) == {"hidden_states"}
 
 
 def _batch(num_computed, prefill_len, num_scheduled):
