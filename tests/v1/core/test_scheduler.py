@@ -1407,6 +1407,105 @@ def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
     assert scheduler.schedule().num_scheduled_tokens == {"0": 10, "1": 4}
 
 
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("adaptive_verification", [False, True])
+@pytest.mark.parametrize(
+    "num_requests,num_tokens,sample_from_anchor,expected",
+    [
+        (2, 8, True, {"0": 8, "1": 8}),
+        (5, 1, True, {"0": 1, "1": 1, "2": 1, "3": 1}),
+        (5, 1, False, {"0": 1, "1": 1, "2": 1}),
+    ],
+)
+def test_dspark_uses_separate_draft_input_budget(
+    tmp_path,
+    monkeypatch,
+    async_scheduling,
+    running,
+    adaptive_verification,
+    num_requests,
+    num_tokens,
+    sample_from_anchor,
+    expected,
+):
+    """Target capacity is independent, but draft queries still bound admission."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=16,
+        num_speculative_tokens=4,
+        speculative_method="ngram_gpu",
+        parallel_drafting=True,
+        skip_tokenizer_init=True,
+        async_scheduling=async_scheduling,
+    )
+    spec = scheduler.vllm_config.speculative_config
+    assert spec is not None
+    assert spec.max_num_new_slots_for_drafting == 3
+    spec.method = "dspark"
+    spec.enable_adaptive_verification = adaptive_verification
+    spec.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(sample_from_anchor=sample_from_anchor)
+    )
+
+    for request in create_requests(num_requests=num_requests, num_tokens=num_tokens):
+        if running:
+            scheduler.requests[request.request_id] = request
+            scheduler.running.append(request)
+            request.status = RequestStatus.RUNNING
+        else:
+            scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens == expected
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("num_speculative_tokens", [None, 0])
+@pytest.mark.parametrize(
+    "num_requests,num_tokens,expected",
+    [
+        (3, 8, {"0": 8, "1": 8}),
+        (5, 1, {"0": 1, "1": 1, "2": 1, "3": 1, "4": 1}),
+    ],
+)
+def test_no_drafting_preserves_input_budget(
+    tmp_path,
+    monkeypatch,
+    async_scheduling,
+    num_speculative_tokens,
+    num_requests,
+    num_tokens,
+    expected,
+):
+    """Absent or zero speculation retains the existing prefill and admission sizes."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
+    )
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        max_num_batched_tokens=16,
+        skip_tokenizer_init=True,
+        async_scheduling=async_scheduling,
+    )
+    if num_speculative_tokens == 0:
+        # Public config validation rejects K=0; exercise the scheduler boundary.
+        spec = SpeculativeConfig(model="ngram", num_speculative_tokens=1)
+        spec.num_speculative_tokens = 0
+        spec.method = "dspark"
+        assert spec.max_num_new_slots_for_drafting == 0
+        scheduler.vllm_config.speculative_config = spec
+
+    for request in create_requests(num_requests=num_requests, num_tokens=num_tokens):
+        scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens == expected
+
+
 # Note - these test cases mirror some of those in test_rejection_sampler.py
 @pytest.mark.parametrize(
     "spec_tokens,output_tokens,expected,expected_per_req",
