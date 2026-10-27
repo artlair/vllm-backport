@@ -43,6 +43,9 @@ from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
 
+# Non-tensor values ride the existing PP metadata without device work.
+_PP_STEP_KEY = "__pp_step_id__"
+
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
     if not any(num_nans_in_logits.values()):
