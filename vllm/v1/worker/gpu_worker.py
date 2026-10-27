@@ -144,6 +144,10 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+# Non-tensor values ride the existing PP metadata without device work.
+_PP_STEP_KEY = "__pp_step_id__"
+
+
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
@@ -223,6 +227,8 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
+        # Count forwards from the same broadcast SchedulerOutput on every PP rank.
+        self._pp_step_id = 0
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -1183,6 +1189,8 @@ class Worker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if forward_pass:
+            self._pp_step_id += 1
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
@@ -1224,6 +1232,19 @@ class Worker(WorkerBase):
                 )
             )
             assert tensor_dict is not None
+            # Pop metadata before the lazy wrapper and persistent-buffer copy.
+            # This touches no tensors and leaves communication asynchronous.
+            sender_step_id = tensor_dict.pop(_PP_STEP_KEY, None)
+            if sender_step_id != self._pp_step_id:
+                raise RuntimeError(
+                    "Pipeline-parallel stream desynchronized: this rank is "
+                    f"executing PP step {self._pp_step_id} "
+                    f"(num_scheduled_tokens={num_scheduled_tokens}) but the "
+                    "intermediate tensors received from the previous stage "
+                    f"belong to PP step {sender_step_id}. The upstream "
+                    "stage skipped or double-sent a forward. Check its "
+                    "log for 'WorkerProc hit an exception.'"
+                )
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
@@ -1256,7 +1277,7 @@ class Worker(WorkerBase):
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
         handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
+            {_PP_STEP_KEY: self._pp_step_id, **output.tensors},
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
