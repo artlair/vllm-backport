@@ -72,6 +72,7 @@ from vllm.v1.kv_cache_interface import (
     KpoolTailSpec,
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import (
@@ -599,6 +600,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_sizes = []
         max_num_blocks_per_group = []
         slot_mapping_enabled = []
+        sliding_window_reach = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
@@ -611,6 +613,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # vs a 32-wide row) and crash with an illegal memory access.
             slot_mapping_enabled.append(
                 not isinstance(layer_spec, (CircularBufferSpec, KpoolTailSpec))
+            )
+            # KpoolTailSpec is circular scratch, not a position-indexed window.
+            sliding_window_reach.append(
+                layer_spec.num_retained_tokens
+                if isinstance(layer_spec, SlidingWindowSpec)
+                and not isinstance(layer_spec, KpoolTailSpec)
+                else 0
             )
             # Let each cache type account for CP. Attention KV is DCP-sharded,
             # while Mamba/GDN recurrent state is replicated across DCP ranks.
@@ -688,6 +697,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             kernel_block_sizes=self.kernel_block_sizes,
             slot_mapping_enabled=slot_mapping_enabled,
+            sliding_window_reach=sliding_window_reach,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
@@ -1580,6 +1590,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         block_tables = self.block_tables.gather_block_tables(
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
+            num_computed_tokens=self.req_states.num_computed_tokens.gpu,
         )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.

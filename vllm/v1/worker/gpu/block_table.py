@@ -27,6 +27,7 @@ class BlockTables:
         cp_rank: int = 0,
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
+        sliding_window_reach: list[int] | None = None,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -44,6 +45,12 @@ class BlockTables:
             slot_mapping_enabled = [True] * self.num_kv_cache_groups
         assert len(slot_mapping_enabled) == self.num_kv_cache_groups
         self._slot_mapping_enabled = slot_mapping_enabled
+        # CP columns do not represent contiguous token ranges.
+        if sliding_window_reach is None or cp_size > 1:
+            sliding_window_reach = [0] * self.num_kv_cache_groups
+        assert len(sliding_window_reach) == self.num_kv_cache_groups
+        self._sliding_window_reach = sliding_window_reach
+        self.has_sliding_window_groups = any(r > 0 for r in sliding_window_reach)
 
         self.blocks_per_kv_block = [
             bs // kbs for bs, kbs in zip(block_sizes, kernel_block_sizes)
@@ -109,6 +116,9 @@ class BlockTables:
         self.slot_mapping_enabled = torch.tensor(
             self._slot_mapping_enabled, dtype=torch.bool, device=self.device
         )
+        self.sliding_window_reach = torch.tensor(
+            self._sliding_window_reach, dtype=torch.int32, device=self.device
+        )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
     def append_block_ids(
@@ -153,9 +163,24 @@ class BlockTables:
         num_reqs_padded: int,
         out: tuple[torch.Tensor, ...] | None = None,
         out_ptrs: torch.Tensor | None = None,
+        num_computed_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
+        """Gather forward-pass rows, nulling entries below the retained window.
+
+        num_computed_tokens is device-side and indexed by request slot. When
+        provided, sliding-window entries wholly below its retained reach become
+        the null block. Freed pages can contain NaN, which propagates even from
+        masked positions in attention tiles. Persistent tables and KV write slot
+        mappings are not changed.
+        """
         if self.num_kv_cache_groups == 0:
             return ()
+        mask_sliding_window = (
+            self.has_sliding_window_groups and num_computed_tokens is not None
+        )
+        if not mask_sliding_window:
+            # Unused by the kernel; any int32 tensor satisfies the signature.
+            num_computed_tokens = self.sliding_window_reach
         num_reqs = idx_mapping.shape[0]
         num_rows = num_reqs_padded
         if out is None:
@@ -175,6 +200,10 @@ class BlockTables:
             self.num_blocks.gpu,
             self.num_blocks.gpu.stride(0),
             num_reqs,
+            num_computed_tokens,
+            self.sliding_window_reach,
+            self.kernel_block_sizes_tensor,
+            MASK_SLIDING_WINDOW=mask_sliding_window,
             BLOCK_SIZE=1024,  # type: ignore
         )
         return tuple(bt[:num_reqs_padded] for bt in out)
@@ -249,6 +278,10 @@ def _gather_block_tables_kernel(
     num_blocks_ptr,  # [num_kv_cache_groups, max_num_reqs]
     num_blocks_stride,
     num_reqs,  # actual number of requests (for padding)
+    num_computed_tokens_ptr,  # [max_num_reqs]
+    sliding_window_reach_ptr,  # [num_kv_cache_groups]
+    kernel_block_sizes_ptr,  # [num_kv_cache_groups]
+    MASK_SLIDING_WINDOW: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # kv cache group id
@@ -274,9 +307,23 @@ def _gather_block_tables_kernel(
     src_block_table_ptr = _load_ptr(src_block_table_ptrs + group_id, tl.int32)
     src_row_ptr = src_block_table_ptr + req_idx * stride
 
+    num_null = 0
+    if MASK_SLIDING_WINDOW:
+        reach = tl.load(sliding_window_reach_ptr + group_id)
+        first_pos = tl.load(num_computed_tokens_ptr + req_idx)
+        # Each column holds a kernel block, not a logical KV block.
+        block_size = tl.load(kernel_block_sizes_ptr + group_id)
+        num_null = tl.where(
+            reach > 0, tl.maximum(first_pos - reach, 0) // block_size, 0
+        )
+
     for i in tl.range(0, num_blocks, BLOCK_SIZE):
         offset = i + tl.arange(0, BLOCK_SIZE)
-        block_ids = tl.load(src_row_ptr + offset, mask=offset < num_blocks)
+        block_ids = tl.load(
+            src_row_ptr + offset,
+            mask=(offset >= num_null) & (offset < num_blocks),
+            other=0,
+        )
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
 
 

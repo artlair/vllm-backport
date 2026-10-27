@@ -6,6 +6,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import SlidingWindowMLASpec, SlidingWindowSpec
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skipif(
@@ -312,6 +313,84 @@ def test_dummy_request_slot_mapping_is_pad():
         num_tokens_padded=3,
     )
     assert dummy[0].tolist() == [PAD_SLOT_ID] * 3
+
+
+@pytest.mark.parametrize("kernel_block_size", [8, 16])
+@pytest.mark.parametrize("extra_retained_tokens", [0, 4])
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_gather_block_tables_nulls_blocks_below_sliding_window(
+    kernel_block_size, extra_retained_tokens, cp_size
+):
+    """Freed SWA pages must not reach attention, even when NaN would be masked.
+
+    Kernel-sized columns touching the retained window stay readable, while
+    persistent tables and write slots must remain unchanged. CP is excluded.
+    """
+    device = torch.device("cuda")
+    spec = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        sliding_window=32,
+        extra_retained_tokens=extra_retained_tokens,
+    )
+    reach = spec.num_retained_tokens
+    assert reach == 31 + extra_retained_tokens
+    assert isinstance(spec, SlidingWindowSpec)
+    tables = BlockTables(
+        block_sizes=[16, 16],
+        max_num_reqs=4,
+        max_num_batched_tokens=64,
+        max_num_blocks_per_group=[16, 16],
+        device=device,
+        kernel_block_sizes=[16, kernel_block_size],
+        sliding_window_reach=[0, reach],
+        cp_size=cp_size,
+    )
+    req_slots = [2, 0, 3]
+    for slot in req_slots:
+        tables.append_block_ids(
+            slot,
+            (list(range(1, 13)), list(range(21, 33))),
+            overwrite=True,
+        )
+    tables.apply_staged_writes()
+    persistent = [table.gpu.clone() for table in tables.block_tables]
+    idx_mapping = torch.tensor(req_slots, dtype=torch.int32, device=device)
+    # Slot-indexed, not batch-indexed; slot 3 has no computed tokens yet.
+    num_computed_tokens = torch.tensor(
+        [120, 0, 143, 0], dtype=torch.int32, device=device
+    )
+    query_start_loc = torch.arange(4, dtype=torch.int32, device=device)
+    positions = num_computed_tokens[idx_mapping]
+    slots_before = tables.compute_slot_mappings(
+        idx_mapping, query_start_loc, positions, num_tokens_padded=4
+    ).clone()
+
+    full, swa = tables.gather_block_tables(
+        idx_mapping, num_reqs_padded=4, num_computed_tokens=num_computed_tokens
+    )
+    for row, slot in enumerate(req_slots):
+        assert full[row, :12].tolist() == list(range(1, 13))
+        expected = persistent[1][slot].clone()
+        if cp_size == 1:
+            cutoff = max(positions[row].item() - reach, 0) // kernel_block_size
+            expected[:cutoff] = 0
+        torch.testing.assert_close(swa[row], expected)
+    assert full[3].count_nonzero().item() == 0
+    assert swa[3].count_nonzero().item() == 0
+    for table, before in zip(tables.block_tables, persistent):
+        torch.testing.assert_close(table.gpu, before)
+    torch.testing.assert_close(tables.slot_mappings[:, :4], slots_before)
+    slots_after = tables.compute_slot_mappings(
+        idx_mapping, query_start_loc, positions, num_tokens_padded=4
+    )
+    torch.testing.assert_close(slots_after, slots_before)
+
+    # Callers without positions (including PCP) keep verbatim rows.
+    _, swa = tables.gather_block_tables(idx_mapping, num_reqs_padded=3)
+    torch.testing.assert_close(swa, persistent[1][idx_mapping])
 
 
 @pytest.fixture

@@ -29,11 +29,13 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch, spec_kind):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144
     runner.is_encoder_decoder = False
+    runner.use_pp = False
     runner.dcp_size = 1
     runner.dcp_rank = 0
     runner.cp_interleave = 1
     runner.cache_config = SimpleNamespace(enable_prefix_caching=True)
     parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
         decode_context_parallel_size=1,
         cp_kv_cache_interleave_size=1,
     )
@@ -106,6 +108,9 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch, spec_kind):
         lambda **kwargs: None,
     )
 
+    monkeypatch.setattr(
+        model_runner_module, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
     captured = {}
 
     class BlockTablesCaptured(Exception):
@@ -120,8 +125,13 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch, spec_kind):
     with pytest.raises(BlockTablesCaptured):
         runner.initialize_kv_cache(kv_cache_config)
 
-    assert captured["max_num_blocks_per_group"] == [1, 1]
+    # Kpool tail rows retain the kernel's 128-token table alignment.
+    assert captured["max_num_blocks_per_group"] == [
+        1 if spec_kind == "circular" else 16,
+        1,
+    ]
     assert captured["slot_mapping_enabled"] == [False, True]
+    assert captured["sliding_window_reach"] == [0, 0]
 
 
 @pytest.mark.parametrize(
