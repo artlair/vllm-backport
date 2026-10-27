@@ -555,6 +555,7 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
 
     auxiliary = [torch.cuda.Stream()] if use_aux else None
     attention = SimpleNamespace(
+        relay_shadow=False,
         compressor=compressor,
         indexer=prepare_indexer,
         aux_stream_list=auxiliary,
