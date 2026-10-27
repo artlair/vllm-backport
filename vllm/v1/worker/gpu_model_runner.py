@@ -229,7 +229,7 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.utils import (
-    _PP_STEP_KEY,
+    PP_STEP_KEY,
     EncoderTimingStats,
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
@@ -4521,7 +4521,7 @@ class GPUModelRunner(
                         )
                     }
                     get_pp_group().send_tensor_dict(
-                        {_PP_STEP_KEY: self._pp_step_id, **hidden_states.tensors},
+                        {PP_STEP_KEY: self._pp_step_id, **hidden_states.tensors},
                         all_gather_group=get_tp_group(),
                         all_gather_tensors=all_gather_tensors,
                     )

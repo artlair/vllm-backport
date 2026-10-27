@@ -91,7 +91,7 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
-from vllm.v1.worker.utils import _PP_STEP_KEY, is_residual_scattered_for_sp
+from vllm.v1.worker.utils import PP_STEP_KEY, is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -1230,7 +1230,7 @@ class Worker(WorkerBase):
             assert tensor_dict is not None
             # Pop metadata before the lazy wrapper and persistent-buffer copy.
             # This touches no tensors and leaves communication asynchronous.
-            sender_step_id = tensor_dict.pop(_PP_STEP_KEY, None)
+            sender_step_id = tensor_dict.pop(PP_STEP_KEY, None)
             if sender_step_id != self._pp_step_id:
                 raise RuntimeError(
                     "Pipeline-parallel stream desynchronized: this rank is "
@@ -1275,7 +1275,7 @@ class Worker(WorkerBase):
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
         handles = get_pp_group().isend_tensor_dict(
-            {_PP_STEP_KEY: self._pp_step_id, **output.tensors},
+            {PP_STEP_KEY: self._pp_step_id, **output.tensors},
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
