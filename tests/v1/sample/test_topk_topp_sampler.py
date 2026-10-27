@@ -871,6 +871,30 @@ class TestTritonTopkTopp:
         )
         assert len(kept_idx) == pytorch_kept
 
+    def test_topp_ties_across_blocks(self):
+        """Split top-p must carry the boundary tie budget across slice blocks."""
+        from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+        batch_size, vocab_size, num_ties = 64, 151936, 4096
+        # Spread ties across 8192-entry blocks, above a low tail so the search
+        # can put its pivot below the tie value rather than keeping everything.
+        tie_idx = torch.arange(num_ties) * 37
+        logits = torch.full((batch_size, vocab_size), -8.0)
+        logits[:, tie_idx] = 0.0
+        logits[:, -64:] = 4.0
+        p = torch.full((batch_size,), 0.75, dtype=torch.float32)
+
+        kept = apply_top_k_top_p_triton(logits.clone(), None, p) != float("-inf")
+        expected = apply_top_k_top_p_pytorch(logits.clone(), None, p) != float("-inf")
+        num_kept, num_expected = kept.sum(dim=-1), expected.sum(dim=-1)
+        assert torch.equal(num_kept, num_expected), (
+            f"kept {num_kept.unique().tolist()}, "
+            f"expected {num_expected.unique().tolist()}"
+        )
+        kept_ties = kept[:, tie_idx]
+        num_kept_ties = kept_ties.sum(dim=-1, keepdim=True)
+        assert torch.equal(kept_ties, torch.arange(num_ties) < num_kept_ties)
+
 
 # =============================================================================
 # FlashInfer top-k/top-p robustness tests
