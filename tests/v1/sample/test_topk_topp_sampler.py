@@ -809,6 +809,35 @@ class TestTritonTopkTopp:
             f"{kept_topk_topp.tolist()}"
         )
 
+    @pytest.mark.parametrize("batch_size", [4, 64], ids=["split", "split-boundary"])
+    @pytest.mark.parametrize(
+        "forced_logit", [1e9, 1e9 / 0.6], ids=["1e9", "1e9_over_temp0.6"]
+    )
+    def test_topp_keeps_forced_huge_logit(self, batch_size: int, forced_logit: float):
+        """Huge forced logits must survive top-p without producing NaN softmax.
+
+        At 1e9 (also after temperature=0.6), the logit-space pivot rounds
+        to the row maximum in fp32. Both batch sizes use the split pipeline.
+        """
+        from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+        vocab_size, forced_token = 131072, 13
+        logits = torch.randn(
+            batch_size, vocab_size, generator=self.generator, dtype=torch.float32
+        )
+        logits[:, forced_token] = forced_logit
+        p = torch.full((batch_size,), 0.95, dtype=torch.float32)
+
+        result = apply_top_k_top_p_triton(logits.clone(), None, p)
+
+        assert (result[:, forced_token] == forced_logit).all()
+        probs = result.softmax(dim=-1)
+        assert not probs.isnan().any()
+        assert (probs.argmax(dim=-1) == forced_token).all()
+        if current_platform.is_cuda_alike():
+            # The monolithic kernel leaves this row unmasked on other devices.
+            assert ((result != float("-inf")).sum(-1) == 1).all()
+
     def test_topp_tie_break_deterministic(self):
         """Boundary-duplicate trimming must be deterministic across calls.
 
@@ -841,6 +870,30 @@ class TestTritonTopkTopp:
             .item()
         )
         assert len(kept_idx) == pytorch_kept
+
+    def test_topp_ties_across_blocks(self):
+        """Split top-p must carry the boundary tie budget across slice blocks."""
+        from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
+
+        batch_size, vocab_size, num_ties = 64, 151936, 4096
+        # Spread ties across 8192-entry blocks, above a low tail so the search
+        # can put its pivot below the tie value rather than keeping everything.
+        tie_idx = torch.arange(num_ties) * 37
+        logits = torch.full((batch_size, vocab_size), -8.0)
+        logits[:, tie_idx] = 0.0
+        logits[:, -64:] = 4.0
+        p = torch.full((batch_size,), 0.75, dtype=torch.float32)
+
+        kept = apply_top_k_top_p_triton(logits.clone(), None, p) != float("-inf")
+        expected = apply_top_k_top_p_pytorch(logits.clone(), None, p) != float("-inf")
+        num_kept, num_expected = kept.sum(dim=-1), expected.sum(dim=-1)
+        assert torch.equal(num_kept, num_expected), (
+            f"kept {num_kept.unique().tolist()}, "
+            f"expected {num_expected.unique().tolist()}"
+        )
+        kept_ties = kept[:, tie_idx]
+        num_kept_ties = kept_ties.sum(dim=-1, keepdim=True)
+        assert torch.equal(kept_ties, torch.arange(num_ties) < num_kept_ties)
 
 
 # =============================================================================
