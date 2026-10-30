@@ -1180,7 +1180,7 @@ struct FilteredTopKTraits<float> {
   }
 
   __device__ __forceinline__ static OrderedType ToOrdered(float x) {
-    return convert_to_uint32_v2(x);
+    return hist4096::convert_to_uint32_v2(x);
   }
 };
 
