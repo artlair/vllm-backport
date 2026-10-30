@@ -14,6 +14,8 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     gather_draft_sampled,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+    _compute_local_logits_stats_kernel,
+    _compute_local_residual_mass_kernel,
     rejection_sample,
 )
 
@@ -87,6 +89,37 @@ def _build_rejection_sample_inputs(
         temperature=temp_tensor,
         seed=seed,
     )
+
+
+def test_rejection_stats_reuse_compilation_across_batch_sizes():
+    """K4 verification shapes must not specialize either statistics kernel."""
+    kernels = (
+        _compute_local_logits_stats_kernel,
+        _compute_local_residual_mass_kernel,
+    )
+
+    def compiled_variants(kernel):
+        return {key for caches in kernel.device_caches.values() for key in caches[0]}
+
+    warmed = None
+    for num_trials in (1, 8, 16):
+        inputs = _build_rejection_sample_inputs(
+            torch.zeros(32, device="cuda"),
+            torch.zeros(32, device="cuda"),
+            num_speculative_steps=4,
+            temperature=1.0,
+            num_trials=num_trials,
+        )
+        _, num_sampled = rejection_sample(
+            **inputs, num_speculative_steps=4, use_block_verification=True
+        )
+        assert (num_sampled == 5).all()
+        variants = tuple(compiled_variants(kernel) for kernel in kernels)
+        if warmed is None:
+            assert all(variants)
+            warmed = variants
+        else:
+            assert variants == warmed
 
 
 @pytest.mark.parametrize("temperature", [0.0, 1.0])

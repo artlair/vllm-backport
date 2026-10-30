@@ -143,7 +143,7 @@ def _assert_matches_torch(logits, lengths, out, k):
 @requires_cuda
 @pytest.mark.parametrize("num_rows", [16, 48])
 @torch.inference_mode()
-def test_persistent_topk_nan_ordering_matches_torch(num_rows: int) -> None:
+def test_persistent_topk_positive_nan_ordering_matches_torch(num_rows: int) -> None:
     live_len = 65536
     topk = 2048
     gen = torch.Generator(device="cuda").manual_seed(0)
