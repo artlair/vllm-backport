@@ -677,6 +677,18 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if (
+                self.num_sampled_tokens_per_step > 0
+                and request.spec_token_ids
+                and request.num_computed_tokens
+                >= request.num_tokens + request.num_output_placeholders
+            ):
+                # PP can relay drafts before their sampled target reaches the
+                # scheduler. Wait unless an actual token or in-flight placeholder
+                # supplies the target row needed to verify them.
+                req_index += 1
+                continue
+
+            if (
                 self.ec_connector is not None
                 and request.mm_features
                 and not self.ec_connector.ensure_cache_available(
@@ -842,6 +854,10 @@ class Scheduler(SchedulerInterface):
                     + request.num_computed_tokens
                     - request.num_tokens
                     - request.num_output_placeholders
+                )
+                num_scheduled_spec_tokens = min(
+                    num_scheduled_spec_tokens,
+                    num_new_tokens - self.num_sampled_tokens_per_step,
                 )
                 if num_scheduled_spec_tokens > 0:
                     spec_token_ids = request.spec_token_ids
