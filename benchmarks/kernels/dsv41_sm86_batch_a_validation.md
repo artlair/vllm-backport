@@ -9,12 +9,12 @@ Batch A and A2 are implemented and running on rome2 and rome as
 - Both container image IDs:
   `cd282af1ef349ee2f1c8b94723e499bbcee6d9c179e446819db63fc3fe430caa`.
 - Successful build: [41056530266](https://github.com/artlair/vllm-backport/actions/runs/41056530266).
-- Salt: `ai/dsv41-batch-a-rollout` at `80aac5f`,
+- Salt: main at `181ba3c` after the operator-approved merge of
   [my-salt PR #812](https://github.com/artlair/my-salt/pull/812).
-- Both scoped Salt applies succeeded with zero failed states. The net pillar diff
-  is exactly the two image pins. Both hosts are on that Salt branch, not main;
-  repository policy requires human review and merge. Applying the old main pin
-  before merging the PR would restore the old image.
+  The initial rollout used `ai/dsv41-batch-a-rollout` at `80aac5f`.
+- Both initial scoped Salt applies succeeded with zero failed states. The net pillar
+  diff is exactly the two image pins. After the merge, both hosts were converged from
+  main without restarting either service or changing the running image.
 
 The operator authorized interrupting the live lane overnight and deploying follow-up
 fixes. The head and worker were stopped before native tests, then the worker was
@@ -181,6 +181,9 @@ confirmation raw requests/waves, comparison JSONs, GSM summaries, review/audit r
 and kernel-health snapshots. `PLAN.md` records the prospective gate and confirmation
 choices. The original sealed fixture under `dsv41-ports-20261027/` was never resealed.
 
-After human merge, converge both hosts from main and verify the same image IDs and
-service PIDs. Until then, the deployed Salt branch is intentional and must not be
-mistaken for convergence to main.
+On 2026-10-31 the operator approved merging PR #812 as `181ba3c`. Gitfs and pillar
+were refreshed, both main dry runs showed no unit change, and scoped main applies
+completed with zero failures. Only the unconditional service-enable command reported
+a change. Both hosts retained their service PIDs/start times and `9842ce767-serve`
+image; the registry manifest was unchanged and `/health` succeeded. Artifacts are
+under `main-convergence/` in the same root. Neither host remains on the trial branch.
