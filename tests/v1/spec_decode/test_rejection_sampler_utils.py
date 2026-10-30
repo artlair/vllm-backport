@@ -438,16 +438,18 @@ def test_gumbel_drafted_rejection_sample_is_unbiased(num_speculative_steps: int)
         )
 
 
-@pytest.mark.parametrize("num_speculative_steps", [1, 3])
-def test_greedy_rejection_sample(num_speculative_steps: int):
+@pytest.mark.parametrize(
+    ("num_speculative_steps", "num_trials"),
+    [(1, 10 * VOCAB_SIZE), (3, 10 * VOCAB_SIZE), (4, 1), (4, 8), (4, 16)],
+)
+def test_greedy_rejection_sample(num_speculative_steps: int, num_trials: int):
     """
     Verify that greedy (temperature=0) always outputs the target argmax
-    at every accepted position.
+    at every accepted position, including small K4 verification batches.
     """
 
     torch.manual_seed(42)
     device = "cuda"
-    num_trials = 10 * VOCAB_SIZE
 
     target_logits_1d = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
     draft_logits_1d = torch.randn(VOCAB_SIZE, device=device, dtype=torch.float32)
