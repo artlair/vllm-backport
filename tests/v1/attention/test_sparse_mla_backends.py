@@ -41,6 +41,7 @@ if not current_platform.is_cuda():
     )
 
 import vllm.v1.attention.backends.mla.flashinfer_mla_sparse as flashinfer_sparse_mod
+import vllm.v1.attention.backends.mla.indexer as indexer_mod
 from vllm.model_executor.layers.attention.mla_attention import (
     _canonicalize_sparse_mla_kv_cache_dtype,
 )
@@ -62,6 +63,7 @@ from vllm.v1.attention.backends.utils import (
     split_prefill_chunks,
 )
 from vllm.v1.attention.ops import flashmla
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 SPARSE_BACKEND_BATCH_SPECS = {
     name: BATCH_SPECS[name]
@@ -1431,6 +1433,73 @@ def test_split_indexer_prefill_chunks(
         max_logits_bytes,
     )
     assert out == expected
+
+
+@pytest.mark.parametrize("requests", [1, 4, 8, 40, 64])
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+def test_indexer_profile_bound_covers_real_chunk_plan(
+    monkeypatch, requests, compress_ratio
+):
+    """The profiled gather capacity must cover every real prefill chunk."""
+    max_model_len = 131328
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_model_len),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=requests,
+            max_num_batched_tokens=8,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=None,
+        attention_config=SimpleNamespace(
+            resolve_indexer_kv_dtype=lambda default: default
+        ),
+        num_speculative_tokens=0,
+    )
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.uint8,
+        tokens_per_state=compress_ratio,
+    )
+    monkeypatch.setattr(indexer_mod.envs, "VLLM_INDEXER_QUERY_SHARD", False)
+    monkeypatch.setattr(indexer_mod, "num_compute_units", lambda _: 1)
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec,
+        ["indexer"],
+        config,
+        torch.device("cpu"),
+        block_table_width=1,
+    )
+
+    expected_capacity = max_model_len * min(40, requests) // compress_ratio
+    assert builder.max_prefill_buffer_size == expected_capacity
+
+    query_len = 8192
+    compressed_seq_lens = torch.full((requests,), max_model_len // compress_ratio)
+    query_lens = torch.full((requests,), query_len)
+    max_logits_bytes = 4 * query_lens.sum().item() * compressed_seq_lens.sum().item()
+    chunks = builder._split_indexer_prefill_chunks(
+        compressed_seq_lens,
+        query_lens,
+        builder.max_prefill_buffer_size,
+        max_logits_bytes,
+    )
+
+    covered_requests: list[int] = []
+    covered_queries = 0
+    for req_slice, query_slice in chunks:
+        chunk_requests = req_slice.stop - req_slice.start
+        assert compressed_seq_lens[req_slice].sum() <= expected_capacity
+        assert query_slice == slice(0, chunk_requests * query_len)
+        covered_requests.extend(range(req_slice.start, req_slice.stop))
+        covered_queries += query_slice.stop - query_slice.start
+    assert covered_requests == list(range(requests))
+    assert covered_queries == requests * query_len
 
 
 def test_split_indexer_prefill_chunks_single_request_overflow():

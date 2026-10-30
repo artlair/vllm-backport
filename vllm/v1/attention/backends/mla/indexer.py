@@ -842,7 +842,9 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    # A profiling step cannot gather more than max_num_seqs request contexts.
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    return max_model_len * min(40, max_num_seqs)
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:
@@ -971,8 +973,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 f"cp_kv_cache_interleave_size=1 (got "
                 f"{self.cp_kv_cache_interleave_size})."
             )
-        # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
-        self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
             self.vllm_config.speculative_config.num_speculative_tokens
             if self.vllm_config.speculative_config
@@ -1061,6 +1061,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 "DCP is not supported with sparse indexer KV compression "
                 f"(compress_ratio={self.compress_ratio})."
             )
+        # Keep real chunking within the compressed gather capacity profiled by
+        # the indexer op.
+        self.max_prefill_buffer_size = (
+            get_max_prefill_buffer_size(self.vllm_config) // self.compress_ratio
+        )
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
