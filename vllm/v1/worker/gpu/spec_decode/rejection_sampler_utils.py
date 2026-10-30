@@ -204,7 +204,7 @@ def _is_bonus_logit(expanded_local_pos_ptr, logit_idx, num_logits):
     return next_local_pos == 0
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_logits"])
 def _compute_local_logits_stats_kernel(
     # [num_logits, num_blocks]
     target_local_argmax_ptr,
@@ -403,7 +403,7 @@ def _compute_cumulative_log_p_kernel(
         tl.store(cumulative_log_p_ptr + logit_idx, log_p)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_logits"])
 def _compute_local_residual_mass_kernel(
     # [num_logits, num_blocks]
     local_residual_mass_ptr,

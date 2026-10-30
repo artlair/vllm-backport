@@ -141,6 +141,39 @@ def _assert_matches_torch(logits, lengths, out, k):
 
 
 @requires_cuda
+@pytest.mark.parametrize("num_rows", [16, 48])
+@torch.inference_mode()
+def test_persistent_topk_nan_ordering_matches_torch(num_rows: int) -> None:
+    live_len = 65536
+    topk = 2048
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    logits = torch.randn((num_rows, live_len), generator=gen, device="cuda")
+    positions = (
+        torch.rand((num_rows, live_len), generator=gen, device="cuda")
+        .topk(topk // 4 + 3 * (topk // 8), dim=1)
+        .indices
+    )
+    n_nan, n_big = topk // 4, topk // 8
+    logits.scatter_(1, positions[:, :n_nan], float("nan"))
+    logits.scatter_(1, positions[:, n_nan : n_nan + n_big], float("inf"))
+    logits.scatter_(
+        1,
+        positions[:, n_nan + n_big : n_nan + 2 * n_big],
+        torch.finfo(torch.float32).max,
+    )
+    logits.scatter_(1, positions[:, n_nan + 2 * n_big :], 1e30)
+    lengths = torch.full((num_rows,), live_len, dtype=torch.int32, device="cuda")
+
+    out = _run_persistent_topk(logits, lengths, topk, live_len)
+    assert torch.all((out >= 0) & (out < live_len))
+    sorted_indices = out.sort(dim=1).values
+    assert torch.all(sorted_indices[:, 1:] != sorted_indices[:, :-1])
+    actual = logits.gather(1, out.long()).sort(dim=1).values
+    expected = logits.topk(topk, dim=1).values.sort(dim=1).values
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+
+
+@requires_cuda
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
 @pytest.mark.parametrize("num_rows", [5, 10, 20])
 @pytest.mark.parametrize("live_len", [40000, 86016, 120000])

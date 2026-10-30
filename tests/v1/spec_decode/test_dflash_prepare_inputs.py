@@ -12,6 +12,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DFlashSpeculator,
+    _prepare_dflash_inputs_kernel,
     prepare_dflash_inputs,
 )
 
@@ -27,6 +28,7 @@ def _run_prepare(
     cp_rank: int = 0,
     cp_size: int = 1,
     cp_interleave: int = 1,
+    num_scheduled_tokens: int = 4,
 ):
     device = torch.device("cuda")
     max_num_reqs = 4
@@ -44,7 +46,7 @@ def _run_prepare(
     )
     input_batch = SimpleNamespace(
         num_reqs=1,
-        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        num_scheduled_tokens=np.array([num_scheduled_tokens], dtype=np.int32),
         positions=torch.tensor(target_positions, dtype=torch.int64, device=device),
         query_start_loc=torch.tensor([0, 4], dtype=torch.int32, device=device),
         idx_mapping=torch.tensor([2], dtype=torch.int32, device=device),
@@ -286,6 +288,24 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+def test_prepare_dflash_inputs_compiles_once_for_all_query_lengths():
+    def compiled_variants() -> set:
+        return {
+            key
+            for caches in _prepare_dflash_inputs_kernel.device_caches.values()
+            for key in caches[0]
+        }
+
+    _run_prepare(target_positions=[10, 11, 12, 13], block_table_values=[0, 7, 8])
+    warmed = compiled_variants()
+    _run_prepare(
+        target_positions=[10, 11, 12, 13],
+        block_table_values=[0, 7, 8],
+        num_scheduled_tokens=300,
+    )
+    assert compiled_variants() == warmed
 
 
 def test_dflash_forward_context_receives_draft_padding_mask(monkeypatch):

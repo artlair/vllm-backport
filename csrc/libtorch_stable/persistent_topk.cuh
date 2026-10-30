@@ -48,8 +48,7 @@ constexpr size_t kFixedSmemLarge =
 // ============================================================================
 
 __device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
-  uint32_t bits = __float_as_uint(x);
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  return topk_histogram_4096::convert_to_uint32_v2(x);
 }
 
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
@@ -822,6 +821,7 @@ __device__ void radix_topk(const float* __restrict__ row_input,
         next_hist[i] = 0;
       }
     }
+    __syncthreads();
 
     if (tx == 0) {
       red_release(&state->arrival_counter, 1);
@@ -1180,8 +1180,7 @@ struct FilteredTopKTraits<float> {
   }
 
   __device__ __forceinline__ static OrderedType ToOrdered(float x) {
-    uint32_t bits = __float_as_uint(x);
-    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    return convert_to_uint32_v2(x);
   }
 };
 
