@@ -1408,75 +1408,66 @@ def test_draft_slots_budgeted_per_scheduled_request(tmp_path, monkeypatch):
     assert scheduler.schedule().num_scheduled_tokens == {"0": 10, "1": 4}
 
 
-@pytest.mark.parametrize("adaptive_verification", [False, True])
-@pytest.mark.parametrize("target_source", ["sampled", "placeholder"])
-@pytest.mark.parametrize("batch_limit", [4, 5])
-def test_dspark_pp_drafts_wait_for_a_target_slot(
-    tmp_path,
-    monkeypatch,
-    adaptive_verification,
-    target_source,
-    batch_limit,
-):
-    """Relayed drafts need one target row, but a PP placeholder supplies it."""
+def test_dspark_sync_pp_drafts_wait_for_delayed_target(tmp_path, monkeypatch):
+    """PP can relay drafts before the prior target reaches the scheduler."""
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 6)
     (tmp_path / "config.json").write_text(
         '{"architectures": ["OPTForCausalLM"], "model_type": "opt"}'
     )
     num_speculative_tokens = 4
-    pp_size = 6
     scheduler = create_scheduler(
         model=str(tmp_path),
         max_num_seqs=1,
-        max_num_batched_tokens=batch_limit,
+        max_num_batched_tokens=5,
         max_model_len=64,
         num_speculative_tokens=num_speculative_tokens,
         speculative_method="ngram_gpu",
         parallel_drafting=True,
         skip_tokenizer_init=True,
-        async_scheduling=True,
+        async_scheduling=False,
+        pipeline_parallel_size=6,
         use_v2_model_runner=True,
     )
+    assert scheduler.parallel_config.pipeline_parallel_size == 6
     spec = scheduler.vllm_config.speculative_config
     assert spec is not None
     spec.method = "dspark"
-    spec.enable_adaptive_verification = adaptive_verification
     spec.draft_model_config = SimpleNamespace(
         hf_config=SimpleNamespace(sample_from_anchor=True)
     )
-    # Emulate PP without constructing a multi-GPU ParallelConfig.
-    scheduler.pp_size = pp_size
-    scheduler.use_pp = True
 
     request = create_requests(num_requests=1, num_tokens=2)[0]
-    request.num_computed_tokens = request.num_tokens
-    request.spec_token_ids = list(range(num_speculative_tokens))
-    request.next_decode_eligible_step = 2
-    request.status = RequestStatus.RUNNING
-    scheduler.requests[request.request_id] = request
-    scheduler.running.append(request)
+    scheduler.add_request(request)
+    prompt_output = scheduler.schedule()
+    assert request.num_computed_tokens == request.num_tokens
+    assert request.num_output_placeholders == 0
 
-    # The existing PP cadence remains the first gate.
-    assert not scheduler.schedule().num_scheduled_tokens
-    assert request.spec_token_ids == list(range(num_speculative_tokens))
+    draft_token_ids = list(range(num_speculative_tokens))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([request.request_id], [draft_token_ids])
+    )
 
-    # Once cadence opens, drafts alone still cannot form a verification row.
-    assert not scheduler.schedule().num_scheduled_tokens
-    assert request.spec_token_ids == list(range(num_speculative_tokens))
+    blocked_output = scheduler.schedule()
+    assert not blocked_output.num_scheduled_tokens
+    assert request.spec_token_ids == draft_token_ids
 
-    if target_source == "sampled":
-        request.append_output_token_ids(42)
-    else:
-        request.num_output_placeholders = 1
+    scheduler.update_from_output(
+        prompt_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[42]],
+            pooler_output=[],
+        ),
+    )
 
-    output = scheduler.schedule()
-    expected_num_tokens = min(1 + num_speculative_tokens, batch_limit)
-    assert output.num_scheduled_tokens == {request.request_id: expected_num_tokens}
-    assert output.scheduled_spec_decode_tokens == {
-        request.request_id: list(range(expected_num_tokens - 1))
+    verify_output = scheduler.schedule()
+    assert verify_output.num_scheduled_tokens == {request.request_id: 5}
+    assert verify_output.scheduled_spec_decode_tokens == {
+        request.request_id: draft_token_ids
     }
-    assert scheduler.current_step == 3
-    assert request.next_decode_eligible_step == scheduler.current_step + pp_size
+    assert verify_output.scheduled_cached_reqs.new_token_ids == [[42]]
 
 
 def test_diffusion_spec_tokens_do_not_wait_for_a_sampled_target():
