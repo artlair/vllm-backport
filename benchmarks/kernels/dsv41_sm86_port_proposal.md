@@ -7,15 +7,19 @@ kv_cache_dtype fp8_ds_mla, FULL_AND_PIECEWISE graphs (capture sizes 5..80),
 prefix caching, max-num-seqs 16, max-num-batched-tokens 2048, max_model_len 524288,
 Engram tables cpu_offloaded with gpu_resident_heads {1:2, 14:1}.
 
-Target: `dsv41-1017` @ `c41e5a8de` (deployed as `zot.lan/vllm-backport/dsv41:c41e5a8de-serve`).
+Proposal baseline: `dsv41-1017` @ `c41e5a8de` (then deployed as
+`zot.lan/vllm-backport/dsv41:c41e5a8de-serve`).
 Upstream base: `29e66dad46` (2026-09-26) + hand-ported PRs through ~#63427.
 Upstream swept: 2026-09-26 .. 2026-10-30 (tip `5d35ce3934`, #63812).
 
-**Status: proposal only.** Nothing described here has been ported. Batch A is held
-pending operator approval; this commit is the record, not the start of the work.
+**Status, 2026-10-31:** Batch A (P1-P5 + F2) and A2 (F1) are implemented and
+running as `9842ce767-serve` on rome2 and rome after operator approval. See
+[the rollout validation](dsv41_sm86_batch_a_validation.md) for evidence and limits.
+Other tiers remain proposals. The operator confirmed no `response_format` or
+grammar-constrained traffic, so grammar-specific items remain out of scope.
 
 Every candidate was checked twice: by PR number in commit bodies, and by code
-equivalence in the current tree. Eight upstream fixes turn out to be in HEAD already
+equivalence in the current tree. Several upstream fixes turn out to be in HEAD already
 under fork-local commits (`#59166`, `#64458`, `#61451`, `#61161`, `#62046`, `#58231`,
 `#62467`/`#62936`, `#61824`, `#56119`, `#56720`), so a number-only grep would have
 proposed them again.
@@ -24,10 +28,11 @@ proposed them again.
 
 ## Tier 0 - port now
 
-Ordered by (severity x cheapness). All five are unported, all five sit on paths this
-lane definitely executes.
+Ordered by (severity x cheapness). At the proposal baseline, all five were unported
+and sat on paths this lane executes.
 
 ### P1. `#63475` persistent_topk: sync the CTA around radix barrier arrivals
+
 **Correctness, silent wrong attention indices. One line.**
 
 - Upstream `3090266d88`, merged 2026-10-26. Diff: a single added `__syncthreads();`
@@ -53,6 +58,7 @@ lane definitely executes.
   claim to make.
 
 ### P2. `#64137` do not specialize MRV2 logits-stats kernels on `num_logits`
+
 **Runtime JIT cliff. Two decorator edits.**
 
 - Upstream `0d6f92ae7c`, merged 2026-10-29: `@triton.jit` ->
@@ -66,6 +72,7 @@ lane definitely executes.
 - Cost: negligible; keep the fork's FLy/DSpark rejection paths under test.
 
 ### P3. `#62748` skip idle sampler staged writes
+
 **Fixed host cost on every no-admission decode step.**
 
 - Upstream `d7f68d4c7d`, merged 2026-10-28: move `sampler.apply_staged_writes()`
@@ -79,6 +86,7 @@ lane definitely executes.
 - Lane relevance: only stage 5 owns the sampler, but every PP step waits on it.
 
 ### P4. `#63819` fixed `BLOCK_SIZE` in DSpark draft input preparation
+
 **Removes shape-driven Triton compiles mid-serving.**
 
 - Upstream `458334f00f`, merged 2026-10-28. The DSpark hunk is one line:
@@ -87,7 +95,7 @@ lane definitely executes.
 - Fork: same dynamic expression at
   `vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:779`. Because `BLOCK_SIZE` is a
   constexpr, new prompt-tail buckets compile new kernels while serving.
-- Upstream measurement (B300, CUPTI, author Misha Goin, k=7): decode bs1 19.7 -> 7.5 us,
+- Upstream measurement (B300, CUPTI, author @mgoin, k=7): decode bs1 19.7 -> 7.5 us,
   bs256 14.3 -> 5.3 us; runtime variants observed before, none after.
 - Port only the speculator hunk plus its test. **Omit** the `acceptance_estimator.py`
   and `warmup.py` hunks: those belong to adaptive verification, which this lane
@@ -97,6 +105,7 @@ lane definitely executes.
   moot once the block size is fixed.
 
 ### P5. `#63118` NaN-stable key conversion in top-k helpers (hardening)
+
 - Upstream fixes `bits | 0x80000000u` (which NVCC may contract to `-|x|`, canonicalizing
   NaNs) by reading float bits through opaque `mov.b32` PTX.
 - Fork still has the vulnerable expression at
@@ -116,6 +125,7 @@ in HEAD in a better form (see "already present" below) or does not fire on TP4xP
 items are worth taking now, two after a measurement, one is a low-priority hygiene item.
 
 ### F1. PP can schedule DSpark drafts before the sampled target token exists
+
 **Correctness. From buliao `84d7523838`.**
 
 - HEAD has the PP cadence check (`scheduler.py:667-671`) but then proceeds straight to
@@ -123,15 +133,21 @@ items are worth taking now, two after a measurement, one is a low-priority hygie
   stops speculative rows consuming the target token slot (`:838-850`). Buliao adds both
   (`84d7523838:scheduler.py:768-774`, `:943-953`) plus a CPU regression that builds the
   offending state and asserts the first schedule is empty.
-- Why this lane: DSpark under PP6 with the async Ray pipeline is exactly the race the
-  fork names; `next_decode_eligible_step` cadence does not subsume it.
-- Effect: fail-closed hardening against verifying a draft without its anchor. No
-  performance claim. Buliao validated 32K/128K requests and 8 concurrent, not this lane.
+- Follow-up audit corrected the initial lane claim: the guard is live for synchronous
+  PP, but defensive on this deployed async lane. Normal `AsyncScheduler` accounting
+  maintains `num_tokens + num_output_placeholders - num_computed_tokens >= 1`.
+  A real sync PP6 regression drives scheduling, early draft delivery, target output
+  delivery and the unblocked verification step; it fails when the guard is removed.
+- Effect: fail-closed hardening against verifying a draft without its anchor, not a
+  demonstrated async-lane race fix or performance gain. The draft-count clamp is
+  redundant under the current wait guard and is retained as a defensive bound.
+  Buliao validated 32K/128K requests and 8 concurrent on its own rig.
 - Port only the two invariants and the regression, not the composite commit (it also
   carries CPU-hybrid scheduler changes). Medium-high risk against the fork's adaptive
   step-id and confidence-relay machinery.
 
 ### F2. Indexer prefill scratch is sized for 40 requests, but this lane allows 16
+
 **Memory, ~1.5 GiB per rank. Two lines. From the same buliao commit.**
 
 - `vllm/v1/attention/backends/mla/indexer.py:845` returns `max_model_len * 40`; the
@@ -148,6 +164,7 @@ items are worth taking now, two after a measurement, one is a low-priority hygie
   for PP-local request counts. Low-medium risk, isolate it from F1.
 
 ### F3. Exact DSpark draft CUDA-graph buckets (measure; precondition now verified)
+
 Luixiao `e9ec85d14a` derives draft-specific capture sizes instead of rounding target
 sizes to `decode_query_len`. With k=4 and anchor mode (`sample_from_anchor=true`,
 `dspark/speculator.py:52-61`) draft captures become `[8,12,16,20,32,40,60,64/80]`, so C1
@@ -160,12 +177,14 @@ attribute to `True`, so `num_query_per_req == k == 4` and the mismatch fires.
 Unmeasured by the fork; small graph-descriptor memory cost.
 
 ### F4. Build Ampere prefill indices on device (measure)
+
 PP170 `2fd36330e4` replaces the shared Torch chain (`repeat_interleave`, `arange`, masks,
 advanced indexing, `index_copy_`) in `deepseek_v4_1/amd/rocm.py:166-245` with one Triton
 launch, behind an Ampere-only override, removing launch count and an implicit D2H sync
 from TTFT. Unmeasured; exact-output tests and 64K/256K needle retrieval only.
 
 ### F5. Power-of-two reuse for prefill-logits allocations (low priority)
+
 PP170 `0f61e15c64` rounds `[M,N]` fp32 logits capacity up to `next_power_of_2(N)` so the
 allocator can reuse it as contexts grow. Prefer buliao's later fixed-workspace variant
 (`56132ba33a`) over this older allocator tactic; HEAD has since gained a shared workspace
@@ -212,6 +231,7 @@ fork-local mechanisms this lane depends on (`common/pp_relay.py`, `ampere/ampere
 Engram `gpu_resident_heads`) would all have to be reimplemented upstream-side first.
 
 Concrete consequences for this proposal:
+
 - **Decoder replay graphs** (`#58132`/`#59532`/`#63155`): real GB200 prefill gains, but the
   implementation assumes one PP rank owns layers 20-39. The lane splits that tail over
   three stages, so adopting it needs a new cross-stage replay-row and metadata protocol.
@@ -226,6 +246,7 @@ Concrete consequences for this proposal:
   record's rule against transferring unmeasured micro-tuning across hardware applies.
 
 ### P6 (conditional, do not ship blind). `#59986` keep DSv4.1 sparse prefill out of FULL graphs
+
 Two children disagreed about this one; the code settles it. Upstream `8977b13a1c` flips
 `DeepseekV4SparseMLAMetadataBuilder` and `CompressorMetadataBuilder` from `ALWAYS` to
 `UNIFORM_BATCH` and adds `get_varlen_cudagraph_max_query_len() = max_decode_query_len()`;
@@ -251,6 +272,7 @@ cached-tail FULL graph regression suite before and after.
 ## Tier 1 - measure before adopting (conditional on traffic shape)
 
 ### M1. `#59804` keep tokens top-p must keep (open, unapproved)
+
 Real sampling-distribution bug: the monolithic Triton pivot search uses strict
 `probs > pivot` and falls back to the midpoint after 18 iterations, dropping a boundary
 token needed to reach the requested mass (author's fuzz: 20 -> 0 standalone and
@@ -260,6 +282,7 @@ Fork already carries the two split-top-p tie fixes, so port the final algorithm,
 old patch.
 
 ### M2. `#61213` masked-logit fast path in `_topk_topp_kernel`
+
 One branch: if `num_finite_total <= k`, skip the cutoff search. Dormant without
 structured/forced decoding; author measured 6.672 -> 0.863 ms (8 finite logits, top-k 50,
 H100) and +13.7% throughput on a restrictive-regex DFlash workload. Worth taking only
@@ -267,6 +290,7 @@ if grammar-constrained traffic is real; the lane's own harness never sends
 `response_format`.
 
 ### M3. `#61996` small-batch split top-p pipeline
+
 Fork caps split count at `splits * batch_size >= SM count` and always launches the
 split pipeline. This lane's c8 + k=4 shape is exactly 40 rows, inside the affected
 range. Author measured 2.11x at B=38 and 1.44x at B=64 for a 129,280 vocab on B300, and
@@ -275,7 +299,9 @@ never measured below 132 SMs and a 3090 has 82**, so benchmark on the lane befor
 merging tuning; the fork's #58231/#62046 tie fixes must be preserved.
 
 ### M4. `#63710` skip redundant DSpark context projections on long prefills (open)
+
 Measured on **this exact model**: DeepSeek-V4.1-Flash-1017, 8x H20, TP8+EP, 64K in/128 out
+
 - TPOT 99.19 -> 93.92 ms, TTFT 7847.73 -> 7278.88 ms, throughput 49.34 -> 51.17 tok/s
 (+3.7%). One run per arm, low acceptance (1.26), so treat as directional. Under the
 lane's 2048-token batch cap the removed rows are fewer, so expect less. Medium-high port
@@ -287,6 +313,7 @@ argmax hooks, graph-captured context KV).
 ## Tier 2 - design decisions, not ports
 
 ### D1. `#63219` per-request draft retention for structured output under PP
+
 Silent-wrongness class: `DraftTokensHandler` keeps one global `req_ids` + `draft_tokens_np`
 (`vllm/v1/worker/gpu/spec_decode/utils.py:13-42`), so a PP microbatch can overwrite batch
 A's drafts before the scheduler generates grammar masks for A. Requires structured
@@ -298,6 +325,7 @@ draft/confidence relay and adaptive verification. Decision needed: is grammar-co
 traffic served? If yes, this is the highest-severity unported item on the list.
 
 ### D2. `#61261` `draft_context_window` (open, mergeable, unreviewed)
+
 Bounds draft attention to a trailing window. Author measured mean accepted length
 1.45 -> 2.29 at 128-256K and 1.26 -> 2.22 above 256K with a 32K window (Kimi-K3, B300),
 +31%/+23% throughput. Directly targets the acceptance collapse above ~128K tracked in
@@ -307,6 +335,7 @@ per-layer draft cache groups. Evaluate as an opt-in flag, not a default, after t
 Tier 0 batch.
 
 ### D3. `#64109` back only the tail of drafter sliding-window KV (open)
+
 Capacity, not tok/s: author measured 1,256,723 -> 1,390,712 KV tokens (+10.7%) on
 Qwen3.8-27B + 5-layer DSpark, GB300. Amplified here because the generic
 `SlidingWindowSpec` reserves `max_in_flight_tokens = PP6 x 2048 = 12288` transient
@@ -315,6 +344,7 @@ patched heavily (null-block guards, PP projection, NaN hardening). High risk; ta
 only if KV pressure actually shows up with prefix caching on.
 
 ### D4. Prefill-only wins (no steady-decode effect)
+
 - `#58539` shared prefill chunk plan (ROCm-authored, but the fork's Ampere path inherits
   the loop): author saw 2.6-6.9% throughput at c32-512 on MI355X. Port first: it makes
   chunk identity/workspace explicit.
@@ -364,24 +394,24 @@ under a 512 MiB reservation), `#59986` (needs adaptive verification), `#60692`
 
 ## Lane hygiene found during the sweep (independent of ports)
 
-1. **Dead env knob.** `VLLM_DSV41_PP_KV_RELAY=1` is set in my-salt `pillar/rome2.sls`
-   and `pillar/rome.sls` and does not exist anywhere in the fork source; no
-   `VLLM_DSV41_*` variable is read by any `.py`/`.cu`/`.cpp` file. The relay in
-   `vllm/models/deepseek_v4_1/common/pp_relay.py` is automatic. The pillar comment
-   ("V4.1 needs ... + VLLM_DSV41_PP_KV_RELAY=1") is stale and should be corrected, so
-   nobody later treats the env var as evidence the relay is on.
+1. **Dead env knob, documentation only in the verified deployment.**
+   `VLLM_DSV41_PP_KV_RELAY=1` has no consumer in the fork source; the relay in
+   `vllm/models/deepseek_v4_1/common/pp_relay.py` is automatic. Contrary to the initial
+   sweep's pillar claim, neither the verified baseline nor candidate service sets it.
+   The formula comment claiming V4.1 needs it is stale, not runtime configuration drift.
 2. **Padding nit.** `prepare_dflash_inputs` takes `.max()` over the padded
    `num_scheduled_tokens` buffer; upstream slices `[:num_reqs]` (#58984).
 3. **Known open deadlock, not from any port:** the fork's own 256k campaign records an
    engine deadlock at ctx ~245k when two prefills are admitted ~0.3 s apart during
-   active decode ("No available shared memory broadcast block found"). Nothing in this
-   proposal fixes or worsens it; do not attribute it to a port if it reappears.
+   active decode ("No available shared memory broadcast block found"). This rollout
+   does not test that operating point or claim to fix it. Separate this known baseline
+   issue from any new regression; 64K checks do not certify 245K behavior.
 4. **Second dead knob: `table_mode`.** my-salt documents `engram_config` as accepting
    `'{"table_mode":"mmap"}'`, but HEAD has no `table_mode` field at all
    (`vllm/config/engram.py:38-60`; no `table_mode` anywhere in the tree). The live
-   `engram_config` does not set it, so nothing breaks, but the two pillars and the
-   formula comment disagree with the source about what the engine accepts. Resolve
-   before anyone claims runtime equivalence to a documented configuration.
+   `engram_config` does not set it. Both verified service units use `cpu_offload` and
+   `gpu_resident_heads`, which the source accepts. The formula example is stale
+   documentation, not an unsupported runtime setting in this rollout.
 
 ---
 
