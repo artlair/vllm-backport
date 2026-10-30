@@ -300,6 +300,7 @@ def test_prepare_dflash_inputs_compiles_once_for_all_query_lengths():
 
     _run_prepare(target_positions=[10, 11, 12, 13], block_table_values=[0, 7, 8])
     warmed = compiled_variants()
+    assert warmed
     _run_prepare(
         target_positions=[10, 11, 12, 13],
         block_table_values=[0, 7, 8],
